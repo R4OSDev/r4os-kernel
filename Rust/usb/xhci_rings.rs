@@ -1,5 +1,6 @@
 //! Original DMA-ring publication and producer/link cycle transitions. No
 //! second ring cursor exists: all positions belong to the current device owner.
+use super::xhci_state::Context;
 use super::{
     ring_cycle, trb_chain,
     xhci_constants::*,
@@ -8,15 +9,21 @@ use super::{
     xhci_types::{BulkSubmission, BulkTrbSubmission, InterruptSubmission, Trb},
 };
 use core::ptr;
-fn ring(address: u64) -> *mut Trb {
+fn ring(_ctx: Context, address: u64) -> *mut Trb {
     ptr::with_exposed_provenance_mut(address as usize)
 }
-pub(super) unsafe fn update_link_trb(address: u64, count: usize, cycle: u8, continues: bool) {
+pub(super) unsafe fn update_link_trb(
+    ctx: Context,
+    address: u64,
+    count: usize,
+    cycle: u8,
+    continues: bool,
+) {
     unsafe {
         if address == 0 || count == 0 {
             return;
         }
-        let p = ring(address).add(count - 1);
+        let p = ring(ctx, address).add(count - 1);
         dma_fence();
         let old = ptr::addr_of!((*p).control).read();
         ptr::addr_of_mut!((*p).control)
@@ -24,12 +31,12 @@ pub(super) unsafe fn update_link_trb(address: u64, count: usize, cycle: u8, cont
         dma_fence();
     }
 }
-pub(super) unsafe fn init_ring(address: u64, physical: u64) {
+pub(super) unsafe fn init_ring(ctx: Context, address: u64, physical: u64) {
     unsafe {
         if address == 0 || physical == 0 {
             return;
         }
-        let p = ring(address);
+        let p = ring(ctx, address);
         for index in 0..TRANSFER_TRB_COUNT {
             p.add(index).write(Trb::EMPTY);
         }
@@ -40,10 +47,10 @@ pub(super) unsafe fn init_ring(address: u64, physical: u64) {
         });
     }
 }
-pub(super) unsafe fn init_ep0_ring() {
+pub(super) unsafe fn init_ep0_ring(ctx: Context) {
     unsafe {
-        let s = state();
-        let p = ring((*s).first_ep0_ring_virt);
+        let s = state(ctx);
+        let p = ring(ctx, (*s).first_ep0_ring_virt);
         for index in 0..TRANSFER_TRB_COUNT {
             p.add(index).write(Trb::EMPTY);
         }
@@ -57,14 +64,14 @@ pub(super) unsafe fn init_ep0_ring() {
         (*s).current.control_endpoint_faulted = false;
     }
 }
-pub(super) unsafe fn init_interrupt_ring() {
+pub(super) unsafe fn init_interrupt_ring(ctx: Context) {
     unsafe {
-        let s = state();
-        if let Some(owner) = super::xhci::current_interrupt_owner_match() {
+        let s = state(ctx);
+        if let Some(owner) = super::xhci::current_interrupt_owner_match(ctx) {
             (*s).deferred_events.purge(owner);
         }
-        super::xhci::release_interrupt_transfer(true);
-        let p = ring((*s).first_interrupt_ring_virt);
+        super::xhci::release_interrupt_transfer(ctx, true);
+        let p = ring(ctx, (*s).first_interrupt_ring_virt);
         for index in 0..TRANSFER_TRB_COUNT {
             p.add(index).write(Trb::EMPTY);
         }
@@ -81,11 +88,16 @@ pub(super) unsafe fn init_interrupt_ring() {
         (*s).current.interrupt_pending_streak = 0;
     }
 }
-pub(super) unsafe fn init_bulk_rings() {
+pub(super) unsafe fn init_bulk_rings(ctx: Context) {
     unsafe {
-        let s = state();
-        init_ring((*s).first_bulk_in_ring_virt, (*s).current.bulk_in_ring_phys);
+        let s = state(ctx);
         init_ring(
+            ctx,
+            (*s).first_bulk_in_ring_virt,
+            (*s).current.bulk_in_ring_phys,
+        );
+        init_ring(
+            ctx,
             (*s).first_bulk_out_ring_virt,
             (*s).current.bulk_out_ring_phys,
         );
@@ -95,9 +107,9 @@ pub(super) unsafe fn init_bulk_rings() {
         (*s).current.bulk_out_cycle = 1;
     }
 }
-pub(super) unsafe fn setup_first_input_context(port_index: usize) {
+pub(super) unsafe fn setup_first_input_context(ctx: Context, port_index: usize) {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         let input = ptr::with_exposed_provenance_mut::<u32>((*s).first_input_virt as usize);
         let count = usize::from((*s).current.context_size) / 4;
         input.write(0);
@@ -122,13 +134,14 @@ pub(super) unsafe fn setup_first_input_context(port_index: usize) {
     }
 }
 pub(super) unsafe fn write_bulk_trb(
+    ctx: Context,
     input: bool,
     parameter: u64,
     status: u32,
     control: u32,
 ) -> BulkTrbSubmission {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         let (address, physical, enqueue, producer) = if input {
             (
                 (*s).first_bulk_in_ring_virt,
@@ -146,7 +159,7 @@ pub(super) unsafe fn write_bulk_trb(
         };
         let trb_phys = physical + u64::from(enqueue) * core::mem::size_of::<Trb>() as u64;
         let cycle = if producer != 0 { TRB_CYCLE } else { 0 };
-        ring(address).add(usize::from(enqueue)).write(Trb {
+        ring(ctx, address).add(usize::from(enqueue)).write(Trb {
             parameter,
             status,
             control: control | cycle,
@@ -154,6 +167,7 @@ pub(super) unsafe fn write_bulk_trb(
         let advance = ring_cycle::after_submission(enqueue, producer, TRANSFER_TRB_COUNT);
         if advance.wrapped {
             update_link_trb(
+                ctx,
                 address,
                 TRANSFER_TRB_COUNT,
                 advance.link_cycle,
@@ -179,6 +193,7 @@ pub(super) unsafe fn write_bulk_trb(
     }
 }
 pub(super) unsafe fn write_bulk_trb_chain(
+    ctx: Context,
     input: bool,
     parameter: u64,
     bytes: u32,
@@ -192,25 +207,26 @@ pub(super) unsafe fn write_bulk_trb_chain(
         let status = segment.len | (remaining.min(31) << 17);
         let last = index + 1 == count;
         let control = trb_type(TRB_TYPE_NORMAL) | if last { TRB_IOC } else { TRB_CHAIN };
-        let submission = unsafe { write_bulk_trb(input, segment.phys, status, control) };
+        let submission = unsafe { write_bulk_trb(ctx, input, segment.phys, status, control) };
         out.trb_phys[usize::from(out.trb_count)] = submission.trb_phys;
         out.trb_count += 1;
     }
     Some(out)
 }
 pub(super) unsafe fn write_interrupt_trb(
+    ctx: Context,
     parameter: u64,
     status: u32,
     control: u32,
 ) -> InterruptSubmission {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         let enqueue = (*s).current.interrupt_enqueue;
         let producer = (*s).current.interrupt_cycle;
         let physical = (*s).current.interrupt_ring_phys
             + u64::from(enqueue) * core::mem::size_of::<Trb>() as u64;
         let cycle = if producer != 0 { TRB_CYCLE } else { 0 };
-        ring((*s).first_interrupt_ring_virt)
+        ring(ctx, (*s).first_interrupt_ring_virt)
             .add(usize::from(enqueue))
             .write(Trb {
                 parameter,
@@ -220,6 +236,7 @@ pub(super) unsafe fn write_interrupt_trb(
         let advance = ring_cycle::after_submission(enqueue, producer, TRANSFER_TRB_COUNT);
         if advance.wrapped {
             update_link_trb(
+                ctx,
                 (*s).first_interrupt_ring_virt,
                 TRANSFER_TRB_COUNT,
                 advance.link_cycle,
@@ -236,15 +253,20 @@ pub(super) unsafe fn write_interrupt_trb(
         }
     }
 }
-pub(super) unsafe fn write_transfer_trb(parameter: u64, status: u32, control: u32) -> u64 {
+pub(super) unsafe fn write_transfer_trb(
+    ctx: Context,
+    parameter: u64,
+    status: u32,
+    control: u32,
+) -> u64 {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         let enqueue = (*s).current.ep0_enqueue;
         let producer = (*s).current.ep0_cycle;
         let physical =
             (*s).current.ep0_ring_phys + u64::from(enqueue) * core::mem::size_of::<Trb>() as u64;
         let cycle = if producer != 0 { TRB_CYCLE } else { 0 };
-        ring((*s).first_ep0_ring_virt)
+        ring(ctx, (*s).first_ep0_ring_virt)
             .add(usize::from(enqueue))
             .write(Trb {
                 parameter,
@@ -254,6 +276,7 @@ pub(super) unsafe fn write_transfer_trb(parameter: u64, status: u32, control: u3
         let advance = ring_cycle::after_submission(enqueue, producer, TRANSFER_TRB_COUNT);
         if advance.wrapped {
             update_link_trb(
+                ctx,
                 (*s).first_ep0_ring_virt,
                 TRANSFER_TRB_COUNT,
                 advance.link_cycle,

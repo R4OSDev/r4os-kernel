@@ -1,5 +1,6 @@
 //! Autonomous port worker and IRQ wakeups. Shared producers use atomics;
 //! the ISR samples only its admitted immutable MMIO binding, never Status.
+use super::xhci_state::Context;
 use super::{
     xhci::*,
     xhci_constants::*,
@@ -21,87 +22,120 @@ use core::{
     ptr,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
-static IRQ_REGISTERED: AtomicBool = AtomicBool::new(false);
-static IRQ_OP: AtomicU64 = AtomicU64::new(0);
-static IRQ_RUNTIME: AtomicU64 = AtomicU64::new(0);
-static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
-static IRQ_HANDLED: AtomicU64 = AtomicU64::new(0);
-static IRQ_WAKEUPS: AtomicU64 = AtomicU64::new(0);
-static POLL_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-static SERVICE_FAILURES: AtomicU64 = AtomicU64::new(0);
-static TASK_STARTED: AtomicBool = AtomicBool::new(false);
-static TASK_STOP: AtomicBool = AtomicBool::new(false);
-static TASK_ID: AtomicU32 = AtomicU32::new(0);
-static TASK_ITERATIONS: AtomicU64 = AtomicU64::new(0);
-static TOPOLOGY_HOOK: AtomicUsize = AtomicUsize::new(0);
-pub(super) fn irq_registered() -> bool {
-    IRQ_REGISTERED.load(Ordering::Acquire)
+
+pub(super) struct AsyncState {
+    pub irq_registered: AtomicBool,
+    pub irq_op: AtomicU64,
+    pub irq_runtime: AtomicU64,
+    pub irq_count: AtomicU64,
+    pub irq_handled: AtomicU64,
+    pub irq_wakeups: AtomicU64,
+    pub poll_fallbacks: AtomicU64,
+    pub service_failures: AtomicU64,
+    pub task_started: AtomicBool,
+    pub task_stop: AtomicBool,
+    pub task_id: AtomicU32,
+    pub task_iterations: AtomicU64,
+    pub topology_hook: AtomicUsize,
 }
-pub(super) fn port_task_started() -> bool {
-    TASK_STARTED.load(Ordering::Acquire)
-}
-pub(super) fn request_port_task_stop() {
-    TASK_STOP.store(true, Ordering::Release);
-}
-pub(super) fn resume_port_task() {
-    TASK_STOP.store(false, Ordering::Release);
-}
-pub(super) fn set_topology_hook(hook: Option<TopologyHook>) {
-    TOPOLOGY_HOOK.store(hook.map_or(0, |f| f as usize), Ordering::Release);
-}
-pub(super) fn record_irq_wakeup() {
-    IRQ_WAKEUPS.fetch_add(1, Ordering::Relaxed);
-}
-pub(super) fn record_poll_fallback() {
-    POLL_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-}
-pub(super) fn record_port_service_failure() {
-    SERVICE_FAILURES.fetch_add(1, Ordering::Relaxed);
-}
-pub(super) fn wait_event_irq(ticks: u64) -> bool {
-    unsafe {
-        sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*state()).event_irq), 2, ticks) == 1
+impl AsyncState {
+    pub(super) const fn empty() -> Self {
+        Self {
+            irq_registered: AtomicBool::new(false),
+            irq_op: AtomicU64::new(0),
+            irq_runtime: AtomicU64::new(0),
+            irq_count: AtomicU64::new(0),
+            irq_handled: AtomicU64::new(0),
+            irq_wakeups: AtomicU64::new(0),
+            poll_fallbacks: AtomicU64::new(0),
+            service_failures: AtomicU64::new(0),
+            task_started: AtomicBool::new(false),
+            task_stop: AtomicBool::new(false),
+            task_id: AtomicU32::new(0),
+            task_iterations: AtomicU64::new(0),
+            topology_hook: AtomicUsize::new(0),
+        }
     }
 }
-pub(super) unsafe fn reset_after_teardown() {
+pub(super) fn irq_registered(ctx: Context) -> bool {
+    ctx.asynchronous().irq_registered.load(Ordering::Acquire)
+}
+pub(super) fn port_task_started(ctx: Context) -> bool {
+    ctx.asynchronous().task_started.load(Ordering::Acquire)
+}
+pub(super) fn request_port_task_stop(ctx: Context) {
+    ctx.asynchronous().task_stop.store(true, Ordering::Release);
+}
+pub(super) fn resume_port_task(ctx: Context) {
+    ctx.asynchronous().task_stop.store(false, Ordering::Release);
+}
+pub(super) fn set_topology_hook(ctx: Context, hook: Option<TopologyHook>) {
+    ctx.asynchronous()
+        .topology_hook
+        .store(hook.map_or(0, |f| f as usize), Ordering::Release);
+}
+pub(super) fn record_irq_wakeup(ctx: Context) {
+    ctx.asynchronous()
+        .irq_wakeups
+        .fetch_add(1, Ordering::Relaxed);
+}
+pub(super) fn record_poll_fallback(ctx: Context) {
+    ctx.asynchronous()
+        .poll_fallbacks
+        .fetch_add(1, Ordering::Relaxed);
+}
+pub(super) fn record_port_service_failure(ctx: Context) {
+    ctx.asynchronous()
+        .service_failures
+        .fetch_add(1, Ordering::Relaxed);
+}
+pub(super) fn wait_event_irq(ctx: Context, ticks: u64) -> bool {
+    unsafe {
+        sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*state(ctx)).event_irq), 2, ticks)
+            == 1
+    }
+}
+pub(super) unsafe fn reset_after_teardown(ctx: Context) {
     // Preserve enrolled waiter links in the permanently resident event. The
     // reset operation clears only its signal, as opposed to replacing a queue
     // under a still-resident port worker during reprobe.
     unsafe {
-        sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*state()).event_irq), 1, 0);
+        sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*state(ctx)).event_irq), 1, 0);
     }
-    IRQ_REGISTERED.store(false, Ordering::Release);
+    ctx.asynchronous()
+        .irq_registered
+        .store(false, Ordering::Release);
     for c in [
-        &IRQ_COUNT,
-        &IRQ_HANDLED,
-        &IRQ_WAKEUPS,
-        &POLL_FALLBACKS,
-        &SERVICE_FAILURES,
+        &ctx.asynchronous().irq_count,
+        &ctx.asynchronous().irq_handled,
+        &ctx.asynchronous().irq_wakeups,
+        &ctx.asynchronous().poll_fallbacks,
+        &ctx.asynchronous().service_failures,
     ] {
         c.store(0, Ordering::Relaxed);
     }
 }
-pub(super) fn project_counters(out: &mut Status) {
-    out.irq_registered = irq_registered();
-    out.irq_count = IRQ_COUNT.load(Ordering::Relaxed);
-    out.irq_handled = IRQ_HANDLED.load(Ordering::Relaxed);
-    out.irq_wakeups = IRQ_WAKEUPS.load(Ordering::Relaxed);
-    out.poll_fallbacks = POLL_FALLBACKS.load(Ordering::Relaxed);
-    out.port_service_failures = SERVICE_FAILURES.load(Ordering::Relaxed);
-    out.port_task_started = port_task_started();
-    out.port_task_id = TASK_ID.load(Ordering::Acquire);
-    out.port_task_iterations = TASK_ITERATIONS.load(Ordering::Relaxed);
+pub(super) fn project_counters(ctx: Context, out: &mut Status) {
+    out.irq_registered = irq_registered(ctx);
+    out.irq_count = ctx.asynchronous().irq_count.load(Ordering::Relaxed);
+    out.irq_handled = ctx.asynchronous().irq_handled.load(Ordering::Relaxed);
+    out.irq_wakeups = ctx.asynchronous().irq_wakeups.load(Ordering::Relaxed);
+    out.poll_fallbacks = ctx.asynchronous().poll_fallbacks.load(Ordering::Relaxed);
+    out.port_service_failures = ctx.asynchronous().service_failures.load(Ordering::Relaxed);
+    out.port_task_started = port_task_started(ctx);
+    out.port_task_id = ctx.asynchronous().task_id.load(Ordering::Acquire);
+    out.port_task_iterations = ctx.asynchronous().task_iterations.load(Ordering::Relaxed);
 }
-pub(super) unsafe fn start_port_task() -> bool {
+pub(super) unsafe fn start_port_task(ctx: Context) -> bool {
     unsafe {
-        if port_task_started()
-            || !(*current()).present
-            || !(*current()).controller_running
-            || (*state()).event_ring_virt == 0
+        if port_task_started(ctx)
+            || !(*current(ctx)).present
+            || !(*current(ctx)).controller_running
+            || (*state(ctx)).event_ring_virt == 0
         {
             return true;
         }
-        start_event_irq();
+        start_event_irq(ctx);
         let request = task_api::CreateRequest {
             name: b"xhci-port".as_ptr(),
             name_len: 9,
@@ -111,7 +145,7 @@ pub(super) unsafe fn start_port_task() -> bool {
             smp_eligible: false,
             smp_r4x: false,
             owner_kind: 0,
-            owner_context: ptr::null_mut(),
+            owner_context: ctx.raw(),
             entry: Some(port_task_main),
         };
         let mut failure = 0;
@@ -123,8 +157,10 @@ pub(super) unsafe fn start_port_task() -> bool {
         // The newborn worker cannot enter the controller until its creator
         // releases admission, so publication precedes its terminal check.
         let id = (*task_registry::core(task.cast())).id;
-        TASK_ID.store(id, Ordering::Release);
-        TASK_STARTED.store(true, Ordering::Release);
+        ctx.asynchronous().task_id.store(id, Ordering::Release);
+        ctx.asynchronous()
+            .task_started
+            .store(true, Ordering::Release);
         puts(b"[XHCI] port-task started id=");
         diag::console_dec(id);
         puts(b"\r\n");
@@ -132,55 +168,62 @@ pub(super) unsafe fn start_port_task() -> bool {
     }
 }
 unsafe extern "C" fn port_task_main() {
+    let task = scheduler::current();
+    let ctx =
+        unsafe { Context::from_raw((*task_registry::core(task.cast())).execution_owner_context) };
     loop {
-        if TASK_STOP.load(Ordering::Acquire) {
+        if ctx.asynchronous().task_stop.load(Ordering::Acquire) {
             // Recheck under controller admission: reprobe may resume this exact
             // resident worker while it is reaching its stop boundary.
-            owner::restore(1);
-            if TASK_STOP.load(Ordering::Acquire) {
-                TASK_STARTED.store(false, Ordering::Release);
-                TASK_ID.store(0, Ordering::Release);
-                owner::release();
+            owner::restore(ctx, 1);
+            if ctx.asynchronous().task_stop.load(Ordering::Acquire) {
+                ctx.asynchronous()
+                    .task_started
+                    .store(false, Ordering::Release);
+                ctx.asynchronous().task_id.store(0, Ordering::Release);
+                owner::release(ctx);
                 return;
             }
-            owner::release();
+            owner::release(ctx);
         }
-        if irq_registered() {
-            if wait_event_irq(PORT_SERVICE_IDLE_TICKS) {
-                record_irq_wakeup();
+        if irq_registered(ctx) {
+            if wait_event_irq(ctx, PORT_SERVICE_IDLE_TICKS) {
+                record_irq_wakeup(ctx);
             } else {
-                record_poll_fallback();
+                record_poll_fallback(ctx);
             }
         } else {
             unsafe {
                 scheduler::sleep(PORT_SERVICE_IDLE_TICKS, b"xhci-port-idle".as_ptr(), 14);
             }
-            record_poll_fallback();
+            record_poll_fallback(ctx);
         }
         unsafe {
-            service_port_changes();
+            service_port_changes(ctx);
         }
-        TASK_ITERATIONS.fetch_add(1, Ordering::Relaxed);
+        ctx.asynchronous()
+            .task_iterations
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
-pub(super) unsafe fn service_port_changes() -> bool {
-    if !owner::acquire() {
-        record_port_service_failure();
+pub(super) unsafe fn service_port_changes(ctx: Context) -> bool {
+    if !owner::acquire(ctx) {
+        record_port_service_failure(ctx);
         return false;
     }
     let changed = unsafe {
-        if (*current()).present
-            && (*current()).controller_running
-            && (*state()).event_ring_virt != 0
+        if (*current(ctx)).present
+            && (*current(ctx)).controller_running
+            && (*state(ctx)).event_ring_virt != 0
         {
-            service_port_changes_locked()
+            service_port_changes_locked(ctx)
         } else {
             false
         }
     };
-    owner::release();
+    owner::release(ctx);
     if changed {
-        let hook = TOPOLOGY_HOOK.load(Ordering::Acquire);
+        let hook = ctx.asynchronous().topology_hook.load(Ordering::Acquire);
         if hook != 0 {
             unsafe {
                 core::mem::transmute::<usize, TopologyHook>(hook)();
@@ -189,139 +232,156 @@ pub(super) unsafe fn service_port_changes() -> bool {
     }
     changed
 }
-unsafe fn service_port_changes_locked() -> bool {
+unsafe fn service_port_changes_locked(ctx: Context) -> bool {
     unsafe {
-        (*current()).port_service_calls = (*current()).port_service_calls.wrapping_add(1);
-        let before = (*state()).pending_port_changes.snapshot().events;
-        drain_maintenance_event_batch();
+        (*current(ctx)).port_service_calls = (*current(ctx)).port_service_calls.wrapping_add(1);
+        let before = (*state(ctx)).pending_port_changes.snapshot().events;
+        drain_maintenance_event_batch(ctx);
         let mut changed = false;
         for _ in 0..MAX_PORTS {
-            let Some(port) = (*state()).pending_port_changes.take_next() else {
+            let Some(port) = (*state(ctx)).pending_port_changes.take_next() else {
                 break;
             };
-            let result = service_pending_port_change(port);
+            let result = service_pending_port_change(ctx, port);
             changed |= result.catalog_changed;
             if result.retry {
-                (*state()).pending_port_changes.retry(port);
+                (*state(ctx)).pending_port_changes.retry(port);
                 break;
             }
         }
-        if read_op32(OP_USBSTS) & USBSTS_PCD != 0 {
-            write_op32(OP_USBSTS, USBSTS_PCD);
-            read_op32(OP_USBSTS);
+        if read_op32(ctx, OP_USBSTS) & USBSTS_PCD != 0 {
+            write_op32(ctx, OP_USBSTS, USBSTS_PCD);
+            read_op32(ctx, OP_USBSTS);
         }
         if changed {
-            (*current()).port_catalog_changes = (*current()).port_catalog_changes.wrapping_add(1);
+            (*current(ctx)).port_catalog_changes =
+                (*current(ctx)).port_catalog_changes.wrapping_add(1);
         }
-        if (*state()).pending_port_changes.snapshot().events != before || changed {
-            emit_port_service_marker();
+        if (*state(ctx)).pending_port_changes.snapshot().events != before || changed {
+            emit_port_service_marker(ctx);
         }
-        rearm_event_irq();
+        rearm_event_irq(ctx);
         changed
     }
 }
-pub(super) unsafe fn start_event_irq() -> bool {
+pub(super) unsafe fn start_event_irq(ctx: Context) -> bool {
     unsafe {
-        if irq_registered() {
+        if irq_registered(ctx) {
             return true;
         }
-        let line = (*current()).irq_line;
+        let line = (*current(ctx)).irq_line;
         if line == 255 || line == 0 || line >= 32 {
-            (*current()).irq_mode = Text::literal(b"poll-fallback");
+            (*current(ctx)).irq_mode = Text::literal(b"poll-fallback");
             return false;
         }
         let _runtime = RuntimeGuard::acquire();
         let result = irq_router::r4os_rust_irq_router_register(
             line,
             event_irq_handler,
-            0,
+            ctx.raw().addr(),
             3,
-            (*state()).activated_owner_id,
+            (*state(ctx)).activated_owner_id,
         );
         if result != 0 {
-            (*current()).irq_mode = Text::literal(b"poll-fallback");
+            (*current(ctx)).irq_mode = Text::literal(b"poll-fallback");
             return false;
         }
-        IRQ_OP.store((*current()).op_virt, Ordering::Relaxed);
-        IRQ_RUNTIME.store((*current()).runtime_virt, Ordering::Relaxed);
-        IRQ_REGISTERED.store(true, Ordering::Release);
-        (*current()).irq_registered = true;
-        (*current()).irq_mode = Text::literal(b"intx-event");
-        write_op32(OP_USBCMD, read_op32(OP_USBCMD) | USBCMD_INTE);
-        rearm_event_irq();
+        ctx.asynchronous()
+            .irq_op
+            .store((*current(ctx)).op_virt, Ordering::Relaxed);
+        ctx.asynchronous()
+            .irq_runtime
+            .store((*current(ctx)).runtime_virt, Ordering::Relaxed);
+        ctx.asynchronous()
+            .irq_registered
+            .store(true, Ordering::Release);
+        (*current(ctx)).irq_registered = true;
+        (*current(ctx)).irq_mode = Text::literal(b"intx-event");
+        write_op32(ctx, OP_USBCMD, read_op32(ctx, OP_USBCMD) | USBCMD_INTE);
+        rearm_event_irq(ctx);
     }
     puts(b"[XHCI] event IRQ active line=");
     unsafe {
-        diag::console_dec((*current()).irq_line);
+        diag::console_dec((*current(ctx)).irq_line);
     }
     puts(b" with poll fallback\r\n");
     true
 }
-pub(super) unsafe fn stop_event_irq() {
+pub(super) unsafe fn stop_event_irq(ctx: Context) {
     unsafe {
         let _runtime = RuntimeGuard::acquire();
-        if (*current()).mapped && (*current()).op_virt != 0 && (*current()).runtime_virt != 0 {
-            write_rt32(RT_IR0_IMAN, 0);
-            write_op32(OP_USBCMD, read_op32(OP_USBCMD) & !USBCMD_INTE);
+        if (*current(ctx)).mapped
+            && (*current(ctx)).op_virt != 0
+            && (*current(ctx)).runtime_virt != 0
+        {
+            write_rt32(ctx, RT_IR0_IMAN, 0);
+            write_op32(ctx, OP_USBCMD, read_op32(ctx, OP_USBCMD) & !USBCMD_INTE);
         }
-        if IRQ_REGISTERED.swap(false, Ordering::AcqRel) {
+        if ctx
+            .asynchronous()
+            .irq_registered
+            .swap(false, Ordering::AcqRel)
+        {
             irq_router::r4os_rust_irq_router_unregister(
-                (*current()).irq_line,
+                (*current(ctx)).irq_line,
                 event_irq_handler,
-                0,
+                ctx.raw().addr(),
             );
         }
-        (*current()).irq_registered = false;
-        (*current()).irq_mode = Text::literal(b"poll");
+        (*current(ctx)).irq_registered = false;
+        (*current(ctx)).irq_mode = Text::literal(b"poll");
     }
 }
-pub(super) unsafe fn rearm_event_irq() {
+pub(super) unsafe fn rearm_event_irq(ctx: Context) {
     unsafe {
-        if irq_registered() && (*current()).controller_running {
-            write_rt32(RT_IR0_IMAN, IMAN_IE);
-            read_rt32(RT_IR0_IMAN);
+        if irq_registered(ctx) && (*current(ctx)).controller_running {
+            write_rt32(ctx, RT_IR0_IMAN, IMAN_IE);
+            read_rt32(ctx, RT_IR0_IMAN);
         }
     }
 }
-unsafe extern "C" fn event_irq_handler(_: u8, _: usize) -> u32 {
+unsafe extern "C" fn event_irq_handler(_: u8, context: usize) -> u32 {
+    let ctx = unsafe { Context::from_raw(context as *mut core::ffi::c_void) };
     let _runtime = RuntimeGuard::acquire();
-    if !irq_registered() {
+    if !irq_registered(ctx) {
         return 0;
     }
-    let op = IRQ_OP.load(Ordering::Relaxed);
-    let rt = IRQ_RUNTIME.load(Ordering::Relaxed);
+    let op = ctx.asynchronous().irq_op.load(Ordering::Relaxed);
+    let rt = ctx.asynchronous().irq_runtime.load(Ordering::Relaxed);
     unsafe {
         let status = volatile_read32(op + OP_USBSTS);
         let iman = volatile_read32(rt + RT_IR0_IMAN);
         if status & (USBSTS_EINT | USBSTS_PCD) == 0 && iman & IMAN_IP == 0 {
             return 0;
         }
-        IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+        ctx.asynchronous().irq_count.fetch_add(1, Ordering::Relaxed);
         volatile_write32(rt + RT_IR0_IMAN, (iman & !IMAN_IE) | IMAN_IP);
         if status & (USBSTS_EINT | USBSTS_PCD) != 0 {
             volatile_write32(op + OP_USBSTS, status & (USBSTS_EINT | USBSTS_PCD));
         }
-        IRQ_HANDLED.fetch_add(1, Ordering::Relaxed);
-        sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*state()).event_irq), 0, 0);
+        ctx.asynchronous()
+            .irq_handled
+            .fetch_add(1, Ordering::Relaxed);
+        sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*state(ctx)).event_irq), 0, 0);
     }
     1
 }
-pub(super) unsafe fn drain_maintenance_event_batch() {
+pub(super) unsafe fn drain_maintenance_event_batch(ctx: Context) {
     unsafe {
         let mut processed = 0u16;
         for _ in 0..1024 {
-            let Some(event) = poll_event() else {
+            let Some(event) = poll_event(ctx) else {
                 break;
             };
             processed = processed.wrapping_add(1);
-            route_foreign_event(event);
+            route_foreign_event(ctx, event);
         }
-        commit_event_batch(processed);
+        commit_event_batch(ctx, processed);
     }
 }
-unsafe fn emit_port_service_marker() {
+unsafe fn emit_port_service_marker(ctx: Context) {
     unsafe {
-        let ports = (*state()).pending_port_changes.snapshot();
+        let ports = (*state(ctx)).pending_port_changes.snapshot();
         puts(b"[XHCIPORT] events=");
         diag::console_dec(ports.events);
         puts(b" pending=");
@@ -337,9 +397,9 @@ unsafe fn emit_port_service_marker() {
         puts(b" retries=");
         diag::console_dec(ports.retries);
         puts(b" failures=");
-        diag::console_dec(SERVICE_FAILURES.load(Ordering::Relaxed));
+        diag::console_dec(ctx.asynchronous().service_failures.load(Ordering::Relaxed));
         puts(b" catalog_changes=");
-        diag::console_dec((*current()).port_catalog_changes);
+        diag::console_dec((*current(ctx)).port_catalog_changes);
         puts(b"\r\n");
     }
 }

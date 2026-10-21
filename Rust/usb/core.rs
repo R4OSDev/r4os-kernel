@@ -3,10 +3,10 @@
 use super::types::{CoreSummary, Device};
 use crate::arch::runtime::RuntimeGuard;
 use core::{cell::UnsafeCell, ptr, slice};
-const CAPACITY: usize = 8;
+const CAPACITY: usize = crate::platform::pci_scan::MAX_DEVICES * 8;
 struct State {
     devices: [Device; CAPACITY],
-    count: u8,
+    count: u32,
     truncated: bool,
 }
 impl State {
@@ -38,17 +38,40 @@ unsafe fn same_controller(
 }
 pub(super) unsafe fn reset() {
     let _guard = RuntimeGuard::acquire();
-    unsafe { state().write(State::EMPTY) };
+    unsafe {
+        let s = state();
+        for i in 0..(*s).count as usize {
+            (*s).devices[i] = Device::EMPTY;
+        }
+        (*s).count = 0;
+        (*s).truncated = false;
+    }
+}
+/// Remove only this exact registration epoch; other controllers stay published.
+pub(super) unsafe fn remove_controller(controller_id: u32) {
+    let _guard = RuntimeGuard::acquire();
+    let s = unsafe { &mut *state() };
+    let mut keep = 0usize;
+    for i in 0..s.count as usize {
+        if s.devices[i].controller_id != controller_id {
+            s.devices[keep] = s.devices[i];
+            keep += 1;
+        }
+    }
+    for i in keep..s.count as usize {
+        s.devices[i] = Device::EMPTY;
+    }
+    s.count = keep as u32;
 }
 pub(super) unsafe fn publish(mut device: Device) -> Option<usize> {
     let _guard = RuntimeGuard::acquire();
     let s = unsafe { &mut *state() };
     device.active = true;
-    if usize::from(s.count) >= CAPACITY {
+    if s.count as usize >= CAPACITY {
         s.truncated = true;
         return None;
     }
-    let index = usize::from(s.count);
+    let index = s.count as usize;
     s.devices[index] = device;
     s.count += 1;
     Some(index)
@@ -58,9 +81,7 @@ pub(super) unsafe fn publish_or_replace(mut device: Device) -> Option<usize> {
     device.active = true;
     for index in 0..unsafe { (*state()).count } as usize {
         let current = unsafe { ptr::addr_of!((*state()).devices[index]).read() };
-        if current.port == device.port
-            && unsafe { same_controller(current.controller, device.controller) }
-        {
+        if current.port == device.port && current.controller_id == device.controller_id {
             unsafe { ptr::addr_of_mut!((*state()).devices[index]).write(device) };
             return Some(index);
         }
@@ -70,27 +91,35 @@ pub(super) unsafe fn publish_or_replace(mut device: Device) -> Option<usize> {
 pub(super) unsafe fn remove(controller: crate::sched::sync_types::Text, port: u8) -> bool {
     let _guard = RuntimeGuard::acquire();
     let s = unsafe { &mut *state() };
-    for index in 0..usize::from(s.count) {
+    for index in 0..s.count as usize {
         if s.devices[index].port != port
             || !unsafe { same_controller(s.devices[index].controller, controller) }
         {
             continue;
         }
-        s.devices
-            .copy_within(index + 1..usize::from(s.count), index);
+        s.devices.copy_within(index + 1..s.count as usize, index);
         s.count = s.count.saturating_sub(1);
-        s.devices[usize::from(s.count)] = Device::EMPTY;
+        s.devices[s.count as usize] = Device::EMPTY;
         return true;
     }
     false
 }
+pub(super) unsafe fn count_controller(id: u32) -> usize {
+    let _guard = RuntimeGuard::acquire();
+    unsafe {
+        (&(*state()).devices)[..(*state()).count as usize]
+            .iter()
+            .filter(|d| d.controller_id == id)
+            .count()
+    }
+}
 pub(super) unsafe fn count() -> usize {
     let _guard = RuntimeGuard::acquire();
-    unsafe { usize::from((*state()).count) }
+    unsafe { (*state()).count as usize }
 }
 pub(super) unsafe fn device_at(index: usize) -> Option<Device> {
     let _guard = RuntimeGuard::acquire();
-    if index >= unsafe { usize::from((*state()).count) } {
+    if index >= unsafe { (*state()).count as usize } {
         return None;
     }
     Some(unsafe { ptr::addr_of!((*state()).devices[index]).read() })
@@ -100,10 +129,10 @@ pub(super) unsafe fn summary() -> CoreSummary {
     let s = unsafe { &*state() };
     CoreSummary {
         count: s.count,
-        configured: s.devices[..usize::from(s.count)]
+        configured: s.devices[..s.count as usize]
             .iter()
             .filter(|d| d.configured)
-            .count() as u8,
+            .count() as u32,
         truncated: s.truncated,
     }
 }

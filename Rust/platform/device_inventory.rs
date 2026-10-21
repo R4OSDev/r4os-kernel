@@ -379,10 +379,10 @@ fn msc() -> MscInput {
         value.assume_init()
     }
 }
-fn xhci(with_status: bool) -> XhciInput {
+fn xhci(pci_function: crate::platform::pci_scan::Device, with_status: bool) -> XhciInput {
     let mut value = MaybeUninit::uninit();
     unsafe {
-        inventory_xhci(with_status, value.as_mut_ptr());
+        inventory_xhci(pci_function, with_status, value.as_mut_ptr());
         value.assume_init()
     }
 }
@@ -1031,8 +1031,8 @@ fn network_note(snapshot: *mut Snapshot, index: usize, adapter: &NetInput) -> Te
     writer.text(adapter.last_error.slice());
     writer.result()
 }
-fn xhci_note(snapshot: *mut Snapshot) -> Text {
-    let host = xhci(true);
+fn xhci_note(snapshot: *mut Snapshot, pci_function: crate::platform::pci_scan::Device) -> Text {
+    let host = xhci(pci_function, true);
     if !host.exists {
         return Text::new(b"xHCI host registry entry unavailable");
     }
@@ -1087,10 +1087,10 @@ fn pci_record(snapshot: *mut Snapshot, device: crate::platform::pci_scan::Device
     let vendor = device.vendor_id;
     let id = device.device_id;
     let name = known_name(class, subclass, prog_if, vendor, id);
-    let binding = binding_for(class, subclass, prog_if, vendor, id);
+    let binding = binding_for(device, class, subclass, prog_if, vendor, id);
     let driver = driver_for(binding, class, subclass, vendor, id);
-    let status = status_for(binding, class, subclass, vendor, id);
-    let note = note_for(snapshot, class, subclass, prog_if, vendor, id);
+    let status = status_for(device, binding, class, subclass, vendor, id);
+    let note = note_for(device, snapshot, class, subclass, prog_if, vendor, id);
     Record {
         binding,
         bus: if device.bus_kind == crate::platform::pci_scan::ECAM {
@@ -1253,7 +1253,14 @@ const _: () = {
     assert!(core::mem::size_of::<Snapshot>() < 16 * 1024);
 };
 
-fn binding_for(class: u8, subclass: u8, prog_if: u8, vendor: u16, device: u16) -> u8 {
+fn binding_for(
+    pci_function: crate::platform::pci_scan::Device,
+    class: u8,
+    subclass: u8,
+    prog_if: u8,
+    vendor: u16,
+    device: u16,
+) -> u8 {
     if class == 1 && subclass == 1 && block_count(ATA, true) > 0 {
         return WITH_DRIVER;
     }
@@ -1266,7 +1273,7 @@ fn binding_for(class: u8, subclass: u8, prog_if: u8, vendor: u16, device: u16) -
     if class == 1 && subclass == 8 && block_count(NVME, false) > 0 {
         return WITH_DRIVER;
     }
-    if class == 12 && subclass == 3 && prog_if == 0x30 && xhci(false).present {
+    if class == 12 && subclass == 3 && prog_if == 0x30 && xhci(pci_function, false).present {
         return WITH_DRIVER;
     }
     if vendor == 0x10ec && matches!(device, 0x8139 | 0x8168) && has_net(vendor, device) {
@@ -1298,7 +1305,14 @@ fn binding_for(class: u8, subclass: u8, prog_if: u8, vendor: u16, device: u16) -
     }
     UNKNOWN
 }
-fn status_for(binding: u8, class: u8, subclass: u8, vendor: u16, device: u16) -> &'static [u8] {
+fn status_for(
+    pci_function: crate::platform::pci_scan::Device,
+    binding: u8,
+    class: u8,
+    subclass: u8,
+    vendor: u16,
+    device: u16,
+) -> &'static [u8] {
     if vendor == 0x10ec && matches!(device, 0x8139 | 0x8168) && has_net(vendor, device) {
         return b"active-netbackend";
     }
@@ -1341,16 +1355,16 @@ fn status_for(binding: u8, class: u8, subclass: u8, vendor: u16, device: u16) ->
         }
     }
     if class == 12 && subclass == 3 {
-        let host = xhci(false);
+        let host = xhci(pci_function, false);
         if host.exists && host.source == PRELOAD {
-            return if xhci(false).state == 1 {
+            return if xhci(pci_function, false).state == 1 {
                 b"host-preload-active"
             } else {
                 b"host-preload-failed"
             };
         }
-        if xhci(false).present {
-            let host = xhci(false);
+        if xhci(pci_function, false).present {
+            let host = xhci(pci_function, false);
             return if host.exists && host.state == 1 {
                 b"host-rescue-active"
             } else {
@@ -1366,6 +1380,7 @@ fn status_for(binding: u8, class: u8, subclass: u8, vendor: u16, device: u16) ->
     }
 }
 fn note_for(
+    pci_function: crate::platform::pci_scan::Device,
     snapshot: *mut Snapshot,
     class: u8,
     subclass: u8,
@@ -1396,8 +1411,8 @@ fn note_for(
     } else if class == 1 && subclass == 8 {
         b"NVMe candidate; standard owner is NVME.R4D preload"
     } else if class == 12 && subclass == 3 && prog_if == 0x30 {
-        if xhci(false).present {
-            return xhci_note(snapshot);
+        if xhci(pci_function, false).present {
+            return xhci_note(snapshot, pci_function);
         }
         b"xHCI USB candidate; standard owner is XHCI.R4D preload"
     } else if vendor == 0x10ec && device == 0x8139 && has_net(vendor, device) {
@@ -1630,7 +1645,11 @@ unsafe fn inventory_net(index: u64, out: *mut NetInput) -> bool {
     true
 }
 
-unsafe fn inventory_xhci(with_status: bool, out: *mut XhciInput) {
+unsafe fn inventory_xhci(
+    pci_function: crate::platform::pci_scan::Device,
+    with_status: bool,
+    out: *mut XhciInput,
+) {
     use crate::usb::{host_controller as host, types};
     let mut result = XhciInput {
         present: false,
@@ -1648,7 +1667,8 @@ unsafe fn inventory_xhci(with_status: bool, out: *mut XhciInput) {
         polls: 0,
         cancellations: 0,
     };
-    let index = unsafe { host::r4os_rust_usb_host_find(b"XHCI".as_ptr(), 4) };
+    let id = crate::usb::xhci_state::host_id_for_pci(pci_function);
+    let index = unsafe { host::r4os_rust_usb_host_index(id) };
     if index != usize::MAX {
         result.present = true;
         let mut value = MaybeUninit::uninit();

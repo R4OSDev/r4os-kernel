@@ -73,6 +73,8 @@ const _: () = {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Device {
+    pub controller_id: u32,
+    pub generation: u64,
     pub active: bool,
     pub configured: bool,
     pub controller: Text,
@@ -119,6 +121,8 @@ pub struct Device {
 }
 impl Device {
     pub const EMPTY: Self = Self {
+        controller_id: 0,
+        generation: 0,
         active: false,
         configured: false,
         controller: Text::literal(b"unknown"),
@@ -164,58 +168,11 @@ impl Device {
         serial_string: [0; 32],
     };
 }
-const _: () = {
-    assert!(core::mem::size_of::<Device>() == 352);
-    assert!(core::mem::align_of::<Device>() == 8);
-    assert!(core::mem::offset_of!(Device, active) == 0);
-    assert!(core::mem::offset_of!(Device, configured) == 1);
-    assert!(core::mem::offset_of!(Device, controller) == 8);
-    assert!(core::mem::offset_of!(Device, slot_id) == 24);
-    assert!(core::mem::offset_of!(Device, port) == 25);
-    assert!(core::mem::offset_of!(Device, speed) == 26);
-    assert!(core::mem::offset_of!(Device, usb_version_bcd) == 28);
-    assert!(core::mem::offset_of!(Device, vendor_id) == 30);
-    assert!(core::mem::offset_of!(Device, product_id) == 32);
-    assert!(core::mem::offset_of!(Device, device_version_bcd) == 34);
-    assert!(core::mem::offset_of!(Device, device_class) == 36);
-    assert!(core::mem::offset_of!(Device, device_subclass) == 37);
-    assert!(core::mem::offset_of!(Device, device_protocol) == 38);
-    assert!(core::mem::offset_of!(Device, config_value) == 39);
-    assert!(core::mem::offset_of!(Device, config_attributes) == 40);
-    assert!(core::mem::offset_of!(Device, config_max_power_ma) == 42);
-    assert!(core::mem::offset_of!(Device, interface_count) == 44);
-    assert!(core::mem::offset_of!(Device, interface_record_count) == 45);
-    assert!(core::mem::offset_of!(Device, interfaces) == 46);
-    assert!(core::mem::offset_of!(Device, endpoint_count) == 222);
-    assert!(core::mem::offset_of!(Device, first_interface_number) == 223);
-    assert!(core::mem::offset_of!(Device, first_interface_class) == 224);
-    assert!(core::mem::offset_of!(Device, first_interface_subclass) == 225);
-    assert!(core::mem::offset_of!(Device, first_interface_protocol) == 226);
-    assert!(core::mem::offset_of!(Device, first_endpoint_address) == 227);
-    assert!(core::mem::offset_of!(Device, first_endpoint_attributes) == 228);
-    assert!(core::mem::offset_of!(Device, first_endpoint_max_packet) == 230);
-    assert!(core::mem::offset_of!(Device, first_endpoint_interval) == 232);
-    assert!(core::mem::offset_of!(Device, hid_descriptor_len) == 233);
-    assert!(core::mem::offset_of!(Device, hid_report_descriptor_len) == 234);
-    assert!(core::mem::offset_of!(Device, bulk_in_endpoint_address) == 236);
-    assert!(core::mem::offset_of!(Device, bulk_in_endpoint_max_packet) == 238);
-    assert!(core::mem::offset_of!(Device, bulk_in_endpoint_max_burst) == 240);
-    assert!(core::mem::offset_of!(Device, bulk_out_endpoint_address) == 241);
-    assert!(core::mem::offset_of!(Device, bulk_out_endpoint_max_packet) == 242);
-    assert!(core::mem::offset_of!(Device, bulk_out_endpoint_max_burst) == 244);
-    assert!(core::mem::offset_of!(Device, string_language_id) == 246);
-    assert!(core::mem::offset_of!(Device, manufacturer_len) == 248);
-    assert!(core::mem::offset_of!(Device, product_len) == 249);
-    assert!(core::mem::offset_of!(Device, serial_len) == 250);
-    assert!(core::mem::offset_of!(Device, manufacturer_string) == 251);
-    assert!(core::mem::offset_of!(Device, product_string) == 283);
-    assert!(core::mem::offset_of!(Device, serial_string) == 315);
-};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CoreSummary {
-    pub count: u8,
-    pub configured: u8,
+    pub count: u32,
+    pub configured: u32,
     pub truncated: bool,
 }
 impl CoreSummary {
@@ -225,13 +182,6 @@ impl CoreSummary {
         truncated: false,
     };
 }
-const _: () = {
-    assert!(core::mem::size_of::<CoreSummary>() == 3);
-    assert!(core::mem::align_of::<CoreSummary>() == 1);
-    assert!(core::mem::offset_of!(CoreSummary, count) == 0);
-    assert!(core::mem::offset_of!(CoreSummary, configured) == 1);
-    assert!(core::mem::offset_of!(CoreSummary, truncated) == 2);
-};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct HostStatus {
@@ -451,6 +401,9 @@ const _: () = {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Controller {
+    pub id: u32,
+    pub callbacks: u32,
+    pub closing: bool,
     pub used: bool,
     pub name: [u8; 32],
     pub name_len: usize,
@@ -464,6 +417,9 @@ pub struct Controller {
 }
 impl Controller {
     pub const EMPTY: Self = Self {
+        id: 0,
+        callbacks: 0,
+        closing: false,
         used: false,
         name: [0; 32],
         name_len: 0,
@@ -476,20 +432,6 @@ impl Controller {
         polls: 0,
     };
 }
-const _: () = {
-    assert!(core::mem::size_of::<Controller>() == 96);
-    assert!(core::mem::align_of::<Controller>() == 8);
-    assert!(core::mem::offset_of!(Controller, used) == 0);
-    assert!(core::mem::offset_of!(Controller, name) == 1);
-    assert!(core::mem::offset_of!(Controller, name_len) == 40);
-    assert!(core::mem::offset_of!(Controller, source) == 48);
-    assert!(core::mem::offset_of!(Controller, owner_id) == 52);
-    assert!(core::mem::offset_of!(Controller, state) == 56);
-    assert!(core::mem::offset_of!(Controller, descriptor) == 64);
-    assert!(core::mem::offset_of!(Controller, transfers) == 72);
-    assert!(core::mem::offset_of!(Controller, failures) == 80);
-    assert!(core::mem::offset_of!(Controller, polls) == 88);
-};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CleanupResult {

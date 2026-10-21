@@ -111,7 +111,7 @@ impl Sink {
 }
 fn xhci_status() -> XhciStatus {
     unsafe {
-        let value = super::xhci::status();
+        let value = super::xhci_api::status();
         XhciStatus {
             interrupt_recoveries: value.interrupt_recoveries,
             interrupt_pending_timeouts: value.interrupt_pending_timeouts,

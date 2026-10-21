@@ -1,32 +1,33 @@
 //! Exact bounded descriptor selection and catalogue projection. No allocation,
 //! callback, wait or controller state outside the supplied owner is involved.
+use super::xhci_state::Context;
 use super::{
     types::Interface,
     xhci_types::{DescriptorInterface, Status},
 };
 use crate::sched::sync_types::Text;
-fn le16(bytes: &[u8], offset: usize) -> u16 {
+fn le16(_ctx: Context, bytes: &[u8], offset: usize) -> u16 {
     u16::from(bytes[offset]) | (u16::from(bytes[offset + 1]) << 8)
 }
-fn bump(value: &mut u8) {
+fn bump(_ctx: Context, value: &mut u8) {
     *value = value.saturating_add(1);
 }
-pub(super) fn parse_device(current: &mut Status, d: &[u8]) {
+pub(super) fn parse_device(ctx: Context, current: &mut Status, d: &[u8]) {
     current.descriptor_len = d[0];
     current.descriptor_type = d[1];
-    current.usb_version_bcd = le16(d, 2);
+    current.usb_version_bcd = le16(ctx, d, 2);
     current.device_class = d[4];
     current.device_subclass = d[5];
     current.device_protocol = d[6];
     current.device_max_packet0 = d[7];
-    current.device_vendor_id = le16(d, 8);
-    current.device_product_id = le16(d, 10);
-    current.device_version_bcd = le16(d, 12);
+    current.device_vendor_id = le16(ctx, d, 8);
+    current.device_product_id = le16(ctx, d, 10);
+    current.device_version_bcd = le16(ctx, d, 12);
     current.manufacturer_index = d[14];
     current.product_index = d[15];
     current.serial_index = d[16];
 }
-pub(super) fn mass_storage(c: &DescriptorInterface) -> bool {
+pub(super) fn mass_storage(_ctx: Context, c: &DescriptorInterface) -> bool {
     c.valid
         && c.class_code == 8
         && c.subclass == 6
@@ -34,17 +35,17 @@ pub(super) fn mass_storage(c: &DescriptorInterface) -> bool {
         && c.bulk_in_endpoint_address != 0
         && c.bulk_out_endpoint_address != 0
 }
-pub(super) fn boot_hid(c: &DescriptorInterface) -> bool {
+pub(super) fn boot_hid(_ctx: Context, c: &DescriptorInterface) -> bool {
     c.valid
         && c.class_code == 3
         && c.subclass == 1
         && (c.protocol == 1 || c.protocol == 2)
         && c.interrupt_in_endpoint_address != 0
 }
-fn rank(c: &DescriptorInterface) -> u8 {
-    if mass_storage(c) {
+fn rank(ctx: Context, c: &DescriptorInterface) -> u8 {
+    if mass_storage(ctx, c) {
         4
-    } else if boot_hid(c) {
+    } else if boot_hid(ctx, c) {
         3
     } else if c.valid && c.first_endpoint_address != 0 {
         2
@@ -52,10 +53,10 @@ fn rank(c: &DescriptorInterface) -> u8 {
         u8::from(c.valid)
     }
 }
-fn reason(c: &DescriptorInterface) -> Text {
-    Text::literal(if mass_storage(c) {
+fn reason(ctx: Context, c: &DescriptorInterface) -> Text {
+    Text::literal(if mass_storage(ctx, c) {
         b"mass-storage-bulk"
-    } else if boot_hid(c) {
+    } else if boot_hid(ctx, c) {
         if c.protocol == 1 {
             b"hid-boot-keyboard"
         } else if c.protocol == 2 {
@@ -71,12 +72,13 @@ fn reason(c: &DescriptorInterface) -> Text {
         b"none"
     })
 }
-fn select(c: &DescriptorInterface, selected: &mut DescriptorInterface) {
-    if c.valid && rank(c) > rank(selected) {
+fn select(ctx: Context, c: &DescriptorInterface, selected: &mut DescriptorInterface) {
+    if c.valid && rank(ctx, c) > rank(ctx, selected) {
         *selected = *c;
     }
 }
 fn endpoint(
+    ctx: Context,
     current: &mut Status,
     c: &mut DescriptorInterface,
     address: u8,
@@ -85,10 +87,10 @@ fn endpoint(
     interval: u8,
 ) {
     if !c.valid {
-        bump(&mut current.descriptor_malformed);
+        bump(ctx, &mut current.descriptor_malformed);
         return;
     }
-    bump(&mut c.endpoint_count);
+    bump(ctx, &mut c.endpoint_count);
     c.last_endpoint_address = address;
     if c.first_endpoint_address == 0 {
         c.first_endpoint_address = address;
@@ -111,15 +113,15 @@ fn endpoint(
         }
     }
 }
-fn companion(current: &mut Status, c: &mut DescriptorInterface, d: &[u8], len: u8) {
+fn companion(ctx: Context, current: &mut Status, c: &mut DescriptorInterface, d: &[u8], len: u8) {
     if !c.valid || len < 6 || c.last_endpoint_address == 0 {
-        bump(&mut current.descriptor_malformed);
+        bump(ctx, &mut current.descriptor_malformed);
         c.last_endpoint_address = 0;
         return;
     }
     let burst = d[2];
     if burst > 15 {
-        bump(&mut current.descriptor_malformed);
+        bump(ctx, &mut current.descriptor_malformed);
         c.last_endpoint_address = 0;
         return;
     }
@@ -131,21 +133,21 @@ fn companion(current: &mut Status, c: &mut DescriptorInterface, d: &[u8], len: u
     }
     c.last_endpoint_address = 0;
 }
-fn hid(current: &mut Status, c: &mut DescriptorInterface, d: &[u8], len: u8) {
+fn hid(ctx: Context, current: &mut Status, c: &mut DescriptorInterface, d: &[u8], len: u8) {
     if !c.valid {
-        bump(&mut current.descriptor_malformed);
+        bump(ctx, &mut current.descriptor_malformed);
         return;
     }
     c.hid_descriptor_len = len;
     if len < 9 {
-        bump(&mut current.descriptor_malformed);
+        bump(ctx, &mut current.descriptor_malformed);
         return;
     }
     let count = d[5];
     let (mut offset, mut seen) = (6usize, 0u8);
     while seen < count && offset + 3 <= usize::from(len) {
         let kind = d[offset];
-        let length = le16(d, offset + 1);
+        let length = le16(ctx, d, offset + 1);
         if kind == 0x22 && c.hid_report_descriptor_len == 0 {
             c.hid_report_descriptor_len = length;
         }
@@ -153,8 +155,8 @@ fn hid(current: &mut Status, c: &mut DescriptorInterface, d: &[u8], len: u8) {
         seen += 1;
     }
 }
-fn publish_selected(current: &mut Status, c: &DescriptorInterface) {
-    current.selected_interface_reason = reason(c);
+fn publish_selected(ctx: Context, current: &mut Status, c: &DescriptorInterface) {
+    current.selected_interface_reason = reason(ctx, c);
     current.first_interface_number = c.number;
     current.first_interface_class = c.class_code;
     current.first_interface_subclass = c.subclass;
@@ -165,13 +167,13 @@ fn publish_selected(current: &mut Status, c: &DescriptorInterface) {
     current.first_endpoint_interval = c.first_endpoint_interval;
     current.first_hid_descriptor_len = c.hid_descriptor_len;
     current.first_hid_report_descriptor_len = c.hid_report_descriptor_len;
-    if boot_hid(c) {
+    if boot_hid(ctx, c) {
         current.first_endpoint_address = c.interrupt_in_endpoint_address;
         current.first_endpoint_attributes = 3;
         current.first_endpoint_max_packet = c.interrupt_in_endpoint_max_packet;
         current.first_endpoint_interval = c.interrupt_in_endpoint_interval;
     }
-    if mass_storage(c) {
+    if mass_storage(ctx, c) {
         current.bulk_in_endpoint_address = c.bulk_in_endpoint_address;
         current.bulk_in_endpoint_max_packet = c.bulk_in_endpoint_max_packet;
         current.bulk_in_endpoint_max_burst = c.bulk_in_endpoint_max_burst;
@@ -180,12 +182,12 @@ fn publish_selected(current: &mut Status, c: &DescriptorInterface) {
         current.bulk_out_endpoint_max_burst = c.bulk_out_endpoint_max_burst;
     }
 }
-fn record_interface(current: &mut Status, c: &DescriptorInterface) {
+fn record_interface(ctx: Context, current: &mut Status, c: &DescriptorInterface) {
     if !c.valid {
         return;
     }
     if usize::from(current.interface_record_count) >= 8 {
-        bump(&mut current.descriptor_malformed);
+        bump(ctx, &mut current.descriptor_malformed);
         return;
     }
     let index = usize::from(current.interface_record_count);
@@ -212,8 +214,8 @@ fn record_interface(current: &mut Status, c: &DescriptorInterface) {
     };
     current.interface_record_count += 1;
 }
-pub(super) fn parse_config(current: &mut Status, d: &[u8], total: u16) {
-    current.config_total_length = le16(d, 2);
+pub(super) fn parse_config(ctx: Context, current: &mut Status, d: &[u8], total: u16) {
+    current.config_total_length = le16(ctx, d, 2);
     current.interface_count = d[4];
     current.interface_record_count = 0;
     current.interface_records = [Interface::EMPTY; 8];
@@ -250,17 +252,17 @@ pub(super) fn parse_config(current: &mut Status, d: &[u8], total: u16) {
         let len = d[offset];
         let kind = d[offset + 1];
         if len < 2 || offset + usize::from(len) > limit {
-            bump(&mut current.descriptor_malformed);
+            bump(ctx, &mut current.descriptor_malformed);
             break;
         }
-        bump(&mut current.descriptor_records);
+        bump(ctx, &mut current.descriptor_records);
         if kind != 5 && kind != 0x30 {
             active.last_endpoint_address = 0;
         }
         if kind == 4 {
             if len >= 9 {
-                select(&active, &mut selected);
-                record_interface(current, &active);
+                select(ctx, &active, &mut selected);
+                record_interface(ctx, current, &active);
                 active = DescriptorInterface {
                     valid: true,
                     number: d[offset + 2],
@@ -270,35 +272,36 @@ pub(super) fn parse_config(current: &mut Status, d: &[u8], total: u16) {
                     ..DescriptorInterface::EMPTY
                 };
             } else {
-                bump(&mut current.descriptor_malformed);
+                bump(ctx, &mut current.descriptor_malformed);
             }
         } else if kind == 5 {
             if len < 7 {
-                bump(&mut current.descriptor_malformed);
+                bump(ctx, &mut current.descriptor_malformed);
                 offset += usize::from(len);
                 continue;
             }
-            bump(&mut current.endpoint_count);
+            bump(ctx, &mut current.endpoint_count);
             endpoint(
+                ctx,
                 current,
                 &mut active,
                 d[offset + 2],
                 d[offset + 3],
-                le16(d, offset + 4),
+                le16(ctx, d, offset + 4),
                 d[offset + 6],
             );
         } else if kind == 0x21 {
-            bump(&mut current.hid_descriptor_count);
-            hid(current, &mut active, &d[offset..], len);
+            bump(ctx, &mut current.hid_descriptor_count);
+            hid(ctx, current, &mut active, &d[offset..], len);
         } else if kind == 0x30 {
-            bump(&mut current.ss_endpoint_companion_count);
-            companion(current, &mut active, &d[offset..], len);
+            bump(ctx, &mut current.ss_endpoint_companion_count);
+            companion(ctx, current, &mut active, &d[offset..], len);
         } else if kind != 2 && kind != 3 && kind != 1 {
-            bump(&mut current.descriptor_unknown);
+            bump(ctx, &mut current.descriptor_unknown);
         }
         offset += usize::from(len);
     }
-    select(&active, &mut selected);
-    record_interface(current, &active);
-    publish_selected(current, &selected);
+    select(ctx, &active, &mut selected);
+    record_interface(ctx, current, &active);
+    publish_selected(ctx, current, &selected);
 }

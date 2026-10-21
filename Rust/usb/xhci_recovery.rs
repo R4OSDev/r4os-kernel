@@ -1,5 +1,6 @@
 //! Generation-bound endpoint recovery. One original budget spans every step;
 //! recovering a failed slot never enumerates its replacement on the same port.
+use super::xhci_state::Context;
 use super::{
     endpoint_recovery::{self, EndpointState, PrepareAction},
     wait_types::Deadline,
@@ -17,138 +18,142 @@ pub(super) enum EndpointFaultClass {
     Interrupt,
     Bulk,
 }
-unsafe fn set_fault(class: EndpointFaultClass, value: bool) {
+unsafe fn set_fault(ctx: Context, class: EndpointFaultClass, value: bool) {
     unsafe {
         match class {
-            EndpointFaultClass::Control => (*current()).control_endpoint_faulted = value,
-            EndpointFaultClass::Interrupt => (*current()).interrupt_endpoint_faulted = value,
-            EndpointFaultClass::Bulk => (*current()).bulk_endpoints_faulted = value,
+            EndpointFaultClass::Control => (*current(ctx)).control_endpoint_faulted = value,
+            EndpointFaultClass::Interrupt => (*current(ctx)).interrupt_endpoint_faulted = value,
+            EndpointFaultClass::Bulk => (*current(ctx)).bulk_endpoints_faulted = value,
         }
     }
 }
-pub(super) unsafe fn mark_dci_recovery_failed(dci: u8, class: EndpointFaultClass) {
+pub(super) unsafe fn mark_dci_recovery_failed(ctx: Context, dci: u8, class: EndpointFaultClass) {
     unsafe {
-        (*current()).failures = (*current()).failures.wrapping_add(1);
-        (*current()).reason = Text::literal(b"xHCI endpoint recovery failed");
+        (*current(ctx)).failures = (*current(ctx)).failures.wrapping_add(1);
+        (*current(ctx)).reason = Text::literal(b"xHCI endpoint recovery failed");
         let token = diag::begin();
         diag::write(b"[XHCI] endpoint recovery failed slot=");
-        diag::dec((*current()).addressed_slot_id);
+        diag::dec((*current(ctx)).addressed_slot_id);
         diag::write(b" ep=");
         diag::dec(dci);
         diag::write(b" state=");
-        if let Some(s) = endpoint_state(dci) {
+        if let Some(s) = endpoint_state(ctx, dci) {
             diag::dec(s as u8);
         } else {
             diag::write(b"unknown");
         }
         diag::write(b" cc=");
-        diag::dec((*current()).last_completion_code);
+        diag::dec((*current(ctx)).last_completion_code);
         diag::end();
         diag::resolve(token);
-        set_fault(class, true);
+        set_fault(ctx, class, true);
     }
 }
-unsafe fn fault_class(address: u8) -> EndpointFaultClass {
-    if address == unsafe { (*current()).interrupt_endpoint_address } {
+unsafe fn fault_class(ctx: Context, address: u8) -> EndpointFaultClass {
+    if address == unsafe { (*current(ctx)).interrupt_endpoint_address } {
         EndpointFaultClass::Interrupt
     } else {
         EndpointFaultClass::Bulk
     }
 }
 pub(super) unsafe fn endpoint_recovery_command_within(
+    ctx: Context,
     control: u32,
     parameter: u64,
     budget: Option<&Deadline>,
 ) -> Option<u8> {
     unsafe {
-        (*current()).last_completion_code = 0xff;
-        let event = submit_command_within(parameter, 0, control, budget)?;
-        (*current()).last_completion_code = event.code;
-        (*current()).last_slot_id = event.slot_id;
+        (*current(ctx)).last_completion_code = 0xff;
+        let event = submit_command_within(ctx, parameter, 0, control, budget)?;
+        (*current(ctx)).last_completion_code = event.code;
+        (*current(ctx)).last_slot_id = event.slot_id;
         Some(event.code)
     }
 }
-unsafe fn drain_unresolved_transfer_dci(dci: u8) {
+unsafe fn drain_unresolved_transfer_dci(ctx: Context, dci: u8) {
     unsafe {
-        let Some(handle) = (*state())
+        let Some(handle) = (*state(ctx))
             .transfer_objects
-            .timed_out_handle((*current()).addressed_slot_id, dci)
+            .timed_out_handle((*current(ctx)).addressed_slot_id, dci)
         else {
             return;
         };
-        let Some(owner) = (*state()).transfer_objects.match_for_handle(handle) else {
+        let Some(owner) = (*state(ctx)).transfer_objects.match_for_handle(handle) else {
             return;
         };
-        let _ = drain_event_batch(owner);
-        (*state()).deferred_events.purge(owner);
-        (*state()).transfer_objects.cancel(handle);
-        (*state()).transfer_objects.release(handle);
-        close_last_sync_transfer_incident();
+        let _ = drain_event_batch(ctx, owner);
+        (*state(ctx)).deferred_events.purge(owner);
+        (*state(ctx)).transfer_objects.cancel(handle);
+        (*state(ctx)).transfer_objects.release(handle);
+        close_last_sync_transfer_incident(ctx);
     }
 }
-pub(super) unsafe fn set_configuration_for_handle(handle: *mut DeviceHandle) -> bool {
+pub(super) unsafe fn set_configuration_for_handle(ctx: Context, handle: *mut DeviceHandle) -> bool {
     unsafe {
-        if !select_device_handle(handle) {
+        if !select_device_handle(ctx, handle) {
             return false;
         }
-        if (*current()).set_configuration_ok && (*current()).config_value == (*handle).config_value
+        if (*current(ctx)).set_configuration_ok
+            && (*current(ctx)).config_value == (*handle).config_value
         {
             return true;
         }
-        set_first_configuration()
+        set_first_configuration(ctx)
     }
 }
-pub(super) unsafe fn set_first_configuration() -> bool {
+pub(super) unsafe fn set_first_configuration(ctx: Context) -> bool {
     unsafe {
-        if !selected_allows_mutation() {
+        if !selected_allows_mutation(ctx) {
             return false;
         }
-        (*current()).set_configuration_attempted = true;
-        (*current()).set_configuration_ok = submit_control_no_data(
+        (*current(ctx)).set_configuration_attempted = true;
+        (*current(ctx)).set_configuration_ok = submit_control_no_data(
+            ctx,
             0,
             USB_REQ_SET_CONFIGURATION,
-            u16::from((*current()).config_value),
+            u16::from((*current(ctx)).config_value),
             0,
         );
         puts(b"[USBCONFIG] slot=");
-        diag::console_dec((*current()).addressed_slot_id);
+        diag::console_dec((*current(ctx)).addressed_slot_id);
         puts(b" port=");
-        diag::console_dec((*current()).addressed_port);
+        diag::console_dec((*current(ctx)).addressed_port);
         puts(b" vid=");
-        diag::console_hex((*current()).device_vendor_id, 4);
+        diag::console_hex((*current(ctx)).device_vendor_id, 4);
         puts(b" pid=");
-        diag::console_hex((*current()).device_product_id, 4);
+        diag::console_hex((*current(ctx)).device_product_id, 4);
         puts(b" value=");
-        diag::console_dec((*current()).config_value);
+        diag::console_dec((*current(ctx)).config_value);
         puts(b" result=");
-        puts(if (*current()).set_configuration_ok {
+        puts(if (*current(ctx)).set_configuration_ok {
             b"OK"
         } else {
             b"FAILED"
         });
         puts(b" code=");
-        diag::console_dec((*current()).last_control_completion_code);
+        diag::console_dec((*current(ctx)).last_control_completion_code);
         puts(b"\r\n");
-        (*current()).set_configuration_ok
+        (*current(ctx)).set_configuration_ok
     }
 }
-unsafe fn recovery_port_ready(port: u8) -> bool {
+unsafe fn recovery_port_ready(ctx: Context, port: u8) -> bool {
     unsafe {
-        if !(*current()).present
-            || !(*current()).controller_running
-            || (*current()).mmio_virt == 0
+        if !(*current(ctx)).present
+            || !(*current(ctx)).controller_running
+            || (*current(ctx)).mmio_virt == 0
             || port == 0
-            || port > (*current()).port_count_seen
+            || port > (*current(ctx)).port_count_seen
         {
             return false;
         }
-        let value = read_op32(OP_PORT_BASE + u64::from(port - 1) * OP_PORT_STRIDE);
+        let value = read_op32(ctx, OP_PORT_BASE + u64::from(port - 1) * OP_PORT_STRIDE);
         value & PORTSC_CCS != 0
             && value & PORTSC_PED != 0
-            && port_link_state(value) == PORTSC_PLS_U0
+            && port_link_state(ctx, value) == PORTSC_PLS_U0
     }
 }
 pub(super) unsafe fn select_existing_runtime_for_recovery(
+    ctx: Context,
     handle: *mut DeviceHandle,
     budget: Option<&Deadline>,
 ) -> bool {
@@ -156,49 +161,52 @@ pub(super) unsafe fn select_existing_runtime_for_recovery(
         if budget.is_some_and(Deadline::expired_any) {
             return false;
         }
-        let Some(index) = runtime_index_for_identity((*handle).slot_id, (*handle).port) else {
+        let Some(index) = runtime_index_for_identity(ctx, (*handle).slot_id, (*handle).port) else {
             return false;
         };
-        let rt = ptr::addr_of!((*state()).runtimes[index]).read();
+        let rt = ptr::addr_of!((*state(ctx)).runtimes[index]).read();
         if rt.detach_pending || ((*handle).generation != 0 && rt.generation != (*handle).generation)
         {
             return false;
         }
-        if rt.transaction_active && !super::xhci_owner::transaction_owned(rt) {
+        if rt.transaction_active && !super::xhci_owner::transaction_owned(ctx, rt) {
             return false;
         }
-        if !recovery_port_ready((*handle).port) || budget.is_some_and(Deadline::expired_any) {
+        if !recovery_port_ready(ctx, (*handle).port) || budget.is_some_and(Deadline::expired_any) {
             return false;
         }
-        if !activate_runtime(index)
-            || (*current()).addressed_slot_id != (*handle).slot_id
-            || (*current()).addressed_port != (*handle).port
+        if !activate_runtime(ctx, index)
+            || (*current(ctx)).addressed_slot_id != (*handle).slot_id
+            || (*current(ctx)).addressed_port != (*handle).port
         {
             return false;
         }
         if budget.is_some_and(Deadline::expired_any) {
             return false;
         }
-        refresh_handle_from_current(handle);
+        refresh_handle_from_current(ctx, handle);
         true
     }
 }
 pub(super) unsafe fn reset_mass_storage_interface_for_handle(
+    ctx: Context,
     handle: *mut DeviceHandle,
     interface: u8,
     budget: Option<&Deadline>,
 ) -> bool {
     unsafe {
-        select_existing_runtime_for_recovery(handle, budget)
-            && reset_first_mass_storage_interface(interface, budget)
+        select_existing_runtime_for_recovery(ctx, handle, budget)
+            && reset_first_mass_storage_interface(ctx, interface, budget)
     }
 }
 pub(super) unsafe fn reset_first_mass_storage_interface(
+    ctx: Context,
     interface: u8,
     budget: Option<&Deadline>,
 ) -> bool {
     unsafe {
         submit_control_no_data_within(
+            ctx,
             0x21,
             MSC_REQ_BULK_ONLY_RESET,
             0,
@@ -208,18 +216,24 @@ pub(super) unsafe fn reset_first_mass_storage_interface(
     }
 }
 pub(super) unsafe fn clear_endpoint_halt_for_handle(
+    ctx: Context,
     handle: *mut DeviceHandle,
     address: u8,
     budget: Option<&Deadline>,
 ) -> bool {
     unsafe {
-        select_existing_runtime_for_recovery(handle, budget)
-            && clear_first_endpoint_halt(address, budget)
+        select_existing_runtime_for_recovery(ctx, handle, budget)
+            && clear_first_endpoint_halt(ctx, address, budget)
     }
 }
-pub(super) unsafe fn clear_first_endpoint_halt(address: u8, budget: Option<&Deadline>) -> bool {
+pub(super) unsafe fn clear_first_endpoint_halt(
+    ctx: Context,
+    address: u8,
+    budget: Option<&Deadline>,
+) -> bool {
     unsafe {
         submit_control_no_data_within(
+            ctx,
             0x02,
             USB_REQ_CLEAR_FEATURE,
             USB_FEATURE_ENDPOINT_HALT,
@@ -229,119 +243,125 @@ pub(super) unsafe fn clear_first_endpoint_halt(address: u8, budget: Option<&Dead
     }
 }
 pub(super) unsafe fn reconfigure_mass_storage_bulk_endpoints_for_handle_within(
+    ctx: Context,
     handle: *mut DeviceHandle,
     input: u8,
     output: u8,
     budget: &Deadline,
 ) -> bool {
     unsafe {
-        if !select_existing_runtime_for_recovery(handle, Some(budget))
-            || !reconfigure_stopped_bulk_endpoints_within(input, output, budget)
+        if !select_existing_runtime_for_recovery(ctx, handle, Some(budget))
+            || !reconfigure_stopped_bulk_endpoints_within(ctx, input, output, budget)
         {
             return false;
         }
-        refresh_handle_from_current(handle);
+        refresh_handle_from_current(ctx, handle);
         true
     }
 }
-unsafe fn fail_bulk_reconfigure(reason: &'static [u8]) -> bool {
+unsafe fn fail_bulk_reconfigure(ctx: Context, reason: &'static [u8]) -> bool {
     unsafe {
-        (*current()).failures = (*current()).failures.wrapping_add(1);
-        (*current()).reason = Text::literal(reason);
-        (*current()).bulk_endpoints_configured = false;
-        (*current()).bulk_endpoints_faulted = true;
+        (*current(ctx)).failures = (*current(ctx)).failures.wrapping_add(1);
+        (*current(ctx)).reason = Text::literal(reason);
+        (*current(ctx)).bulk_endpoints_configured = false;
+        (*current(ctx)).bulk_endpoints_faulted = true;
         let token = diag::begin();
         diag::write(b"[XHCI] BOT bulk reconfigure failed slot=");
-        diag::dec((*current()).addressed_slot_id);
+        diag::dec((*current(ctx)).addressed_slot_id);
         diag::write(b" in=");
-        diag::dec((*current()).bulk_in_endpoint_id);
+        diag::dec((*current(ctx)).bulk_in_endpoint_id);
         diag::write(b" out=");
-        diag::dec((*current()).bulk_out_endpoint_id);
+        diag::dec((*current(ctx)).bulk_out_endpoint_id);
         diag::write(b" cc=");
-        diag::dec((*current()).last_completion_code);
+        diag::dec((*current(ctx)).last_completion_code);
         diag::end();
         diag::resolve(token);
         false
     }
 }
 unsafe fn reconfigure_stopped_bulk_endpoints_within(
+    ctx: Context,
     input: u8,
     output: u8,
     budget: &Deadline,
 ) -> bool {
     unsafe {
-        (*current()).last_completion_code = 0xff;
-        let i = endpoint_dci(input);
-        let o = endpoint_dci(output);
-        if (*current()).addressed_slot_id == 0
-            || (*state()).first_input_virt == 0
-            || (*state()).first_device_virt == 0
+        (*current(ctx)).last_completion_code = 0xff;
+        let i = endpoint_dci(ctx, input);
+        let o = endpoint_dci(ctx, output);
+        if (*current(ctx)).addressed_slot_id == 0
+            || (*state(ctx)).first_input_virt == 0
+            || (*state(ctx)).first_device_virt == 0
             || i == 0
             || o == 0
             || i >= 32
             || o >= 32
             || input & 0x80 == 0
             || output & 0x80 != 0
-            || input != (*current()).bulk_in_endpoint_address
-            || output != (*current()).bulk_out_endpoint_address
+            || input != (*current(ctx)).bulk_in_endpoint_address
+            || output != (*current(ctx)).bulk_out_endpoint_address
         {
-            return fail_bulk_reconfigure(b"xHCI BOT bulk identity invalid");
+            return fail_bulk_reconfigure(ctx, b"xHCI BOT bulk identity invalid");
         }
         if budget.expired_any() {
-            return fail_bulk_reconfigure(b"xHCI BOT bulk reconfigure budget expired");
+            return fail_bulk_reconfigure(ctx, b"xHCI BOT bulk reconfigure budget expired");
         }
-        let Some(ins) = endpoint_state(i) else {
-            return fail_bulk_reconfigure(b"xHCI BOT bulk IN state missing");
+        let Some(ins) = endpoint_state(ctx, i) else {
+            return fail_bulk_reconfigure(ctx, b"xHCI BOT bulk IN state missing");
         };
-        let Some(outs) = endpoint_state(o) else {
-            return fail_bulk_reconfigure(b"xHCI BOT bulk OUT state missing");
+        let Some(outs) = endpoint_state(ctx, o) else {
+            return fail_bulk_reconfigure(ctx, b"xHCI BOT bulk OUT state missing");
         };
         if !matches!(ins, EndpointState::Stopped) || !matches!(outs, EndpointState::Stopped) {
-            return fail_bulk_reconfigure(b"xHCI BOT bulk endpoint not stopped");
+            return fail_bulk_reconfigure(ctx, b"xHCI BOT bulk endpoint not stopped");
         }
-        let Some(ideq) = endpoint_ring_dequeue(input) else {
-            return fail_bulk_reconfigure(b"xHCI BOT bulk IN dequeue missing");
+        let Some(ideq) = endpoint_ring_dequeue(ctx, input) else {
+            return fail_bulk_reconfigure(ctx, b"xHCI BOT bulk IN dequeue missing");
         };
-        let Some(odeq) = endpoint_ring_dequeue(output) else {
-            return fail_bulk_reconfigure(b"xHCI BOT bulk OUT dequeue missing");
+        let Some(odeq) = endpoint_ring_dequeue(ctx, output) else {
+            return fail_bulk_reconfigure(ctx, b"xHCI BOT bulk OUT dequeue missing");
         };
-        let ctx = (*state()).first_input_virt as *mut u32;
-        ptr::write_bytes(ctx, 0, INPUT_CONTEXT_BYTES / 4);
-        let words = usize::from((*current()).context_size) / 4;
-        ctx.write((1 << i) | (1 << o));
-        ctx.add(1).write(1 | (1 << i) | (1 << o));
+        let input_context = (*state(ctx)).first_input_virt as *mut u32;
+        ptr::write_bytes(input_context, 0, INPUT_CONTEXT_BYTES / 4);
+        let words = usize::from((*current(ctx)).context_size) / 4;
+        input_context.write((1 << i) | (1 << o));
+        input_context.add(1).write(1 | (1 << i) | (1 << o));
         dma_fence();
-        copy_output_slot_context_to_input(ctx.add(words));
-        let ic = endpoint_context(ctx, words, i);
-        let oc = endpoint_context(ctx, words, o);
-        copy_output_endpoint_context_to_input(ic, i);
-        copy_output_endpoint_context_to_input(oc, o);
+        copy_output_slot_context_to_input(ctx, input_context.add(words));
+        let ic = endpoint_context(ctx, input_context, words, i);
+        let oc = endpoint_context(ctx, input_context, words, o);
+        copy_output_endpoint_context_to_input(ctx, ic, i);
+        copy_output_endpoint_context_to_input(ctx, oc, o);
         ic.add(2).write(ideq as u32);
         ic.add(3).write((ideq >> 32) as u32);
         oc.add(2).write(odeq as u32);
         oc.add(3).write((odeq >> 32) as u32);
-        (*current()).bulk_endpoints_configured = false;
-        (*current()).bulk_endpoints_faulted = true;
+        (*current(ctx)).bulk_endpoints_configured = false;
+        (*current(ctx)).bulk_endpoints_faulted = true;
         let command = trb_type(TRB_TYPE_CONFIGURE_ENDPOINT)
-            | (u32::from((*current()).addressed_slot_id) << 24);
-        let Some(event) =
-            submit_command_within((*current()).input_context_phys, 0, command, Some(budget))
-        else {
-            return fail_bulk_reconfigure(b"xHCI BOT bulk reconfigure timeout");
+            | (u32::from((*current(ctx)).addressed_slot_id) << 24);
+        let Some(event) = submit_command_within(
+            ctx,
+            (*current(ctx)).input_context_phys,
+            0,
+            command,
+            Some(budget),
+        ) else {
+            return fail_bulk_reconfigure(ctx, b"xHCI BOT bulk reconfigure timeout");
         };
-        (*current()).last_completion_code = event.code;
-        (*current()).last_slot_id = event.slot_id;
-        if event.code != COMPLETION_SUCCESS || event.slot_id != (*current()).addressed_slot_id {
-            return fail_bulk_reconfigure(b"xHCI BOT bulk reconfigure rejected");
+        (*current(ctx)).last_completion_code = event.code;
+        (*current(ctx)).last_slot_id = event.slot_id;
+        if event.code != COMPLETION_SUCCESS || event.slot_id != (*current(ctx)).addressed_slot_id {
+            return fail_bulk_reconfigure(ctx, b"xHCI BOT bulk reconfigure rejected");
         }
-        (*current()).bulk_endpoints_configured = true;
-        (*current()).bulk_endpoints_faulted = false;
+        (*current(ctx)).bulk_endpoints_configured = true;
+        (*current(ctx)).bulk_endpoints_faulted = false;
         true
     }
 }
-unsafe fn copy_output_slot_context_to_input(dest: *mut u32) {
+unsafe fn copy_output_slot_context_to_input(ctx: Context, dest: *mut u32) {
     unsafe {
-        let source = (*state()).first_device_virt;
+        let source = (*state(ctx)).first_device_virt;
         dest.write(volatile_read32(source) & !(1 << 24));
         dest.add(1).write(volatile_read32(source + 4));
         dest.add(2)
@@ -349,70 +369,76 @@ unsafe fn copy_output_slot_context_to_input(dest: *mut u32) {
         dest.add(3).write(0);
     }
 }
-unsafe fn copy_output_endpoint_context_to_input(dest: *mut u32, dci: u8) {
+unsafe fn copy_output_endpoint_context_to_input(ctx: Context, dest: *mut u32, dci: u8) {
     unsafe {
-        let source =
-            (*state()).first_device_virt + u64::from((*current()).context_size) * u64::from(dci);
+        let source = (*state(ctx)).first_device_virt
+            + u64::from((*current(ctx)).context_size) * u64::from(dci);
         dest.write(volatile_read32(source) & 0xffff_ff00);
         dest.add(1).write(volatile_read32(source + 4) & !0x41);
         dest.add(4).write(volatile_read32(source + 16));
     }
 }
 pub(super) unsafe fn reset_endpoint_state_for_handle(
+    ctx: Context,
     handle: *mut DeviceHandle,
     address: u8,
     budget: Option<&Deadline>,
 ) -> bool {
     unsafe {
-        select_existing_runtime_for_recovery(handle, budget)
-            && reset_first_endpoint_state(address, budget)
+        select_existing_runtime_for_recovery(ctx, handle, budget)
+            && reset_first_endpoint_state(ctx, address, budget)
     }
 }
-pub(super) unsafe fn reset_first_endpoint_state(address: u8, budget: Option<&Deadline>) -> bool {
+pub(super) unsafe fn reset_first_endpoint_state(
+    ctx: Context,
+    address: u8,
+    budget: Option<&Deadline>,
+) -> bool {
     unsafe {
-        if (*current()).addressed_slot_id == 0 {
+        if (*current(ctx)).addressed_slot_id == 0 {
             return false;
         }
-        let dci = endpoint_dci(address);
+        let dci = endpoint_dci(ctx, address);
         if dci == 0 || dci >= 32 {
             return false;
         }
-        let class = fault_class(address);
-        let Some(dequeue) = endpoint_ring_dequeue(address) else {
-            mark_dci_recovery_failed(dci, class);
+        let class = fault_class(ctx, address);
+        let Some(dequeue) = endpoint_ring_dequeue(ctx, address) else {
+            mark_dci_recovery_failed(ctx, dci, class);
             return false;
         };
-        recover_endpoint_dci(dci, dequeue, class, budget)
+        recover_endpoint_dci(ctx, dci, dequeue, class, budget)
     }
 }
-pub(super) unsafe fn recover_control_endpoint(budget: Option<&Deadline>) -> bool {
+pub(super) unsafe fn recover_control_endpoint(ctx: Context, budget: Option<&Deadline>) -> bool {
     unsafe {
-        if (*current()).addressed_slot_id == 0 {
+        if (*current(ctx)).addressed_slot_id == 0 {
             return false;
         }
-        let Some(dequeue) = control_ring_dequeue() else {
-            mark_dci_recovery_failed(1, EndpointFaultClass::Control);
+        let Some(dequeue) = control_ring_dequeue(ctx) else {
+            mark_dci_recovery_failed(ctx, 1, EndpointFaultClass::Control);
             return false;
         };
-        recover_endpoint_dci(1, dequeue, EndpointFaultClass::Control, budget)
+        recover_endpoint_dci(ctx, 1, dequeue, EndpointFaultClass::Control, budget)
     }
 }
 unsafe fn recover_endpoint_dci(
+    ctx: Context,
     dci: u8,
     dequeue: u64,
     class: EndpointFaultClass,
     budget: Option<&Deadline>,
 ) -> bool {
     unsafe {
-        if !selected_allows_mutation() || dci == 0 || dci >= 32 {
+        if !selected_allows_mutation(ctx) || dci == 0 || dci >= 32 {
             return false;
         }
-        let fields = (u32::from(dci) << 16) | (u32::from((*current()).addressed_slot_id) << 24);
+        let fields = (u32::from(dci) << 16) | (u32::from((*current(ctx)).addressed_slot_id) << 24);
         for _ in 0..ENDPOINT_RECOVERY_COMMAND_ATTEMPTS {
             if budget.is_some_and(Deadline::expired_any) {
                 break;
             }
-            let Some(s) = endpoint_state(dci) else {
+            let Some(s) = endpoint_state(ctx, dci) else {
                 break;
             };
             let action = endpoint_recovery::prepare_action(s);
@@ -428,7 +454,7 @@ unsafe fn recover_endpoint_dci(
                 0
             };
             let Some(code) =
-                endpoint_recovery_command_within(trb_type(kind) | fields, parameter, budget)
+                endpoint_recovery_command_within(ctx, trb_type(kind) | fields, parameter, budget)
             else {
                 break;
             };
@@ -439,71 +465,78 @@ unsafe fn recover_endpoint_dci(
                 break;
             }
             if matches!(action, PrepareAction::SetDequeue) {
-                drain_unresolved_transfer_dci(dci);
-                set_fault(class, false);
+                drain_unresolved_transfer_dci(ctx, dci);
+                set_fault(ctx, class, false);
                 return true;
             }
         }
-        mark_dci_recovery_failed(dci, class);
+        mark_dci_recovery_failed(ctx, dci, class);
         false
     }
 }
 pub(super) unsafe fn set_hid_boot_protocol_for_handle(
+    ctx: Context,
     handle: *mut DeviceHandle,
     interface: u8,
 ) -> bool {
-    unsafe { select_device_handle(handle) && set_first_hid_boot_protocol(interface) }
+    unsafe { select_device_handle(ctx, handle) && set_first_hid_boot_protocol(ctx, interface) }
 }
-pub(super) unsafe fn set_first_hid_boot_protocol(interface: u8) -> bool {
+pub(super) unsafe fn set_first_hid_boot_protocol(ctx: Context, interface: u8) -> bool {
     unsafe {
-        (*current()).hid_set_protocol_attempted = true;
-        (*current()).hid_set_protocol_ok =
-            submit_control_no_data(0x21, HID_REQ_SET_PROTOCOL, 0, u16::from(interface));
-        (*current()).hid_set_protocol_ok
+        (*current(ctx)).hid_set_protocol_attempted = true;
+        (*current(ctx)).hid_set_protocol_ok =
+            submit_control_no_data(ctx, 0x21, HID_REQ_SET_PROTOCOL, 0, u16::from(interface));
+        (*current(ctx)).hid_set_protocol_ok
     }
 }
-pub(super) unsafe fn set_hid_idle_for_handle(handle: *mut DeviceHandle, interface: u8) -> bool {
-    unsafe { select_device_handle(handle) && set_first_hid_idle(interface) }
+pub(super) unsafe fn set_hid_idle_for_handle(
+    ctx: Context,
+    handle: *mut DeviceHandle,
+    interface: u8,
+) -> bool {
+    unsafe { select_device_handle(ctx, handle) && set_first_hid_idle(ctx, interface) }
 }
-pub(super) unsafe fn set_first_hid_idle(interface: u8) -> bool {
+pub(super) unsafe fn set_first_hid_idle(ctx: Context, interface: u8) -> bool {
     unsafe {
-        (*current()).hid_set_idle_attempted = true;
-        (*current()).hid_set_idle_ok =
-            submit_control_no_data(0x21, HID_REQ_SET_IDLE, 0, u16::from(interface));
-        (*current()).hid_set_idle_ok
+        (*current(ctx)).hid_set_idle_attempted = true;
+        (*current(ctx)).hid_set_idle_ok =
+            submit_control_no_data(ctx, 0x21, HID_REQ_SET_IDLE, 0, u16::from(interface));
+        (*current(ctx)).hid_set_idle_ok
     }
 }
 pub(super) unsafe fn get_hid_report_descriptor_for_handle(
+    ctx: Context,
     handle: *mut DeviceHandle,
     interface: u8,
     expected: u16,
     out: &mut [u8],
 ) -> Option<usize> {
     unsafe {
-        if !select_device_handle(handle)
-            || !selected_allows_mutation()
+        if !select_device_handle(ctx, handle)
+            || !selected_allows_mutation(ctx)
             || expected == 0
             || out.is_empty()
-            || (*state()).first_descriptor_virt == 0
+            || (*state(ctx)).first_descriptor_virt == 0
         {
             return None;
         }
         let len = usize::from(expected).min(DESCRIPTOR_BYTES).min(out.len()) as u16;
-        let desc = (*state()).first_descriptor_virt as *mut u8;
+        let desc = (*state(ctx)).first_descriptor_virt as *mut u8;
         ptr::write_bytes(desc, 0, usize::from(len));
         if !submit_control_in_typed(
+            ctx,
             0x81,
             USB_REQ_GET_DESCRIPTOR,
             u16::from(USB_DESC_REPORT) << 8,
             u16::from(interface),
             len,
-            (*current()).descriptor_phys,
+            (*current(ctx)).descriptor_phys,
         ) {
             return None;
         }
-        let actual = (u32::from(len) - (*current()).last_control_residue) as usize;
+        let actual = (u32::from(len) - (*current(ctx)).last_control_residue) as usize;
         ptr::copy_nonoverlapping(desc, out.as_mut_ptr(), actual);
-        refresh_handle_from_current(handle);
+        refresh_handle_from_current(ctx, handle);
         Some(actual)
     }
 }

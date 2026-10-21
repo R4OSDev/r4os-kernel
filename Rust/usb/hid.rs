@@ -4,9 +4,7 @@
 use super::{
     core as usb_core, hid_report,
     hid_types::{HidBinding, HidInterfaceCandidate as Candidate, Options, PollTaskSummary, Status},
-    host_controller, xhci,
-    xhci_api::Guard,
-    xhci_diag as diag,
+    host_controller, xhci_api as xhci, xhci_diag as diag,
     xhci_types::EndpointHandle,
 };
 use crate::{
@@ -26,6 +24,40 @@ use core::{
     mem, ptr,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
+struct ClassOwner(core::cell::UnsafeCell<crate::sched::sync_types::UnwindGuard>);
+unsafe impl Sync for ClassOwner {}
+static CLASS_OWNER: ClassOwner = ClassOwner(core::cell::UnsafeCell::new(
+    crate::sched::sync_types::UnwindGuard {
+        owner: 0,
+        owner_generation: 0,
+        boot_owner: false,
+        depth: 0,
+        name: Text::literal(b"usb-hid-class"),
+        queue: crate::sched::sync_types::WaitQueue::EMPTY,
+    },
+));
+struct Guard;
+impl Guard {
+    fn enter() -> Option<Self> {
+        if unsafe {
+            crate::sched::sync_locks::guard_enter(
+                CLASS_OWNER.0.get(),
+                super::xhci_constants::CONTROLLER_OWNERSHIP_TIMEOUT_TICKS,
+            )
+        } {
+            Some(Self)
+        } else {
+            None
+        }
+    }
+}
+impl Drop for Guard {
+    fn drop(&mut self) {
+        unsafe {
+            crate::sched::sync_locks::guard_leave(CLASS_OWNER.0.get());
+        }
+    }
+}
 const REPORT_BUFFER_LEN: usize = 32;
 const MOUSE_POLL_BUDGET: usize = 8;
 const REPORT_DESCRIPTOR_MAX: usize = 512;
@@ -76,7 +108,7 @@ impl State {
     };
 }
 struct Storage(UnsafeCell<State>);
-// SAFETY: all binding/state entries retain controller admission through their
+// SAFETY: binding/state entries retain class admission through their
 // exact callbacks; task lifecycle summary is separate atomic producer data.
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new(State::EMPTY));
@@ -170,7 +202,7 @@ pub fn init(selected: Options) -> bool {
         (*state()).boot_r4p_mouse = 0;
         (*state()).boot_dispatch_failures = 0;
         (*state()).boot_last_result = 0;
-        super::xhci_async::set_topology_hook(Some(topology_changed));
+        xhci::set_topology_hook(Some(topology_changed));
         scan_catalogue();
         refresh_aggregate_status();
         if (*current()).keyboard_bound && (*current()).mouse_bound {
@@ -218,7 +250,10 @@ unsafe fn binding_still_published(b: *const HidBinding) -> bool {
             if !dev.active || !dev.configured {
                 continue;
             }
-            if dev.port == (*b).port && dev.slot_id == (*b).device.slot_id {
+            if dev.controller_id == (*b).device.controller_id
+                && dev.port == (*b).port
+                && dev.slot_id == (*b).device.slot_id
+            {
                 let live = xhci::device_handle_from_core(dev);
                 return live.generation != 0 && live.generation == (*b).device.generation;
             }
@@ -566,7 +601,7 @@ unsafe fn poll_mouse() {
 }
 unsafe fn ensure_selected(b: *mut HidBinding, kind: Kind) -> bool {
     unsafe {
-        let xs = xhci::status();
+        let xs = xhci::device_status((*b).device);
         if (*b).device.slot_id != 0
             && xs.addressed_slot_id == (*b).device.slot_id
             && xs.addressed_port == (*b).device.port
@@ -581,7 +616,7 @@ unsafe fn ensure_selected(b: *mut HidBinding, kind: Kind) -> bool {
             (*current()).reason = select_failure(kind);
             return false;
         }
-        let selected = xhci::status();
+        let selected = xhci::device_status((*b).device);
         if selected.addressed_slot_id == (*b).device.slot_id
             && selected.addressed_port == (*b).device.port
             && selected.interrupt_endpoint_configured
@@ -598,6 +633,11 @@ unsafe fn poll_binding(b: *mut HidBinding, kind: Kind) -> bool {
         if !(*b).bound {
             return false;
         }
+        // Retain this exact controller across public-v2 handle projection and
+        // dispatch; local slot reuse cannot enter the gap between those calls.
+        let Some(_controller) = super::xhci_api::Guard::for_device((*b).device) else {
+            return false;
+        };
         if kind == Kind::Keyboard {
             if !usb_hid_can_accept(KEYBOARD_REPORT_QUEUE_RESERVE) {
                 (*state()).keyboard_backpressure_active = true;
@@ -632,7 +672,7 @@ unsafe fn poll_binding(b: *mut HidBinding, kind: Kind) -> bool {
             }
         }
         let n = if actual == 0 || actual as usize > requested {
-            let len = xhci::last_interrupt_actual_length();
+            let len = xhci::last_interrupt_actual_length((*b).device);
             if len == 0 || len > requested {
                 requested
             } else {
@@ -641,8 +681,9 @@ unsafe fn poll_binding(b: *mut HidBinding, kind: Kind) -> bool {
         } else {
             actual as usize
         };
-        (*b).last_report_request_len = xhci::last_interrupt_requested_length().min(255) as u8;
-        (*b).last_report_residue = xhci::last_interrupt_residue();
+        (*b).last_report_request_len =
+            xhci::last_interrupt_requested_length((*b).device).min(255) as u8;
+        (*b).last_report_residue = xhci::last_interrupt_residue((*b).device);
         (*b).reports += 1;
         let bytes = &report[..n];
         if bytes.iter().any(|v| *v != 0) {

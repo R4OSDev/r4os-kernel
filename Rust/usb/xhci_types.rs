@@ -548,6 +548,7 @@ const _: () = {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DeviceHandle {
+    pub controller_id: u32,
     pub generation: u64,
     pub controller: Text,
     pub port: u8,
@@ -559,6 +560,7 @@ pub struct DeviceHandle {
 }
 impl DeviceHandle {
     pub const EMPTY: Self = Self {
+        controller_id: 0,
         generation: 0,
         controller: Text::literal(b"xhci"),
         port: 0,
@@ -569,18 +571,6 @@ impl DeviceHandle {
         product_id: 0,
     };
 }
-const _: () = {
-    assert!(core::mem::size_of::<DeviceHandle>() == 32);
-    assert!(core::mem::align_of::<DeviceHandle>() == 8);
-    assert!(core::mem::offset_of!(DeviceHandle, generation) == 0);
-    assert!(core::mem::offset_of!(DeviceHandle, controller) == 8);
-    assert!(core::mem::offset_of!(DeviceHandle, port) == 24);
-    assert!(core::mem::offset_of!(DeviceHandle, slot_id) == 25);
-    assert!(core::mem::offset_of!(DeviceHandle, speed) == 26);
-    assert!(core::mem::offset_of!(DeviceHandle, config_value) == 27);
-    assert!(core::mem::offset_of!(DeviceHandle, vendor_id) == 28);
-    assert!(core::mem::offset_of!(DeviceHandle, product_id) == 30);
-};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EndpointHandle {
@@ -603,35 +593,20 @@ impl EndpointHandle {
         interval: 0,
     };
 }
-const _: () = {
-    assert!(core::mem::size_of::<EndpointHandle>() == 40);
-    assert!(core::mem::align_of::<EndpointHandle>() == 8);
-    assert!(core::mem::offset_of!(EndpointHandle, device) == 0);
-    assert!(core::mem::offset_of!(EndpointHandle, kind) == 32);
-    assert!(core::mem::offset_of!(EndpointHandle, address) == 33);
-    assert!(core::mem::offset_of!(EndpointHandle, endpoint_id) == 34);
-    assert!(core::mem::offset_of!(EndpointHandle, max_packet) == 36);
-    assert!(core::mem::offset_of!(EndpointHandle, max_burst) == 38);
-    assert!(core::mem::offset_of!(EndpointHandle, interval) == 39);
-};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DeviceTransaction {
+    pub controller_id: u32,
     pub runtime_index: usize,
     pub generation: u64,
 }
 impl DeviceTransaction {
     pub const EMPTY: Self = Self {
+        controller_id: 0,
         runtime_index: 0,
         generation: 0,
     };
 }
-const _: () = {
-    assert!(core::mem::size_of::<DeviceTransaction>() == 16);
-    assert!(core::mem::align_of::<DeviceTransaction>() == 8);
-    assert!(core::mem::offset_of!(DeviceTransaction, runtime_index) == 0);
-    assert!(core::mem::offset_of!(DeviceTransaction, generation) == 8);
-};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Status {

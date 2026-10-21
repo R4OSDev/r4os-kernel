@@ -5,7 +5,7 @@ use super::{
     msc_types::{Direction, Status},
     timing,
     wait_types::Deadline,
-    xhci,
+    xhci_api as xhci,
     xhci_api::{self, Guard},
     xhci_diag as diag,
     xhci_types::{EndpointHandle, IncidentToken},
@@ -453,7 +453,7 @@ pub(super) unsafe fn set_data_length_reason(current: *mut Status, detail: &[u8],
     }
 }
 unsafe fn recover_transport(current: *mut Status) -> bool {
-    let Some(_g) = Guard::enter() else {
+    let Some(_g) = Guard::for_device(unsafe { (*current).device }) else {
         return false;
     };
     unsafe {

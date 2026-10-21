@@ -16,7 +16,8 @@ impl Drop for MetadataGuard {
         crate::arch::runtime::restore_runtime(self.0);
     }
 }
-const CAPACITY: usize = 4;
+const CAPACITY: usize = crate::platform::pci_scan::MAX_DEVICES;
+static NEXT_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 struct Storage(UnsafeCell<[Controller; CAPACITY]>);
 // SAFETY: short metadata admission covers every slot read/mutation. The
 // original driver/controller lifecycle still owns callback/descriptor lifetime.
@@ -49,7 +50,11 @@ unsafe fn find(name: &[u8]) -> Option<usize> {
     let _metadata = MetadataGuard::enter();
     for index in 0..CAPACITY {
         let c = unsafe { row(index).read() };
-        if c.used && c.name[..c.name_len].eq_ignore_ascii_case(name) {
+        if c.used
+            && (c.name[..c.name_len].eq_ignore_ascii_case(name)
+                || (name.eq_ignore_ascii_case(b"XHCI")
+                    && c.name[..c.name_len].starts_with(b"XHCI@")))
+        {
             return Some(index);
         }
     }
@@ -66,15 +71,49 @@ unsafe fn account(index: usize, result: i32, transfer: bool) -> i32 {
     }
     result
 }
-unsafe fn descriptor(index: usize) -> Result<HostDescriptor, i32> {
+struct CallbackLease {
+    descriptor: HostDescriptor,
+    index: usize,
+    id: u32,
+}
+impl core::ops::Deref for CallbackLease {
+    type Target = HostDescriptor;
+    fn deref(&self) -> &HostDescriptor {
+        &self.descriptor
+    }
+}
+impl Drop for CallbackLease {
+    fn drop(&mut self) {
+        let _metadata = MetadataGuard::enter();
+        unsafe {
+            let p = row(self.index);
+            assert!(
+                (*p).used && (*p).id == self.id && (*p).callbacks != 0,
+                "USB callback epoch changed"
+            );
+            (*p).callbacks -= 1;
+        }
+    }
+}
+unsafe fn descriptor(index: usize) -> Result<CallbackLease, i32> {
     let _metadata = MetadataGuard::enter();
     let p = unsafe { at(index) }.ok_or(-1)?;
-    let descriptor = unsafe { (*p).descriptor };
-    if descriptor.is_null() {
-        return Err(unsafe { account(index, -2, false) });
+    unsafe {
+        if (*p).closing {
+            return Err(-4);
+        }
+        if (*p).descriptor.is_null() {
+            return Err(account(index, -2, false));
+        }
+        (*p).callbacks = (*p).callbacks.checked_add(1).ok_or(-4)?;
+        Ok(CallbackLease {
+            descriptor: (*p).descriptor.read(),
+            index,
+            id: (*p).id,
+        })
     }
-    Ok(unsafe { descriptor.read() })
 }
+
 unsafe fn callback(index: usize, address: usize) -> Result<usize, i32> {
     if address == 0 {
         Err(unsafe { account(index, -3, false) })
@@ -84,12 +123,12 @@ unsafe fn callback(index: usize, address: usize) -> Result<usize, i32> {
 }
 fn device_index(device: HostDevice) -> Option<usize> {
     let _metadata = MetadataGuard::enter();
-    if device.controller_id == 0 || device.controller_id > CAPACITY as u32 {
+    if device.controller_id == 0 {
         return None;
     }
-    let i = (device.controller_id - 1) as usize;
-    unsafe { at(i) }.map(|_| i)
+    (0..CAPACITY).find(|i| unsafe { (*row(*i)).used && (*row(*i)).id == device.controller_id })
 }
+
 unsafe fn register(
     name: &[u8],
     descriptor: *const HostDescriptor,
@@ -104,7 +143,15 @@ unsafe fn register(
             return None;
         }
         let index = (0..CAPACITY).find(|i| !unsafe { (*row(*i)).used })?;
+        let id = NEXT_ID
+            .try_update(
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+                |v| v.checked_add(1),
+            )
+            .ok()?;
         let mut c = Controller {
+            id,
             used: true,
             source: if builtin {
                 0
@@ -167,8 +214,18 @@ type Port = unsafe extern "C" fn(*mut c_void, u8) -> i32;
 type Endpoint = unsafe extern "C" fn(*mut c_void, *const HostEndpoint) -> i32;
 type Status = unsafe extern "C" fn(*mut c_void, *mut HostStatus) -> i32;
 unsafe fn unregister(index: usize) -> bool {
-    let Some(c) = (unsafe { snapshot(index) }) else {
-        return false;
+    let c = {
+        let _metadata = MetadataGuard::enter();
+        let Some(p) = (unsafe { at(index) }) else {
+            return false;
+        };
+        unsafe {
+            if (*p).closing || (*p).callbacks != 0 {
+                return false;
+            }
+            (*p).closing = true;
+            p.read()
+        }
     };
     if !c.descriptor.is_null() {
         let d = unsafe { c.descriptor.read() };
@@ -176,6 +233,8 @@ unsafe fn unregister(index: usize) -> bool {
         {
             let _metadata = MetadataGuard::enter();
             unsafe {
+                assert!((*row(index)).id == c.id);
+                (*row(index)).closing = false;
                 (*row(index)).state = 2;
                 account(index, -1, false);
             }
@@ -183,9 +242,13 @@ unsafe fn unregister(index: usize) -> bool {
         }
     }
     let _metadata = MetadataGuard::enter();
-    unsafe { row(index).write(Controller::EMPTY) };
+    unsafe {
+        assert!((*row(index)).id == c.id && (*row(index)).callbacks == 0 && (*row(index)).closing);
+        row(index).write(Controller::EMPTY);
+    }
     true
 }
+
 unsafe fn status_at(index: usize, out: *mut HostStatus) -> i32 {
     let Some(c) = (unsafe { snapshot(index) }) else {
         return -1;
@@ -203,7 +266,10 @@ unsafe fn status_at(index: usize, out: *mut HostStatus) -> i32 {
     if c.descriptor.is_null() {
         return 0;
     }
-    let d = unsafe { c.descriptor.read() };
+    let d = match unsafe { descriptor(index) } {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
     if d.status != 0 {
         let result = unsafe { mem::transmute::<usize, Status>(d.status)(d.context, out) };
         if result < 0 {
@@ -292,7 +358,7 @@ pub unsafe extern "C" fn r4os_rust_usb_host_set_state(index: usize, state: u8) -
 /// exclusive. The caller retains the owner/context documented by this module.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_usb_host_id(index: usize) -> u32 {
-    u32::try_from(index + 1).expect("USB controller ID")
+    unsafe { snapshot(index) }.map_or(0, |c| c.id)
 }
 /// # Safety
 /// Exact live private C records and resident labels/buffers; outputs are
@@ -431,7 +497,7 @@ pub unsafe extern "C" fn r4os_rust_usb_host_address(
     };
     let result = unsafe { mem::transmute::<usize, Address>(f)(d.context, port, out) };
     if result >= 0 {
-        unsafe { (*out).controller_id = u32::try_from(index + 1).expect("USB controller ID") }
+        unsafe { (*out).controller_id = snapshot(index).map_or(0, |c| c.id) }
     }
     unsafe { account(index, result, false) }
 }

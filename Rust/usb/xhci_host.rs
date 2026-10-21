@@ -1,6 +1,7 @@
 //! Exact USB-v2 backend callback table. Every callback retains controller
 //! admission until completion; the registry itself holds no metadata lock over
 //! these calls. Only admitted guards are constructed, including error returns.
+use super::xhci_state::Context;
 use super::{
     types::{ControlRequest as HostControl, HostDevice, HostEndpoint, HostStatus},
     xhci_handles::*,
@@ -9,15 +10,20 @@ use super::{
     xhci_types::{ControlRequest, DeviceHandle},
 };
 use core::{ffi::c_void, ptr, slice};
-struct Guard;
+struct Guard(Context);
 impl Guard {
-    fn enter() -> Option<Self> {
-        if owner::acquire() { Some(Self) } else { None }
+    fn enter(ctx: Context) -> Option<Self> {
+        if owner::acquire(ctx) {
+            Some(Self(ctx))
+        } else {
+            None
+        }
     }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        owner::release();
+        let ctx = self.0;
+        owner::release(ctx);
     }
 }
 unsafe fn buffer<'a>(pointer: *mut u8, len: u32) -> &'a mut [u8] {
@@ -27,51 +33,55 @@ unsafe fn buffer<'a>(pointer: *mut u8, len: u32) -> &'a mut [u8] {
         unsafe { slice::from_raw_parts_mut(pointer, len as usize) }
     }
 }
-pub(super) unsafe extern "C" fn host_port_scan(_: *mut c_void) -> i32 {
-    i32::from(unsafe { super::xhci::service_port_changes() })
+pub(super) unsafe extern "C" fn host_port_scan(context: *mut c_void) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
+    i32::from(unsafe { super::xhci::service_port_changes(ctx) })
 }
 pub(super) unsafe extern "C" fn host_address_device(
-    _: *mut c_void,
+    context: *mut c_void,
     port: u8,
     out: *mut HostDevice,
 ) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
     unsafe {
-        let Some(_guard) = Guard::enter() else {
+        let Some(_guard) = Guard::enter(ctx) else {
             return -1;
         };
-        if !super::xhci::select_device_by_port(port) {
+        if !super::xhci::select_device_by_port(ctx, port) {
             return -2;
         }
         let handle = DeviceHandle {
-            port: (*current()).addressed_port,
-            slot_id: (*current()).addressed_slot_id,
-            speed: (*current()).addressed_speed,
-            config_value: (*current()).config_value,
-            vendor_id: (*current()).device_vendor_id,
-            product_id: (*current()).device_product_id,
+            controller_id: ctx.id(),
+            port: (*current(ctx)).addressed_port,
+            slot_id: (*current(ctx)).addressed_slot_id,
+            speed: (*current(ctx)).addressed_speed,
+            config_value: (*current(ctx)).config_value,
+            vendor_id: (*current(ctx)).device_vendor_id,
+            product_id: (*current(ctx)).device_product_id,
             ..DeviceHandle::EMPTY
         };
-        out.write(usb_host_device_handle(handle));
+        out.write(usb_host_device_handle(ctx, handle));
         0
     }
 }
 pub(super) unsafe extern "C" fn host_configure_device(
-    _: *mut c_void,
+    context: *mut c_void,
     raw: *const HostDevice,
     configuration: u8,
 ) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
     unsafe {
-        let Some(_guard) = Guard::enter() else {
+        let Some(_guard) = Guard::enter(ctx) else {
             return -1;
         };
-        let mut handle = device_from_usb_host(*raw);
-        if !select_device_handle(&mut handle) || !owner::selected_allows_mutation() {
+        let mut handle = device_from_usb_host(ctx, *raw);
+        if !select_device_handle(ctx, &mut handle) || !owner::selected_allows_mutation(ctx) {
             return -2;
         }
         if configuration != 0 {
-            (*current()).config_value = configuration;
+            (*current(ctx)).config_value = configuration;
         }
-        if super::xhci::set_first_configuration() {
+        if super::xhci::set_first_configuration(ctx) {
             0
         } else {
             -3
@@ -79,21 +89,22 @@ pub(super) unsafe extern "C" fn host_configure_device(
     }
 }
 pub(super) unsafe extern "C" fn host_control_transfer(
-    _: *mut c_void,
+    context: *mut c_void,
     raw_device: *const HostDevice,
     request: *const HostControl,
     bytes: *mut u8,
     len: u32,
 ) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
     unsafe {
-        let Some(_guard) = Guard::enter() else {
+        let Some(_guard) = Guard::enter(ctx) else {
             return -1;
         };
-        let mut device = device_from_usb_host(*raw_device);
-        if !select_device_handle(&mut device) || (*state()).first_descriptor_virt == 0 {
+        let mut device = device_from_usb_host(ctx, *raw_device);
+        if !select_device_handle(ctx, &mut device) || (*state(ctx)).first_descriptor_virt == 0 {
             return -2;
         }
-        if !owner::selected_allows_mutation() {
+        if !owner::selected_allows_mutation(ctx) {
             return -2;
         }
         if u32::from((*request).length) > len
@@ -108,7 +119,7 @@ pub(super) unsafe extern "C" fn host_control_transfer(
             _ => return -4,
         };
         let scratch =
-            ptr::with_exposed_provenance_mut::<u8>((*state()).first_descriptor_virt as usize);
+            ptr::with_exposed_provenance_mut::<u8>((*state(ctx)).first_descriptor_virt as usize);
         let size = usize::from((*request).length);
         if direction == 2 && size != 0 {
             ptr::copy_nonoverlapping(bytes, scratch, size);
@@ -116,23 +127,26 @@ pub(super) unsafe extern "C" fn host_control_transfer(
         if direction == 1 && size != 0 {
             ptr::write_bytes(scratch, 0, size);
         }
-        let ok = super::xhci::submit_control(ControlRequest {
-            request_type: (*request).request_type,
-            request: (*request).request,
-            value: (*request).value,
-            index_value: (*request).index_value,
-            length: (*request).length,
-            data_phys: if direction == 0 {
-                0
-            } else {
-                (*current()).descriptor_phys
+        let ok = super::xhci::submit_control(
+            ctx,
+            ControlRequest {
+                request_type: (*request).request_type,
+                request: (*request).request,
+                value: (*request).value,
+                index_value: (*request).index_value,
+                length: (*request).length,
+                data_phys: if direction == 0 {
+                    0
+                } else {
+                    (*current(ctx)).descriptor_phys
+                },
+                direction,
             },
-            direction,
-        });
+        );
         if !ok {
             return -5;
         }
-        let actual = u32::from((*request).length) - (*current()).last_control_residue;
+        let actual = u32::from((*request).length) - (*current(ctx)).last_control_residue;
         if direction == 1 && actual != 0 {
             ptr::copy_nonoverlapping(scratch, bytes, actual as usize);
         }
@@ -140,49 +154,51 @@ pub(super) unsafe extern "C" fn host_control_transfer(
     }
 }
 pub(super) unsafe extern "C" fn host_bulk_transfer(
-    _: *mut c_void,
+    context: *mut c_void,
     raw: *const HostEndpoint,
     bytes: *mut u8,
     len: u32,
     direction: u32,
 ) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
     unsafe {
-        let Some(_guard) = Guard::enter() else {
+        let Some(_guard) = Guard::enter(ctx) else {
             return -1;
         };
-        let Some(mut endpoint) = endpoint_from_usb_host(*raw) else {
+        let Some(mut endpoint) = endpoint_from_usb_host(ctx, *raw) else {
             return -2;
         };
         let bytes = buffer(bytes, len);
         let ok = match direction {
-            1 => endpoint.kind == 2 && super::xhci::bulk_in_for_handle(&mut endpoint, bytes),
-            2 => endpoint.kind == 3 && super::xhci::bulk_out_for_handle(&mut endpoint, bytes),
+            1 => endpoint.kind == 2 && super::xhci::bulk_in_for_handle(ctx, &mut endpoint, bytes),
+            2 => endpoint.kind == 3 && super::xhci::bulk_out_for_handle(ctx, &mut endpoint, bytes),
             _ => false,
         };
         if !ok {
             return -3;
         }
-        i32::try_from((*current()).last_bulk_actual_len).expect("USB bulk length")
+        i32::try_from((*current(ctx)).last_bulk_actual_len).expect("USB bulk length")
     }
 }
 pub(super) unsafe extern "C" fn host_interrupt_transfer(
-    _: *mut c_void,
+    context: *mut c_void,
     raw: *const HostEndpoint,
     bytes: *mut u8,
     len: u32,
     actual: *mut u32,
 ) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
     unsafe {
-        let Some(_guard) = Guard::enter() else {
+        let Some(_guard) = Guard::enter(ctx) else {
             return -1;
         };
-        let Some(mut endpoint) = endpoint_from_usb_host(*raw) else {
+        let Some(mut endpoint) = endpoint_from_usb_host(ctx, *raw) else {
             return -2;
         };
         let result =
-            super::xhci::poll_interrupt_in_report_status(&mut endpoint, buffer(bytes, len));
+            super::xhci::poll_interrupt_in_report_status(ctx, &mut endpoint, buffer(bytes, len));
         actual.write(
-            u32::try_from(super::xhci::last_interrupt_actual_length())
+            u32::try_from(super::xhci::last_interrupt_actual_length(ctx))
                 .expect("USB interrupt length"),
         );
         match result {
@@ -192,44 +208,31 @@ pub(super) unsafe extern "C" fn host_interrupt_transfer(
         }
     }
 }
-pub(super) unsafe extern "C" fn host_reset_port(_: *mut c_void, port: u8) -> i32 {
-    let Some(_guard) = Guard::enter() else {
+pub(super) unsafe extern "C" fn host_reset_port(context: *mut c_void, port: u8) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
+    let Some(_guard) = Guard::enter(ctx) else {
         return -1;
     };
-    if unsafe { super::xhci_ports::reset_port(port) } {
+    if unsafe { super::xhci_ports::reset_port(ctx, port) } {
         0
     } else {
         -2
     }
 }
-pub(super) unsafe extern "C" fn host_clear_halt(_: *mut c_void, raw: *const HostEndpoint) -> i32 {
-    unsafe {
-        let Some(_guard) = Guard::enter() else {
-            return -1;
-        };
-        let Some(mut endpoint) = endpoint_from_usb_host(*raw) else {
-            return -2;
-        };
-        if super::xhci::clear_endpoint_halt_for_handle(&mut endpoint.device, endpoint.address, None)
-        {
-            0
-        } else {
-            -3
-        }
-    }
-}
-pub(super) unsafe extern "C" fn host_reset_endpoint(
-    _: *mut c_void,
+pub(super) unsafe extern "C" fn host_clear_halt(
+    context: *mut c_void,
     raw: *const HostEndpoint,
 ) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
     unsafe {
-        let Some(_guard) = Guard::enter() else {
+        let Some(_guard) = Guard::enter(ctx) else {
             return -1;
         };
-        let Some(mut endpoint) = endpoint_from_usb_host(*raw) else {
+        let Some(mut endpoint) = endpoint_from_usb_host(ctx, *raw) else {
             return -2;
         };
-        if super::xhci::reset_endpoint_state_for_handle(
+        if super::xhci::clear_endpoint_halt_for_handle(
+            ctx,
             &mut endpoint.device,
             endpoint.address,
             None,
@@ -240,35 +243,64 @@ pub(super) unsafe extern "C" fn host_reset_endpoint(
         }
     }
 }
-pub(super) unsafe extern "C" fn host_poll(_: *mut c_void) -> i32 {
-    i32::from(unsafe { super::xhci::service_port_changes() })
-}
-pub(super) unsafe extern "C" fn host_shutdown(_: *mut c_void) -> i32 {
+pub(super) unsafe extern "C" fn host_reset_endpoint(
+    context: *mut c_void,
+    raw: *const HostEndpoint,
+) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
     unsafe {
-        let Some(_guard) = Guard::enter() else {
+        let Some(_guard) = Guard::enter(ctx) else {
             return -1;
         };
-        let ok = super::xhci_boot::teardown_for_reprobe();
-        if ok {
-            (*current()).probed = false;
-            (*current()).controller_running = false;
-            (*current()).present = false;
-            (*current()).reason = crate::sched::sync_types::Text::literal(b"xHCI backend unloaded");
+        let Some(mut endpoint) = endpoint_from_usb_host(ctx, *raw) else {
+            return -2;
+        };
+        if super::xhci::reset_endpoint_state_for_handle(
+            ctx,
+            &mut endpoint.device,
+            endpoint.address,
+            None,
+        ) {
+            0
         } else {
-            (*current()).reason = crate::sched::sync_types::Text::literal(
+            -3
+        }
+    }
+}
+pub(super) unsafe extern "C" fn host_poll(context: *mut c_void) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
+    i32::from(unsafe { super::xhci::service_port_changes(ctx) })
+}
+pub(super) unsafe extern "C" fn host_shutdown(context: *mut c_void) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
+    unsafe {
+        let Some(_guard) = Guard::enter(ctx) else {
+            return -1;
+        };
+        let ok = super::xhci_boot::teardown_for_reprobe(ctx);
+        if ok {
+            ctx.publish_id(0);
+            (*current(ctx)).probed = false;
+            (*current(ctx)).controller_running = false;
+            (*current(ctx)).present = false;
+            (*current(ctx)).reason =
+                crate::sched::sync_types::Text::literal(b"xHCI backend unloaded");
+        } else {
+            (*current(ctx)).reason = crate::sched::sync_types::Text::literal(
                 b"xHCI unload deferred or halt failed; resources retained",
             );
         }
         if ok { 0 } else { -2 }
     }
 }
-pub(super) unsafe extern "C" fn host_status(_: *mut c_void, out: *mut HostStatus) -> i32 {
+pub(super) unsafe extern "C" fn host_status(context: *mut c_void, out: *mut HostStatus) -> i32 {
+    let ctx = unsafe { Context::from_raw(context) };
     unsafe {
-        let Some(_guard) = Guard::enter() else {
+        let Some(_guard) = Guard::enter(ctx) else {
             return -1;
         };
-        let snapshot = super::xhci_status::status_locked();
-        let transfers = (*state()).transfer_objects.snapshot();
+        let snapshot = super::xhci_status::status_locked(ctx);
+        let transfers = (*state(ctx)).transfer_objects.snapshot();
         out.write(HostStatus {
             state: if snapshot.controller_running {
                 1
@@ -279,12 +311,13 @@ pub(super) unsafe extern "C" fn host_status(_: *mut c_void, out: *mut HostStatus
             },
             source: snapshot.host_source,
             ports: u32::from(snapshot.port_count_seen),
-            devices: u32::try_from(super::core::count()).expect("USB device count"),
+            devices: u32::try_from(super::core::count_controller(ctx.id()))
+                .expect("USB device count"),
             transfers: snapshot.control_transfers
                 + snapshot.bulk_transfers
                 + snapshot.interrupt_polls,
             failures: snapshot.failures,
-            flags: (*state()).canonical_backend.flags,
+            flags: (*state(ctx)).canonical_backend.flags,
             queue_depth: super::transfer_pool::MAX_TRANSFERS as u16,
             max_transfer_bytes: super::trb_chain::MAX_TRANSFER_BYTES,
             active_transfers: transfers.active,
@@ -297,9 +330,9 @@ pub(super) unsafe extern "C" fn host_status(_: *mut c_void, out: *mut HostStatus
         0
     }
 }
-pub(super) unsafe fn install_callbacks() {
+pub(super) unsafe fn install_callbacks(ctx: Context) {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         if (*s).callbacks_initialized {
             return;
         }

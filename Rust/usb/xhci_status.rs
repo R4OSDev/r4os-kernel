@@ -2,6 +2,7 @@
 //! admission; IRQ/worker counters will be sampled from their atomic producers
 //! when the controller entrypoints are switched. This is never an unlocked
 //! read of the mutable controller catalogue.
+use super::xhci_state::Context;
 use super::{
     xhci_constants::*,
     xhci_hardware::{read_op32, read_rt32, read_rt64, volatile_read32},
@@ -9,9 +10,9 @@ use super::{
     xhci_types::{Status, Trb},
 };
 use core::ptr;
-pub(super) unsafe fn status_locked() -> Status {
+pub(super) unsafe fn status_locked(ctx: Context) -> Status {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         let mut result = ptr::addr_of!((*s).current).read();
         let waits = super::wait::metrics();
         result.wait_calls = waits.calls;
@@ -57,7 +58,7 @@ pub(super) unsafe fn status_locked() -> Status {
             result.event_raw_type = ((control >> TRB_TYPE_SHIFT) & 0x3f) as u8;
             result.event_raw_code = (volatile_read32(address + 8) >> 24) as u8;
         }
-        result.interrupt_hw_dequeue = super::xhci::read_interrupt_hardware_dequeue();
+        result.interrupt_hw_dequeue = super::xhci::read_interrupt_hardware_dequeue(ctx);
         if result.mapped && result.mmio_virt != 0 {
             result.usbsts = read_op32(ptr::addr_of!((*s).current), OP_USBSTS);
             result.iman0 = read_rt32(ptr::addr_of!((*s).current), RT_IR0_IMAN);
@@ -88,7 +89,7 @@ pub(super) unsafe fn status_locked() -> Status {
         result.transfer_objects_timed_out = transfers.timed_out;
         result.transfer_objects_cancelled = transfers.cancelled;
         result.transfer_objects_failed = transfers.failed;
-        super::xhci_async::project_counters(&mut result);
+        super::xhci_async::project_counters(ctx, &mut result);
         result
     }
 }

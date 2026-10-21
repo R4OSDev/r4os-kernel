@@ -1,11 +1,12 @@
 //! Exact per-device persist/load and enumeration reset records. Configuration
 //! acknowledgements travel with the device runtime, including identical values.
+use super::xhci_state::Context;
 use super::{types::Interface, xhci_state::state, xhci_types::DeviceRuntime};
 use crate::sched::sync_types::Text;
 use core::ptr;
-pub(super) unsafe fn persist_active_runtime() {
+pub(super) unsafe fn persist_active_runtime(ctx: Context) {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         let Some(index) = (*s).active_runtime_index else {
             return;
         };
@@ -97,9 +98,9 @@ pub(super) unsafe fn persist_active_runtime() {
         (*rt).sync_transfer_incident = (*s).last_sync_transfer_incident;
     }
 }
-pub(super) unsafe fn load_runtime(index: usize) {
+pub(super) unsafe fn load_runtime(ctx: Context, index: usize) {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         let rt = ptr::addr_of!((*s).runtimes[index]);
 
         (*s).current.addressed_slot_id = (*rt).slot_id;
@@ -187,9 +188,9 @@ pub(super) unsafe fn load_runtime(index: usize) {
         (*s).last_sync_transfer_incident = (*rt).sync_transfer_incident;
     }
 }
-pub(super) unsafe fn reset_first_enumeration_fields() {
+pub(super) unsafe fn reset_first_enumeration_fields(ctx: Context) {
     unsafe {
-        let s = state();
+        let s = state(ctx);
 
         (*s).current.address_device_attempted = false;
         (*s).current.address_device_ok = false;
@@ -297,9 +298,9 @@ pub(super) unsafe fn reset_first_enumeration_fields() {
         (*s).current.serial_string = [0; 32];
     }
 }
-pub(super) unsafe fn clear_current_runtime_selection(slot_id: u8) {
+pub(super) unsafe fn clear_current_runtime_selection(ctx: Context, slot_id: u8) {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         if slot_id != 0 && (*s).current.addressed_slot_id != slot_id {
             return;
         }
@@ -354,71 +355,71 @@ pub(super) unsafe fn clear_current_runtime_selection(slot_id: u8) {
         (*s).current.bulk_out_endpoint_max_burst = 0;
     }
 }
-pub(super) unsafe fn runtime_index_for_slot(slot: u8) -> Option<usize> {
+pub(super) unsafe fn runtime_index_for_slot(ctx: Context, slot: u8) -> Option<usize> {
     for index in 0..8 {
-        let rt = unsafe { ptr::addr_of!((*state()).runtimes[index]).read() };
+        let rt = unsafe { ptr::addr_of!((*state(ctx)).runtimes[index]).read() };
         if rt.active && rt.slot_id == slot {
             return Some(index);
         }
     }
     None
 }
-pub(super) unsafe fn runtime_index_for_identity(slot: u8, port: u8) -> Option<usize> {
+pub(super) unsafe fn runtime_index_for_identity(ctx: Context, slot: u8, port: u8) -> Option<usize> {
     if slot == 0 || port == 0 {
         return None;
     }
     for index in 0..8 {
-        let rt = unsafe { ptr::addr_of!((*state()).runtimes[index]).read() };
+        let rt = unsafe { ptr::addr_of!((*state(ctx)).runtimes[index]).read() };
         if rt.active && rt.slot_id == slot && rt.port == port {
             return Some(index);
         }
     }
     None
 }
-pub(super) unsafe fn activate_runtime(index: usize) -> bool {
+pub(super) unsafe fn activate_runtime(ctx: Context, index: usize) -> bool {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         if index >= 8 || !(*s).runtimes[index].active {
             return false;
         }
         if let Some(active) = (*s).active_runtime_index {
             if active == index {
-                persist_active_runtime();
+                persist_active_runtime(ctx);
                 return true;
             }
-            persist_active_runtime();
+            persist_active_runtime(ctx);
         }
         (*s).active_runtime_index = Some(index);
         (*s).current.runtime_switches += 1;
-        load_runtime(index);
+        load_runtime(ctx, index);
         true
     }
 }
-pub(super) unsafe fn activate_runtime_by_port(port: u8) -> bool {
+pub(super) unsafe fn activate_runtime_by_port(ctx: Context, port: u8) -> bool {
     for index in 0..8 {
-        let rt = unsafe { ptr::addr_of!((*state()).runtimes[index]).read() };
+        let rt = unsafe { ptr::addr_of!((*state(ctx)).runtimes[index]).read() };
         if rt.active && rt.port == port {
-            return unsafe { activate_runtime(index) };
+            return unsafe { activate_runtime(ctx, index) };
         }
     }
     false
 }
 
-pub(super) unsafe fn activate_runtime_by_identity(slot: u8, port: u8) -> bool {
-    unsafe { runtime_index_for_identity(slot, port) }
-        .is_some_and(|index| unsafe { activate_runtime(index) })
+pub(super) unsafe fn activate_runtime_by_identity(ctx: Context, slot: u8, port: u8) -> bool {
+    unsafe { runtime_index_for_identity(ctx, slot, port) }
+        .is_some_and(|index| unsafe { activate_runtime(ctx, index) })
 }
-pub(super) unsafe fn defer_runtime_detach(rt: *mut DeviceRuntime) -> bool {
+pub(super) unsafe fn defer_runtime_detach(ctx: Context, rt: *mut DeviceRuntime) -> bool {
     unsafe {
         if !(*rt).transaction_active {
             return false;
         }
         (*rt).detach_pending = true;
-        (*state()).pending_port_changes.retry((*rt).port);
+        (*state(ctx)).pending_port_changes.retry((*rt).port);
         true
     }
 }
-pub(super) unsafe fn free_dma_frame(frame: *mut u64) {
+pub(super) unsafe fn free_dma_frame(_ctx: Context, frame: *mut u64) {
     unsafe {
         if *frame == 0 {
             return;
@@ -427,7 +428,7 @@ pub(super) unsafe fn free_dma_frame(frame: *mut u64) {
         frame.write(0);
     }
 }
-pub(super) unsafe fn free_dma_frames(base: *mut u64, count: u16) {
+pub(super) unsafe fn free_dma_frames(_ctx: Context, base: *mut u64, count: u16) {
     unsafe {
         if *base == 0 {
             return;
@@ -440,87 +441,93 @@ pub(super) unsafe fn free_dma_frames(base: *mut u64, count: u16) {
         base.write(0);
     }
 }
-pub(super) unsafe fn free_runtime_frames(rt: *mut DeviceRuntime) {
+pub(super) unsafe fn free_runtime_frames(ctx: Context, rt: *mut DeviceRuntime) {
     unsafe {
-        free_dma_frame(ptr::addr_of_mut!((*rt).descriptor_phys));
+        free_dma_frame(ctx, ptr::addr_of_mut!((*rt).descriptor_phys));
         free_dma_frames(
+            ctx,
             ptr::addr_of_mut!((*rt).bulk_buffer_phys),
             (*rt).bulk_buffer_frames,
         );
         (*rt).bulk_buffer_frames = 0;
-        free_dma_frame(ptr::addr_of_mut!((*rt).bulk_out_ring_phys));
-        free_dma_frame(ptr::addr_of_mut!((*rt).bulk_in_ring_phys));
-        free_dma_frame(ptr::addr_of_mut!((*rt).interrupt_buffer_phys));
-        free_dma_frame(ptr::addr_of_mut!((*rt).interrupt_ring_phys));
-        free_dma_frame(ptr::addr_of_mut!((*rt).ep0_ring_phys));
-        free_dma_frame(ptr::addr_of_mut!((*rt).input_context_phys));
-        free_dma_frame(ptr::addr_of_mut!((*rt).device_context_phys));
+        free_dma_frame(ctx, ptr::addr_of_mut!((*rt).bulk_out_ring_phys));
+        free_dma_frame(ctx, ptr::addr_of_mut!((*rt).bulk_in_ring_phys));
+        free_dma_frame(ctx, ptr::addr_of_mut!((*rt).interrupt_buffer_phys));
+        free_dma_frame(ctx, ptr::addr_of_mut!((*rt).interrupt_ring_phys));
+        free_dma_frame(ctx, ptr::addr_of_mut!((*rt).ep0_ring_phys));
+        free_dma_frame(ctx, ptr::addr_of_mut!((*rt).input_context_phys));
+        free_dma_frame(ctx, ptr::addr_of_mut!((*rt).device_context_phys));
         rt.write(DeviceRuntime::EMPTY);
     }
 }
-pub(super) unsafe fn free_all_runtimes() {
+pub(super) unsafe fn free_all_runtimes(ctx: Context) {
     unsafe {
         for index in 0..8 {
-            free_runtime_frames(ptr::addr_of_mut!((*state()).runtimes[index]));
+            free_runtime_frames(ctx, ptr::addr_of_mut!((*state(ctx)).runtimes[index]));
         }
-        ptr::addr_of_mut!((*state()).runtimes).write([DeviceRuntime::EMPTY; 8]);
-        (*state()).active_runtime_index = None;
-        (*state()).current.retained_slots = 0;
-        clear_current_runtime_selection((*state()).current.addressed_slot_id);
+        ptr::addr_of_mut!((*state(ctx)).runtimes).write([DeviceRuntime::EMPTY; 8]);
+        (*state(ctx)).active_runtime_index = None;
+        (*state(ctx)).current.retained_slots = 0;
+        clear_current_runtime_selection(ctx, (*state(ctx)).current.addressed_slot_id);
     }
 }
-pub(super) unsafe fn release_runtime_by_slot(slot: u8) {
+pub(super) unsafe fn release_runtime_by_slot(ctx: Context, slot: u8) {
     unsafe {
-        if let Some(index) = runtime_index_for_slot(slot)
-            && defer_runtime_detach(ptr::addr_of_mut!((*state()).runtimes[index]))
+        if let Some(index) = runtime_index_for_slot(ctx, slot)
+            && defer_runtime_detach(ctx, ptr::addr_of_mut!((*state(ctx)).runtimes[index]))
         {
             return;
         }
-        (*state()).deferred_events.purge_slot(slot);
-        (*state()).transfer_objects.purge_slot(slot);
+        (*state(ctx)).deferred_events.purge_slot(slot);
+        (*state(ctx)).transfer_objects.purge_slot(slot);
         for index in 0..8 {
-            let rt = ptr::addr_of_mut!((*state()).runtimes[index]);
+            let rt = ptr::addr_of_mut!((*state(ctx)).runtimes[index]);
             if !(*rt).active || (*rt).slot_id != slot {
                 continue;
             }
-            let active = (*state()).active_runtime_index == Some(index);
+            let active = (*state(ctx)).active_runtime_index == Some(index);
             if active {
-                super::xhci::close_last_sync_transfer_incident();
+                super::xhci::close_last_sync_transfer_incident(ctx);
             } else {
-                super::xhci::resolve_incident((*rt).sync_transfer_incident);
+                super::xhci::resolve_incident(ctx, (*rt).sync_transfer_incident);
             }
-            free_runtime_frames(rt);
-            if (*state()).current.retained_slots > 0 {
-                (*state()).current.retained_slots -= 1;
+            free_runtime_frames(ctx, rt);
+            if (*state(ctx)).current.retained_slots > 0 {
+                (*state(ctx)).current.retained_slots -= 1;
             }
             if active {
-                (*state()).active_runtime_index = None;
-                clear_current_runtime_selection(slot);
+                (*state(ctx)).active_runtime_index = None;
+                clear_current_runtime_selection(ctx, slot);
             }
             return;
         }
     }
 }
-pub(super) unsafe fn runtime_index_for_port(port: u8) -> Option<usize> {
+pub(super) unsafe fn runtime_index_for_port(ctx: Context, port: u8) -> Option<usize> {
     for index in 0..8 {
-        let rt = unsafe { ptr::addr_of!((*state()).runtimes[index]).read() };
+        let rt = unsafe { ptr::addr_of!((*state(ctx)).runtimes[index]).read() };
         if rt.active && rt.port == port {
             return Some(index);
         }
     }
     None
 }
-unsafe fn fail_alloc_runtime(index: usize) -> Option<usize> {
+unsafe fn fail_alloc_runtime(ctx: Context, index: usize) -> Option<usize> {
     unsafe {
-        free_runtime_frames(ptr::addr_of_mut!((*state()).runtimes[index]));
-        (*state()).current.failures += 1;
-        (*state()).current.reason = Text::literal(b"failed to allocate xHCI DMA frame");
+        free_runtime_frames(ctx, ptr::addr_of_mut!((*state(ctx)).runtimes[index]));
+        (*state(ctx)).current.failures += 1;
+        (*state(ctx)).current.reason = Text::literal(b"failed to allocate xHCI DMA frame");
         None
     }
 }
-pub(super) unsafe fn allocate_runtime(slot_id: u8, port: u8, speed: u8) -> Option<usize> {
+pub(super) unsafe fn allocate_runtime(
+    ctx: Context,
+    slot_id: u8,
+    port: u8,
+    speed: u8,
+) -> Option<usize> {
     unsafe {
-        let s = state();
+        let s = state(ctx);
         (*s).deferred_events.purge_slot(slot_id);
         for index in 0..8 {
             let rt = ptr::addr_of_mut!((*s).runtimes[index]);
@@ -541,42 +548,42 @@ pub(super) unsafe fn allocate_runtime(slot_id: u8, port: u8, speed: u8) -> Optio
             });
             (*rt).device_context_phys = match super::xhci_hardware::alloc_frame_zero() {
                 Some(frame) => frame,
-                None => return fail_alloc_runtime(index),
+                None => return fail_alloc_runtime(ctx, index),
             };
             (*rt).input_context_phys = match super::xhci_hardware::alloc_frame_zero() {
                 Some(frame) => frame,
-                None => return fail_alloc_runtime(index),
+                None => return fail_alloc_runtime(ctx, index),
             };
             (*rt).ep0_ring_phys = match super::xhci_hardware::alloc_frame_zero() {
                 Some(frame) => frame,
-                None => return fail_alloc_runtime(index),
+                None => return fail_alloc_runtime(ctx, index),
             };
             (*rt).interrupt_ring_phys = match super::xhci_hardware::alloc_frame_zero() {
                 Some(frame) => frame,
-                None => return fail_alloc_runtime(index),
+                None => return fail_alloc_runtime(ctx, index),
             };
             (*rt).interrupt_buffer_phys = match super::xhci_hardware::alloc_frame_zero() {
                 Some(frame) => frame,
-                None => return fail_alloc_runtime(index),
+                None => return fail_alloc_runtime(ctx, index),
             };
             (*rt).bulk_in_ring_phys = match super::xhci_hardware::alloc_frame_zero() {
                 Some(frame) => frame,
-                None => return fail_alloc_runtime(index),
+                None => return fail_alloc_runtime(ctx, index),
             };
             (*rt).bulk_out_ring_phys = match super::xhci_hardware::alloc_frame_zero() {
                 Some(frame) => frame,
-                None => return fail_alloc_runtime(index),
+                None => return fail_alloc_runtime(ctx, index),
             };
             (*rt).bulk_buffer_frames = super::xhci_constants::BULK_BUFFER_FRAMES;
             (*rt).bulk_buffer_phys = match super::xhci_hardware::alloc_contiguous_zero(
                 super::xhci_constants::BULK_BUFFER_FRAMES,
             ) {
                 Some(frame) => frame,
-                None => return fail_alloc_runtime(index),
+                None => return fail_alloc_runtime(ctx, index),
             };
             (*rt).descriptor_phys = match super::xhci_hardware::alloc_frame_zero() {
                 Some(frame) => frame,
-                None => return fail_alloc_runtime(index),
+                None => return fail_alloc_runtime(ctx, index),
             };
             (*rt).device_virt =
                 crate::memory::phys::r4os_rust_phys_to_virt((*rt).device_context_phys);

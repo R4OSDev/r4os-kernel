@@ -4,9 +4,8 @@ use super::{
     core as usb_core, msc_bot, msc_retry,
     msc_scsi::{self, RetryKind},
     msc_types::Status,
-    xhci,
+    xhci_api as xhci,
     xhci_api::Guard,
-    xhci_owner,
     xhci_types::{DeviceHandle, DeviceTransaction, EndpointHandle},
 };
 use crate::{
@@ -108,14 +107,14 @@ struct Operation {
 impl Drop for Operation {
     fn drop(&mut self) {
         unsafe {
-            xhci_owner::end_transaction(self.transaction);
+            xhci::end_transaction(self.transaction);
         }
     }
 }
 unsafe fn begin_operation(current: *mut Status) -> Option<Operation> {
     unsafe {
         let admission = Admission::enter(ptr::addr_of_mut!((*medium(current)).ownership))?;
-        let transaction = xhci_owner::begin_transaction(ptr::addr_of_mut!((*current).device))?;
+        let transaction = xhci::begin_transaction(ptr::addr_of_mut!((*current).device))?;
         LAST_MEDIUM.store((*medium(current)).index, Ordering::Release);
         Some(Operation {
             transaction,
@@ -169,9 +168,6 @@ pub fn init() -> bool {
     let mut index = 0;
     loop {
         let binding = unsafe {
-            let Some(_controller) = Guard::enter() else {
-                return false;
-            };
             usb_core::device_at(index).map(|dev| DeviceBinding {
                 descriptor: dev,
                 device: xhci::device_handle_from_core(dev),
@@ -315,7 +311,7 @@ fn valid_logical_block_size(bytes: u32) -> bool {
     (512..=MAX_TRANSFER_BYTES).contains(&bytes) && bytes & (bytes - 1) == 0
 }
 unsafe fn ensure_selected(current: *mut Status) -> bool {
-    let Some(_g) = Guard::enter() else {
+    let Some(_g) = Guard::for_device(unsafe { (*current).device }) else {
         return false;
     };
     unsafe {
@@ -333,7 +329,7 @@ unsafe fn ensure_selected(current: *mut Status) -> bool {
             (*current).reason = Text::literal(b"USBMSC transport recovery incomplete");
             return false;
         }
-        let xs = xhci::status();
+        let xs = xhci::device_status((*current).device);
         let exact = (*current).device.slot_id != 0
             && xs.addressed_slot_id == (*current).device.slot_id
             && xs.addressed_port == (*current).device.port;
@@ -348,7 +344,7 @@ unsafe fn ensure_selected(current: *mut Status) -> bool {
                 (*current).reason = Text::literal(b"USBMSC device select failed");
                 return false;
             }
-            let selected = xhci::status();
+            let selected = xhci::device_status((*current).device);
             if selected.bulk_endpoints_faulted || selected.control_endpoint_faulted {
                 (*current).failures += 1;
                 (*current).reason = Text::literal(b"USBMSC xHCI endpoint faulted");
