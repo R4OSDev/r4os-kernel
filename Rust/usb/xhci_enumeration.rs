@@ -153,8 +153,6 @@ pub(super) unsafe fn alloc_first_device_runtime(ctx: Context) -> bool {
             ((*s).first_device_virt, DEVICE_CONTEXT_BYTES),
             ((*s).first_input_virt, INPUT_CONTEXT_BYTES),
             ((*s).first_descriptor_virt, DESCRIPTOR_BYTES),
-            ((*s).first_interrupt_buffer_virt, INTERRUPT_BUFFER_BYTES),
-            ((*s).first_bulk_buffer_virt, BULK_BUFFER_BYTES),
         ] {
             ptr::write_bytes(
                 ptr::with_exposed_provenance_mut::<u8>(address as usize),
@@ -166,8 +164,6 @@ pub(super) unsafe fn alloc_first_device_runtime(ctx: Context) -> bool {
             .add(usize::from((*current(ctx)).addressed_slot_id))
             .write((*current(ctx)).device_context_phys);
         init_ep0_ring(ctx);
-        init_interrupt_ring(ctx);
-        init_bulk_rings(ctx);
         true
     }
 }

@@ -558,29 +558,6 @@ pub(super) unsafe fn allocate_runtime(
                 Some(frame) => frame,
                 None => return fail_alloc_runtime(ctx, index),
             };
-            (*rt).interrupt_ring_phys = match super::xhci_hardware::alloc_frame_zero() {
-                Some(frame) => frame,
-                None => return fail_alloc_runtime(ctx, index),
-            };
-            (*rt).interrupt_buffer_phys = match super::xhci_hardware::alloc_frame_zero() {
-                Some(frame) => frame,
-                None => return fail_alloc_runtime(ctx, index),
-            };
-            (*rt).bulk_in_ring_phys = match super::xhci_hardware::alloc_frame_zero() {
-                Some(frame) => frame,
-                None => return fail_alloc_runtime(ctx, index),
-            };
-            (*rt).bulk_out_ring_phys = match super::xhci_hardware::alloc_frame_zero() {
-                Some(frame) => frame,
-                None => return fail_alloc_runtime(ctx, index),
-            };
-            (*rt).bulk_buffer_frames = super::xhci_constants::BULK_BUFFER_FRAMES;
-            (*rt).bulk_buffer_phys = match super::xhci_hardware::alloc_contiguous_zero(
-                super::xhci_constants::BULK_BUFFER_FRAMES,
-            ) {
-                Some(frame) => frame,
-                None => return fail_alloc_runtime(ctx, index),
-            };
             (*rt).descriptor_phys = match super::xhci_hardware::alloc_frame_zero() {
                 Some(frame) => frame,
                 None => return fail_alloc_runtime(ctx, index),
@@ -590,16 +567,6 @@ pub(super) unsafe fn allocate_runtime(
             (*rt).input_virt =
                 crate::memory::phys::r4os_rust_phys_to_virt((*rt).input_context_phys);
             (*rt).ep0_ring_virt = crate::memory::phys::r4os_rust_phys_to_virt((*rt).ep0_ring_phys);
-            (*rt).interrupt_ring_virt =
-                crate::memory::phys::r4os_rust_phys_to_virt((*rt).interrupt_ring_phys);
-            (*rt).interrupt_buffer_virt =
-                crate::memory::phys::r4os_rust_phys_to_virt((*rt).interrupt_buffer_phys);
-            (*rt).bulk_in_ring_virt =
-                crate::memory::phys::r4os_rust_phys_to_virt((*rt).bulk_in_ring_phys);
-            (*rt).bulk_out_ring_virt =
-                crate::memory::phys::r4os_rust_phys_to_virt((*rt).bulk_out_ring_phys);
-            (*rt).bulk_buffer_virt =
-                crate::memory::phys::r4os_rust_phys_to_virt((*rt).bulk_buffer_phys);
             (*rt).descriptor_virt =
                 crate::memory::phys::r4os_rust_phys_to_virt((*rt).descriptor_phys);
             (*s).current.retained_slots += 1;
@@ -608,5 +575,82 @@ pub(super) unsafe fn allocate_runtime(
         (*s).current.failures += 1;
         (*s).current.reason = Text::literal(b"xHCI runtime table full");
         None
+    }
+}
+
+// Allocation groups remain local until complete. Only these unpublished
+// frames may roll back without a hardware acknowledgement. Once committed,
+// existing exact endpoint/controller cleanup owns every frame, including
+// command failure/timeout; no speculative free follows a possible submission.
+pub(super) unsafe fn ensure_interrupt_storage(ctx: Context) -> bool {
+    unsafe {
+        let s = state(ctx);
+        let c = super::xhci_state::current(ctx);
+        if (*s).active_runtime_index.is_none() {
+            return false;
+        }
+        if (*c).interrupt_ring_phys != 0 || (*c).interrupt_buffer_phys != 0 {
+            return (*c).interrupt_ring_phys != 0
+                && (*c).interrupt_buffer_phys != 0
+                && (*s).first_interrupt_ring_virt != 0
+                && (*s).first_interrupt_buffer_virt != 0;
+        }
+        let Some(mut ring) = super::xhci_hardware::alloc_frame_zero() else {
+            return false;
+        };
+        let Some(buffer) = super::xhci_hardware::alloc_frame_zero() else {
+            free_dma_frame(ctx, &mut ring);
+            return false;
+        };
+        (*c).interrupt_ring_phys = ring;
+        (*c).interrupt_buffer_phys = buffer;
+        (*s).first_interrupt_ring_virt = crate::memory::phys::r4os_rust_phys_to_virt(ring);
+        (*s).first_interrupt_buffer_virt = crate::memory::phys::r4os_rust_phys_to_virt(buffer);
+        super::xhci_rings::init_interrupt_ring(ctx);
+        persist_active_runtime(ctx);
+        true
+    }
+}
+pub(super) unsafe fn ensure_bulk_storage(ctx: Context) -> bool {
+    unsafe {
+        let s = state(ctx);
+        let c = super::xhci_state::current(ctx);
+        if (*s).active_runtime_index.is_none() {
+            return false;
+        }
+        if (*c).bulk_in_ring_phys != 0 || (*c).bulk_out_ring_phys != 0 || (*c).bulk_buffer_phys != 0
+        {
+            return (*c).bulk_in_ring_phys != 0
+                && (*c).bulk_out_ring_phys != 0
+                && (*c).bulk_buffer_phys != 0
+                && (*c).bulk_buffer_frames == super::xhci_constants::BULK_BUFFER_FRAMES
+                && (*s).first_bulk_in_ring_virt != 0
+                && (*s).first_bulk_out_ring_virt != 0
+                && (*s).first_bulk_buffer_virt != 0;
+        }
+        let Some(mut input) = super::xhci_hardware::alloc_frame_zero() else {
+            return false;
+        };
+        let Some(mut output) = super::xhci_hardware::alloc_frame_zero() else {
+            free_dma_frame(ctx, &mut input);
+            return false;
+        };
+        let Some(buffer) =
+            super::xhci_hardware::alloc_contiguous_zero(super::xhci_constants::BULK_BUFFER_FRAMES)
+        else {
+            free_dma_frame(ctx, &mut output);
+            free_dma_frame(ctx, &mut input);
+            return false;
+        };
+        (*c).bulk_in_ring_phys = input;
+        (*c).bulk_out_ring_phys = output;
+        (*c).bulk_buffer_phys = buffer;
+        (*c).bulk_buffer_frames = super::xhci_constants::BULK_BUFFER_FRAMES;
+        (*s).first_bulk_in_ring_virt = crate::memory::phys::r4os_rust_phys_to_virt(input);
+        (*s).first_bulk_out_ring_virt = crate::memory::phys::r4os_rust_phys_to_virt(output);
+        (*s).first_bulk_buffer_virt = crate::memory::phys::r4os_rust_phys_to_virt(buffer);
+        super::xhci_rings::init_bulk_rings(ctx);
+        persist_active_runtime(ctx);
+        true
     }
 }

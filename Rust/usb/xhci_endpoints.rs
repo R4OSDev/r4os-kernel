@@ -11,6 +11,7 @@ use super::{
     xhci_state::{current, state},
     xhci_types::{EndpointHandle, Trb},
 };
+use crate::sched::sync_types::Text;
 use core::ptr;
 pub(super) fn endpoint_dci(_ctx: Context, address: u8) -> u8 {
     let number = address & 15;
@@ -84,7 +85,6 @@ pub(super) unsafe fn configure_first_interrupt_in_endpoint(
         if !(*c).get_config_ok
             || (*c).addressed_slot_id == 0
             || (*s).first_input_virt == 0
-            || (*s).first_interrupt_ring_virt == 0
             || (*c).interrupt_endpoint_faulted
             || address & 0x80 == 0
         {
@@ -96,6 +96,13 @@ pub(super) unsafe fn configure_first_interrupt_in_endpoint(
         }
         let dci = number * 2 + 1;
         if dci >= 32 {
+            return false;
+        }
+        if !super::xhci_runtime::ensure_interrupt_storage(ctx) {
+            (*c).failures += 1;
+            (*c).reason = Text::literal(
+                b"xHCI interrupt DMA allocation unavailable; retained owner unchanged",
+            );
             return false;
         }
         if let Some(owner) = super::xhci::current_interrupt_owner_match(ctx) {
@@ -190,8 +197,6 @@ pub(super) unsafe fn configure_first_bulk_endpoints(
             || (*c).addressed_slot_id == 0
             || (*s).first_input_virt == 0
             || (*c).bulk_endpoints_faulted
-            || (*s).first_bulk_in_ring_virt == 0
-            || (*s).first_bulk_out_ring_virt == 0
             || in_address & 0x80 == 0
             || out_address & 0x80 != 0
         {
@@ -200,6 +205,12 @@ pub(super) unsafe fn configure_first_bulk_endpoints(
         let in_dci = endpoint_dci(ctx, in_address);
         let out_dci = endpoint_dci(ctx, out_address);
         if in_dci == 0 || out_dci == 0 || in_dci >= 32 || out_dci >= 32 {
+            return false;
+        }
+        if !super::xhci_runtime::ensure_bulk_storage(ctx) {
+            (*c).failures += 1;
+            (*c).reason =
+                Text::literal(b"xHCI bulk DMA allocation unavailable; retained owner unchanged");
             return false;
         }
         let max_dci = in_dci.max(out_dci);

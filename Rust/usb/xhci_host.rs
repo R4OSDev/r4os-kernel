@@ -273,10 +273,15 @@ pub(super) unsafe extern "C" fn host_poll(context: *mut c_void) -> i32 {
 }
 pub(super) unsafe extern "C" fn host_shutdown(context: *mut c_void) -> i32 {
     let ctx = unsafe { Context::from_raw(context) };
-    unsafe {
+    let hook = unsafe {
         let Some(_guard) = Guard::enter(ctx) else {
             return -1;
         };
+        // Class callbacks must run after the last controller admission is
+        // released. A nested shutdown cannot provide that boundary yet.
+        if (*state(ctx)).controller_ownership.depth != 1 {
+            return -2;
+        }
         let ok = super::xhci_boot::teardown_for_reprobe(ctx);
         if ok {
             ctx.publish_id(0);
@@ -290,8 +295,19 @@ pub(super) unsafe extern "C" fn host_shutdown(context: *mut c_void) -> i32 {
                 b"xHCI unload deferred or halt failed; resources retained",
             );
         }
-        if ok { 0 } else { -2 }
+        if !ok {
+            return -2;
+        }
+        ctx.asynchronous()
+            .topology_hook
+            .load(core::sync::atomic::Ordering::Acquire)
+    };
+    // The successful teardown removed the exact controller catalogue and
+    // stopped its worker; no later port change will retire the class state.
+    if hook != 0 {
+        unsafe { core::mem::transmute::<usize, super::xhci_state::TopologyHook>(hook)() };
     }
+    0
 }
 pub(super) unsafe extern "C" fn host_status(context: *mut c_void, out: *mut HostStatus) -> i32 {
     let ctx = unsafe { Context::from_raw(context) };
