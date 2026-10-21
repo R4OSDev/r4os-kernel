@@ -20,7 +20,7 @@ use crate::{
 };
 use core::{
     ptr,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 pub(super) struct AsyncState {
@@ -37,6 +37,13 @@ pub(super) struct AsyncState {
     pub task_id: AtomicU32,
     pub task_iterations: AtomicU64,
     pub topology_hook: AtomicUsize,
+    pub completion_waiting: AtomicU16,
+    pub completion_fast: AtomicU64,
+    pub completion_enrolled: AtomicU64,
+    pub completion_recheck: AtomicU64,
+    pub completion_signaled: AtomicU64,
+    pub completion_fallback: AtomicU64,
+    pub completion_parks: AtomicU64,
 }
 impl AsyncState {
     pub(super) const fn empty() -> Self {
@@ -54,6 +61,13 @@ impl AsyncState {
             task_id: AtomicU32::new(0),
             task_iterations: AtomicU64::new(0),
             topology_hook: AtomicUsize::new(0),
+            completion_waiting: AtomicU16::new(0),
+            completion_fast: AtomicU64::new(0),
+            completion_enrolled: AtomicU64::new(0),
+            completion_recheck: AtomicU64::new(0),
+            completion_signaled: AtomicU64::new(0),
+            completion_fallback: AtomicU64::new(0),
+            completion_parks: AtomicU64::new(0),
         }
     }
 }
@@ -101,6 +115,22 @@ pub(super) unsafe fn reset_after_teardown(ctx: Context) {
     // under a still-resident port worker during reprobe.
     unsafe {
         sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*state(ctx)).event_irq), 1, 0);
+    }
+    assert_eq!(
+        ctx.asynchronous()
+            .completion_waiting
+            .load(Ordering::Acquire),
+        0,
+        "xHCI teardown with a live completion waiter"
+    );
+    unsafe {
+        for i in 0..9 {
+            sync_objects::r4os_rust_sync_event(
+                ptr::addr_of_mut!((*state(ctx)).completion_events[i]),
+                1,
+                0,
+            );
+        }
     }
     ctx.asynchronous()
         .irq_registered
@@ -362,6 +392,21 @@ unsafe extern "C" fn event_irq_handler(_: u8, context: usize) -> u32 {
         ctx.asynchronous()
             .irq_handled
             .fetch_add(1, Ordering::Relaxed);
+        // Only currently enrolled waiters of this exact resident controller
+        // are nudged. The ring/matcher, never this IRQ, grants completion.
+        let mut waiting = ctx
+            .asynchronous()
+            .completion_waiting
+            .load(Ordering::Acquire);
+        while waiting != 0 {
+            let i = waiting.trailing_zeros() as usize;
+            waiting &= waiting - 1;
+            sync_objects::r4os_rust_sync_event(
+                ptr::addr_of_mut!((*state(ctx)).completion_events[i]),
+                0,
+                0,
+            );
+        }
         sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*state(ctx)).event_irq), 0, 0);
     }
     1
@@ -401,5 +446,109 @@ unsafe fn emit_port_service_marker(ctx: Context) {
         puts(b" catalog_changes=");
         diag::console_dec((*current(ctx)).port_catalog_changes);
         puts(b"\r\n");
+    }
+}
+
+// An enrolled slot remains resident and is exclusive under controller
+// admission. Runtime transaction pins preserve its generation across parks;
+// the command lane cannot release its owner to another command.
+pub(super) struct CompletionWait {
+    ctx: Context,
+    pub slot: usize,
+}
+impl CompletionWait {
+    pub(super) unsafe fn enroll(ctx: Context, expected: super::event_router::Match) -> Self {
+        let slot = if expected.tag == 1 {
+            8
+        } else {
+            unsafe { (*state(ctx)).active_runtime_index }
+                .expect("completion without device runtime")
+        };
+        unsafe {
+            assert!(
+                (*state(ctx)).completion_matches[slot].is_none(),
+                "completion slot already enrolled"
+            );
+            // Clear the old signal before publication, then publish before
+            // the caller rechecks the mailbox/ring. An earlier completion
+            // stays on that ring; a later signal persists until enrollment.
+            sync_objects::r4os_rust_sync_event(
+                ptr::addr_of_mut!((*state(ctx)).completion_events[slot]),
+                1,
+                0,
+            );
+            (*state(ctx)).completion_matches[slot] = Some(expected);
+        }
+        ctx.asynchronous()
+            .completion_waiting
+            .fetch_or(1 << slot, Ordering::Release);
+        ctx.asynchronous()
+            .completion_enrolled
+            .fetch_add(1, Ordering::Relaxed);
+        Self { ctx, slot }
+    }
+    pub(super) fn rechecked(&self) {
+        self.ctx
+            .asynchronous()
+            .completion_recheck
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+impl Drop for CompletionWait {
+    fn drop(&mut self) {
+        self.ctx
+            .asynchronous()
+            .completion_waiting
+            .fetch_and(!(1 << self.slot), Ordering::AcqRel);
+        unsafe { (*state(self.ctx)).completion_matches[self.slot] = None };
+    }
+}
+pub(super) unsafe fn signal_completion(ctx: Context, event: super::event_router::Event) {
+    unsafe {
+        for i in 0..9 {
+            if (*state(ctx)).completion_matches[i]
+                .is_some_and(|m| super::event_router::matches(event, m))
+            {
+                // Exact event is already in the deferred mailbox here.
+                sync_objects::r4os_rust_sync_event(
+                    ptr::addr_of_mut!((*state(ctx)).completion_events[i]),
+                    0,
+                    0,
+                );
+            }
+        }
+    }
+}
+pub(super) unsafe fn completion_idle(
+    ctx: Context,
+    wait: *mut super::wait_types::Wait,
+    slot: usize,
+) {
+    unsafe {
+        (*wait).iterations = (*wait).iterations.wrapping_add(1);
+        if !(*wait).deadline.can_block() {
+            core::hint::spin_loop();
+            return;
+        }
+        ctx.asynchronous()
+            .completion_parks
+            .fetch_add(1, Ordering::Relaxed);
+        // At most one tick is a progress fallback, not a renewed deadline.
+        // Only a matching ring event can finish the caller's original wait.
+        let result = sync_objects::r4os_rust_sync_event(
+            ptr::addr_of_mut!((*state(ctx)).completion_events[slot]),
+            2,
+            1,
+        );
+        (*wait).blocked_ticks = (*wait).blocked_ticks.wrapping_add(1);
+        if result == 1 {
+            ctx.asynchronous()
+                .completion_signaled
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            ctx.asynchronous()
+                .completion_fallback
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }

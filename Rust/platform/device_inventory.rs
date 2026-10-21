@@ -795,7 +795,66 @@ fn add_usb(snapshot: *mut Snapshot) {
             },
         );
     }
+    for mode in 0..3 {
+        let name = match mode {
+            0 => b"USB completion work".as_slice(),
+            1 => b"USB IRQ work".as_slice(),
+            _ => b"USB completion wake".as_slice(),
+        };
+        let note = usb_work_note(snapshot, mode);
+        add(
+            snapshot,
+            Record::named(USB, name, b"usb/xhci", b"counters", note.slice()),
+        );
+    }
 }
+
+// Like PCI notes, only the requested record owns text in this existing
+// stationary buffer. This adds no ABI or 16-KB snapshot-stack allocation.
+fn usb_work_note(snapshot: *mut Snapshot, mode: u8) -> Text {
+    if unsafe { (*snapshot).count != (*snapshot).requested_text_index } {
+        return Text::EMPTY;
+    }
+    let out = unsafe { &mut *ptr::addr_of_mut!((*snapshot).xhci_note) };
+    out.fill(0);
+    let mut w = NoteWriter::new(out);
+    if mode == 2 {
+        let v = crate::usb::xhci_state::work_counters();
+        for (name, value) in [
+            (b"fast=".as_slice(), v[3]),
+            (b" enrolled=", v[4]),
+            (b" recheck=", v[5]),
+            (b" signal=", v[6]),
+            (b" fallbackwait=", v[7]),
+            (b" parks=", v[8]),
+        ] {
+            w.text(name);
+            w.num(value);
+        }
+    } else if mode == 1 {
+        let v = crate::usb::xhci_state::work_counters();
+        w.text(b"irq=");
+        w.num(v[0]);
+        w.text(b" wake=");
+        w.num(v[1]);
+        w.text(b" fallback=");
+        w.num(v[2]);
+    } else {
+        let v = crate::usb::wait::metrics();
+        w.text(b"calls=");
+        w.num(v.calls);
+        w.text(b" loops=");
+        w.num(v.iterations);
+        w.text(b" sleep=");
+        w.num(v.blocked_ticks);
+        w.text(b" to=");
+        w.num(v.timeouts);
+        w.text(b" ns=");
+        w.num(v.elapsed_ns);
+    }
+    w.result()
+}
+
 fn r4p_source(source: Text) -> bool {
     matches!(source.slice(), b"r4p" | b"preload")
 }
@@ -1700,10 +1759,14 @@ unsafe fn inventory_xhci(
     let id = crate::usb::xhci_state::host_id_for_pci(pci_function);
     let index = unsafe { host::r4os_rust_usb_host_index(id) };
     if index != usize::MAX {
-        result.present = true;
         let mut value = MaybeUninit::uninit();
         if unsafe { host::r4os_rust_usb_host_at(index, value.as_mut_ptr()) } {
             let value = unsafe { value.assume_init() };
+            if id == 0 || value.id != id {
+                unsafe { out.write(result) };
+                return;
+            }
+            result.present = true;
             result.exists = true;
             result.source = value.source;
             result.state = value.state;
@@ -1715,8 +1778,7 @@ unsafe fn inventory_xhci(
             });
             if with_status {
                 let mut status = types::HostStatus::EMPTY;
-                result.status_ok =
-                    unsafe { host::r4os_rust_usb_host_status(index, &mut status) } == 0;
+                result.status_ok = unsafe { host::status_exact(id, &mut status) } == 0;
                 result.flags = status.flags;
                 result.queue_depth = status.queue_depth;
                 result.max_transfer_bytes = status.max_transfer_bytes;

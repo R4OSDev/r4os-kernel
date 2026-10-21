@@ -253,10 +253,20 @@ unsafe fn unregister(index: usize, expected_id: u32, expected_owner: u32) -> boo
     true
 }
 
+pub(crate) unsafe fn status_exact(id: u32, out: *mut HostStatus) -> i32 {
+    let index = unsafe { r4os_rust_usb_host_index(id) };
+    unsafe { status_expected(index, Some(id), out) }
+}
 unsafe fn status_at(index: usize, out: *mut HostStatus) -> i32 {
+    unsafe { status_expected(index, None, out) }
+}
+unsafe fn status_expected(index: usize, expected: Option<u32>, out: *mut HostStatus) -> i32 {
     let Some(c) = (unsafe { snapshot(index) }) else {
         return -1;
     };
+    if expected.is_some_and(|id| c.id != id) {
+        return -1;
+    }
     unsafe {
         out.write(HostStatus {
             state: u32::from(c.state),
@@ -274,6 +284,9 @@ unsafe fn status_at(index: usize, out: *mut HostStatus) -> i32 {
         Ok(d) => d,
         Err(e) => return e,
     };
+    if d.id != c.id {
+        return -1;
+    }
     if d.status != 0 {
         let result = unsafe { mem::transmute::<usize, Status>(d.status)(d.context, out) };
         if result < 0 {

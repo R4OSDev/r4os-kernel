@@ -44,6 +44,8 @@ pub(super) struct State {
     pub last_sync_transfer_incident: IncidentToken,
     pub active_command: Option<Match>,
     pub event_irq: Event,
+    pub completion_events: [Event; 9],
+    pub completion_matches: [Option<Match>; 9],
     pub activated_owner_id: u32,
     pub controller_ownership: UnwindGuard,
     pub canonical_backend: HostDescriptor,
@@ -92,6 +94,8 @@ impl State {
             last_sync_transfer_incident: IncidentToken::EMPTY,
             active_command: None,
             event_irq: Event::AUTO,
+            completion_events: [const { Event::AUTO }; 9],
+            completion_matches: [None; 9],
             activated_owner_id: 0,
             controller_ownership: UnwindGuard {
                 owner: 0,
@@ -196,6 +200,32 @@ impl Iterator for Iter {
         self.0 = unsafe { (*p).next };
         Some(Context(p))
     }
+}
+
+// Passive diagnostic quantities. IRQ producers remain atomic; no mutable
+// Status or controller admission is borrowed across the catalogue traversal.
+pub(crate) fn work_counters() -> [u64; 9] {
+    use core::sync::atomic::Ordering;
+    let mut out = [0u64; 9];
+    for ctx in instances() {
+        for (i, value) in [
+            &ctx.asynchronous().irq_count,
+            &ctx.asynchronous().irq_wakeups,
+            &ctx.asynchronous().poll_fallbacks,
+            &ctx.asynchronous().completion_fast,
+            &ctx.asynchronous().completion_enrolled,
+            &ctx.asynchronous().completion_recheck,
+            &ctx.asynchronous().completion_signaled,
+            &ctx.asynchronous().completion_fallback,
+            &ctx.asynchronous().completion_parks,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out[i] = out[i].wrapping_add(value.load(Ordering::Relaxed));
+        }
+    }
+    out
 }
 pub(super) fn instances() -> Iter {
     let _metadata = RuntimeGuard::acquire();

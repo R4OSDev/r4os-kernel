@@ -140,21 +140,23 @@ pub(super) fn restore(ctx: Context, depth: u32) {
         restored += 1;
     }
 }
-pub(super) unsafe fn idle_device_wait(ctx: Context, wait: *mut Wait) {
-    let Some(index) = (unsafe { (*state(ctx)).active_runtime_index }) else {
-        unsafe { (&mut *wait).idle() };
-        return;
-    };
-    if scheduler::current().is_null()
-        || !transaction_owned(ctx, unsafe {
-            ptr::addr_of!((*state(ctx)).runtimes[index]).read()
-        })
-    {
-        unsafe { (&mut *wait).idle() };
+pub(super) unsafe fn idle_device_wait(ctx: Context, wait: *mut Wait, completion_slot: usize) {
+    // Keep a small bounded immediate-completion poll; the former one-ms
+    // spin grace is replaced only for this exact completion wait.
+    if !unsafe { (*wait).deadline.can_block() } || unsafe { (*wait).iterations } < 32 {
+        unsafe { (&mut *wait).poll_once() };
         return;
     }
-    if !unsafe { (*wait).may_block_on_idle() } {
-        unsafe { (&mut *wait).poll_once() };
+    let Some(index) = (unsafe { (*state(ctx)).active_runtime_index }) else {
+        unsafe { super::xhci_async::completion_idle(ctx, wait, completion_slot) };
+        return;
+    };
+    if !transaction_owned(ctx, unsafe {
+        ptr::addr_of!((*state(ctx)).runtimes[index]).read()
+    }) {
+        // Control/command state remains under its original owner. The IRQ
+        // wakes this separate slot, so it need not borrow the port worker.
+        unsafe { super::xhci_async::completion_idle(ctx, wait, completion_slot) };
         return;
     }
     let generation = unsafe { (*state(ctx)).runtimes[index].generation };
@@ -169,7 +171,7 @@ pub(super) unsafe fn idle_device_wait(ctx: Context, wait: *mut Wait) {
         release(ctx);
         released += 1;
     }
-    unsafe { (&mut *wait).idle() };
+    unsafe { super::xhci_async::completion_idle(ctx, wait, completion_slot) };
     restore(ctx, depth);
     assert!(
         unsafe {

@@ -138,6 +138,7 @@ pub(super) unsafe fn route_foreign_event(ctx: Context, event: Event) {
         }
         if event_has_live_owner(ctx, event) {
             if (*state(ctx)).deferred_events.enqueue(event) {
+                super::xhci_async::signal_completion(ctx, event);
                 return;
             }
             clear_overflowed_interrupt_owner(ctx, event);
@@ -181,11 +182,18 @@ pub(super) unsafe fn wait_matching_event_within(
     unsafe {
         (*current(ctx)).last_wait_cancelled = false;
         if let Some(e) = (*state(ctx)).deferred_events.take(expected) {
+            ctx.asynchronous()
+                .completion_fast
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return Some(e);
         }
         if let Some(e) = drain_event_batch(ctx, expected) {
+            ctx.asynchronous()
+                .completion_fast
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return Some(e);
         }
+        let completion = super::xhci_async::CompletionWait::enroll(ctx, expected);
         let mut wait = Wait::begin(
             timing::XHCI_EVENT_TIMEOUT_MS,
             Text::literal(b"xhci-event"),
@@ -230,17 +238,23 @@ pub(super) unsafe fn wait_matching_event_within(
                 };
             }
             if let Some(e) = drain_event_batch(ctx, expected) {
+                if wait.iterations == 0 {
+                    completion.rechecked();
+                }
                 wait.finish(true);
                 return Some(e);
             }
             if let Some(e) = (*state(ctx)).deferred_events.take(expected) {
+                if wait.iterations == 0 {
+                    completion.rechecked();
+                }
                 wait.finish(true);
                 return Some(e);
             }
             if guard >= COMMAND_WAIT_GUARD {
                 break TimeoutClock::CpuGuard;
             }
-            idle_device_wait(ctx, &mut wait);
+            idle_device_wait(ctx, &mut wait, completion.slot);
             guard = guard.wrapping_add(1);
         };
         let ticks = wait.deadline.elapsed_ticks();
