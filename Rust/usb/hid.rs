@@ -14,7 +14,6 @@ use crate::{
     loader::r4p,
     platform::timer,
     sched::{
-        scheduler,
         sync_types::Text,
         task::{task_api, task_registry},
     },
@@ -62,7 +61,7 @@ const REPORT_BUFFER_LEN: usize = 32;
 const MOUSE_POLL_BUDGET: usize = 8;
 const REPORT_DESCRIPTOR_MAX: usize = 512;
 const KEYBOARD_REPORT_QUEUE_RESERVE: u32 = (c::usb_hid_boot_max_keys as u32 * 2) + 8;
-const POLL_IDLE_TICKS: u64 = 10 * crate::arch::pit::DEFAULT_HZ as u64 / 1000;
+const POLL_IDLE_TICKS: u64 = 100 * crate::arch::pit::DEFAULT_HZ as u64 / 1000;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Keyboard,
@@ -79,6 +78,8 @@ pub struct QueueStats {
 
 struct State {
     current: Status,
+    pending_keyboard_release: HidBinding,
+    pending_release_active: bool,
     bindings: [HidBinding; 3],
     options: Options,
     service_polls: u64,
@@ -94,6 +95,8 @@ struct State {
 impl State {
     const EMPTY: Self = Self {
         current: Status::EMPTY,
+        pending_keyboard_release: HidBinding::EMPTY,
+        pending_release_active: false,
         bindings: [HidBinding::EMPTY; 3],
         options: Options::EMPTY,
         service_polls: 0,
@@ -115,6 +118,18 @@ static STATE: Storage = Storage(UnsafeCell::new(State::EMPTY));
 static POLL_STARTED: AtomicBool = AtomicBool::new(false);
 static POLL_TASK_ID: AtomicU32 = AtomicU32::new(0);
 static POLL_ITERATIONS: AtomicU64 = AtomicU64::new(0);
+struct InputWake(UnsafeCell<crate::sched::sync_types::Event>);
+// The existing Event intrinsic owns its runtime admission; this object and
+// its queue remain resident independently of class/driver reconfiguration.
+unsafe impl Sync for InputWake {}
+static INPUT_WAKE: InputWake = InputWake(UnsafeCell::new(crate::sched::sync_types::Event::AUTO));
+static INPUT_SIGNALS: AtomicU64 = AtomicU64::new(0);
+unsafe extern "C" fn signal_input_work() {
+    INPUT_SIGNALS.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        crate::sched::sync_objects::r4os_rust_sync_event(INPUT_WAKE.0.get(), 0, 0);
+    }
+}
 fn state() -> *mut State {
     STATE.0.get()
 }
@@ -190,7 +205,7 @@ pub fn init(selected: Options) -> bool {
             ..Status::EMPTY
         });
         for kind in [Kind::Keyboard, Kind::Mouse, Kind::Consumer] {
-            binding(kind).write(HidBinding::EMPTY);
+            retire_binding(binding(kind), kind);
         }
         usb_hid_platform_usb(false);
         (*state()).service_polls = 0;
@@ -229,9 +244,11 @@ unsafe extern "C" fn topology_changed() {
         unsafe {
             (*state()).topology_reconciles = (*state()).topology_reconciles.wrapping_add(1);
             reconcile_bindings();
-            if [Kind::Keyboard, Kind::Mouse, Kind::Consumer]
-                .into_iter()
-                .any(|k| (*binding(k)).bound)
+            signal_input_work();
+            if (*state()).pending_release_active
+                || [Kind::Keyboard, Kind::Mouse, Kind::Consumer]
+                    .into_iter()
+                    .any(|k| (*binding(k)).bound)
             {
                 start_poll_task_locked();
             }
@@ -248,12 +265,28 @@ unsafe fn binding_still_published(b: *const HidBinding) -> bool {
         usb_core::contains_device((*b).device)
     }
 }
+unsafe fn retire_binding(b: *mut HidBinding, kind: Kind) {
+    unsafe {
+        if (*b).present {
+            let _ = xhci::input_interest((*b).endpoint, None);
+        }
+        if kind == Kind::Keyboard && (*b).last_report_len != 0 {
+            assert!(
+                !(*state()).pending_release_active,
+                "old keyboard release overwritten"
+            );
+            ptr::copy_nonoverlapping(b, ptr::addr_of_mut!((*state()).pending_keyboard_release), 1);
+            (*state()).pending_release_active = true;
+        }
+        b.write(HidBinding::EMPTY);
+    }
+}
 unsafe fn reconcile_bindings() {
     unsafe {
         for kind in [Kind::Keyboard, Kind::Mouse, Kind::Consumer] {
             let b = binding(kind);
             if (*b).present && !binding_still_published(b) {
-                b.write(HidBinding::EMPTY);
+                retire_binding(b, kind);
             }
         }
         if !(*binding(Kind::Keyboard)).bound {
@@ -422,7 +455,10 @@ unsafe fn handle_candidate(dev: super::types::Device, cand: Candidate) {
             return;
         };
         let b = binding(kind);
-        if (*b).bound || (kind == Kind::Mouse && !(*state()).options.bind_mouse) {
+        if (kind == Kind::Keyboard && (*state()).pending_release_active)
+            || (*b).bound
+            || (kind == Kind::Mouse && !(*state()).options.bind_mouse)
+        {
             return;
         }
         if kind == Kind::Keyboard {
@@ -504,6 +540,10 @@ unsafe fn bind_device(b: *mut HidBinding, kind: Kind) -> bool {
             return false;
         }
         (*b).bound = bind_interrupt_input(b);
+        if (*b).bound && !xhci::input_interest((*b).endpoint, Some(signal_input_work)) {
+            (*b).bound = false;
+            (*current()).reason = Text::literal(b"exact HID input notification binding failed");
+        }
         (*b).bound
     }
 }
@@ -617,7 +657,7 @@ unsafe fn ensure_selected(b: *mut HidBinding, kind: Kind) -> bool {
 }
 unsafe fn poll_binding(b: *mut HidBinding, kind: Kind) -> bool {
     unsafe {
-        if !(*b).bound {
+        if !(*b).bound || (kind == Kind::Keyboard && (*state()).pending_release_active) {
             return false;
         }
         // Retain this exact controller across public-v2 handle projection and
@@ -778,6 +818,28 @@ unsafe fn decode_keyboard(b: *mut HidBinding, report: &[u8]) -> bool {
             (*current()).last_usage = *usage;
             record_injected_usage(*usage, true);
         }
+        true
+    }
+}
+// A detached binding cannot submit hardware work. Retain only its exact
+// previous input state until the normal queue can accept release decoding;
+// do not bind/poll a replacement keyboard ahead of these releases.
+unsafe fn flush_keyboard_release() -> bool {
+    unsafe {
+        if !usb_hid_can_accept(KEYBOARD_REPORT_QUEUE_RESERVE) {
+            return false;
+        }
+        let b = ptr::addr_of_mut!((*state()).pending_keyboard_release);
+        let n = usize::from((*b).last_report_len).clamp(8, REPORT_BUFFER_LEN);
+        let mut released = [0u8; REPORT_BUFFER_LEN];
+        if (*b).report_id_heuristic && n > 8 {
+            released[0] = (*b).last_report[0];
+        }
+        if !decode_keyboard(b, &released[..n]) {
+            return false;
+        }
+        (*state()).pending_release_active = false;
+        (*state()).pending_keyboard_release = HidBinding::EMPTY;
         true
     }
 }
@@ -943,6 +1005,9 @@ pub fn service_poll() {
     };
     unsafe {
         (*state()).service_polls = (*state()).service_polls.wrapping_add(1);
+        if (*state()).pending_release_active && flush_keyboard_release() {
+            reconcile_bindings();
+        }
         poll_binding(binding(Kind::Keyboard), Kind::Keyboard);
         poll_mouse();
         poll_binding(binding(Kind::Consumer), Kind::Consumer);
@@ -999,6 +1064,11 @@ unsafe fn start_poll_task_locked() -> bool {
 }
 unsafe extern "C" fn poll_task_main() {
     loop {
+        // Clear before inspecting reports. Earlier work remains in the exact
+        // native mailbox; later publication retains its signal until wait.
+        unsafe {
+            crate::sched::sync_objects::r4os_rust_sync_event(INPUT_WAKE.0.get(), 1, 0);
+        }
         service_poll();
         let iteration = POLL_ITERATIONS
             .fetch_add(1, Ordering::Relaxed)
@@ -1011,7 +1081,11 @@ unsafe extern "C" fn poll_task_main() {
             }
         }
         unsafe {
-            scheduler::sleep(POLL_IDLE_TICKS, b"usb-hid-poll-idle".as_ptr(), 17);
+            crate::sched::sync_objects::r4os_rust_sync_event(
+                INPUT_WAKE.0.get(),
+                2,
+                POLL_IDLE_TICKS,
+            );
         }
     }
 }
@@ -1217,5 +1291,27 @@ unsafe fn usb_hid_released(op: *const c::UsbHidBootOp, out: *mut u8, capacity: u
             usize::from(op.report_offset).min(cl),
             core::slice::from_raw_parts_mut(out, capacity),
         )
+    }
+}
+
+// Passive quantities under the existing class owner; no new hot-path clock.
+pub(crate) fn work_counters() -> Option<[u64; 12]> {
+    let _g = Guard::enter()?;
+    unsafe {
+        refresh_aggregate_status();
+        Some([
+            timer::tick_count(),
+            u64::from(timer::frequency()),
+            (*state()).service_polls,
+            POLL_ITERATIONS.load(Ordering::Relaxed),
+            (*current()).no_reports,
+            (*current()).decoded_keys,
+            (*current()).decoded_mouse,
+            (*state()).keyboard_backpressure_polls,
+            INPUT_SIGNALS.load(Ordering::Relaxed),
+            u64::from((*current()).last_modifiers),
+            u64::from((*current()).keyboard_bound),
+            u64::from((*current()).mouse_bound),
+        ])
     }
 }

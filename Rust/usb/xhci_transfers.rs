@@ -9,7 +9,7 @@ use super::{
     xhci_constants::*,
     xhci_diag as diag,
     xhci_state::{current, state},
-    xhci_types::{ControlRequest, EndpointHandle, IncidentToken, InterruptSubmission},
+    xhci_types::{ControlRequest, EndpointHandle, IncidentToken, InterruptSubmission, Trb},
 };
 use crate::{boot::foundation::puts, platform::timer, sched::sync_types::Text};
 use core::ptr;
@@ -496,50 +496,8 @@ pub(super) unsafe fn poll_first_interrupt_in_report_status(
             (*current(ctx)).interrupt_pending = false;
             (*current(ctx)).interrupt_pending_streak = 0;
         }
-        if !(*current(ctx)).interrupt_pending {
-            ptr::write_bytes(
-                (*state(ctx)).first_interrupt_buffer_virt as *mut u8,
-                0,
-                out.len(),
-            );
-            (*current(ctx)).last_interrupt_request_len = out.len() as u32;
-            (*current(ctx)).last_interrupt_residue = 0;
-            (*current(ctx)).last_interrupt_actual_len = 0;
-            (*current(ctx)).last_interrupt_completion_code = 0;
-            let submission = write_interrupt_trb(
-                ctx,
-                (*current(ctx)).interrupt_buffer_phys,
-                out.len() as u32,
-                trb_type(TRB_TYPE_NORMAL) | TRB_IOC,
-            );
-            (*current(ctx)).interrupt_pending_trb_phys = submission.trb_phys;
-            let expected = Match::transfer(
-                (*current(ctx)).addressed_slot_id,
-                (*current(ctx)).interrupt_endpoint_id,
-                submission.trb_phys,
-            );
-            let Some(handle) =
-                (*state(ctx))
-                    .transfer_objects
-                    .begin(3, expected, timer::tick_count())
-            else {
-                (*current(ctx)).interrupt_pending_trb_phys = 0;
-                (*current(ctx)).failures += 1;
-                return InterruptPollResult::Failed;
-            };
-            (*current(ctx)).interrupt_transfer_handle = handle;
-            dma_fence();
-            (*current(ctx)).interrupt_pending = true;
-            (*current(ctx)).interrupt_pending_streak = 0;
-            write_doorbell(
-                ctx,
-                (*current(ctx)).addressed_slot_id,
-                u32::from((*current(ctx)).interrupt_endpoint_id),
-            );
-            if submission.advance.wrapped {
-                (*current(ctx)).interrupt_ring_wraps += 1;
-                emit_interrupt_wrap_marker(ctx, submission);
-            }
+        if !(*current(ctx)).interrupt_pending && !arm_interrupt_report(ctx, out.len()) {
+            return InterruptPollResult::Failed;
         }
         let expected = Match::transfer(
             (*current(ctx)).addressed_slot_id,
@@ -598,7 +556,82 @@ pub(super) unsafe fn poll_first_interrupt_in_report_status(
             count,
         );
         (*current(ctx)).interrupt_reports += 1;
+        // The previous report is in caller storage and its exact ledger entry
+        // is retired. Keep its public length/residue metadata while preparing
+        // the next one; DMA may only overwrite the private native buffer.
+        let subscribed = (*state(ctx)).active_runtime_index.is_some_and(|i| {
+            (*state(ctx)).input_generations[i] == (*state(ctx)).runtimes[i].generation
+                && (*state(ctx)).input_endpoints[i] == (*current(ctx)).interrupt_endpoint_id
+        });
+        if subscribed {
+            let last = (
+                (*current(ctx)).last_interrupt_request_len,
+                (*current(ctx)).last_interrupt_residue,
+                (*current(ctx)).last_interrupt_actual_len,
+                (*current(ctx)).last_interrupt_completion_code,
+            );
+            let _ = arm_interrupt_report(ctx, out.len());
+            (*current(ctx)).last_interrupt_request_len = last.0;
+            (*current(ctx)).last_interrupt_residue = last.1;
+            (*current(ctx)).last_interrupt_actual_len = last.2;
+            (*current(ctx)).last_interrupt_completion_code = last.3;
+        }
         InterruptPollResult::Report
+    }
+}
+// Admission/reservation precedes ring publication. A failed immediate
+// resubmit leaves the completed report valid and retries on a later poll.
+unsafe fn arm_interrupt_report(ctx: Context, bytes: usize) -> bool {
+    unsafe {
+        let c = current(ctx);
+        if (*c).interrupt_pending || (*c).interrupt_endpoint_faulted {
+            return false;
+        }
+        let physical = (*c).interrupt_ring_phys
+            + u64::from((*c).interrupt_enqueue) * core::mem::size_of::<Trb>() as u64;
+        let expected =
+            Match::transfer((*c).addressed_slot_id, (*c).interrupt_endpoint_id, physical);
+        let Some(handle) = (*state(ctx))
+            .transfer_objects
+            .begin(3, expected, timer::tick_count())
+        else {
+            (*c).failures += 1;
+            return false;
+        };
+        ptr::write_bytes(
+            (*state(ctx)).first_interrupt_buffer_virt as *mut u8,
+            0,
+            bytes,
+        );
+        (*c).last_interrupt_request_len = bytes as u32;
+        (*c).last_interrupt_residue = 0;
+        (*c).last_interrupt_actual_len = 0;
+        (*c).last_interrupt_completion_code = 0;
+        let submission = write_interrupt_trb(
+            ctx,
+            (*c).interrupt_buffer_phys,
+            bytes as u32,
+            trb_type(TRB_TYPE_NORMAL) | TRB_IOC,
+        );
+        assert_eq!(
+            submission.trb_phys, physical,
+            "interrupt reservation/ring mismatch"
+        );
+        (*c).interrupt_pending_trb_phys = physical;
+        (*c).interrupt_transfer_handle = handle;
+        dma_fence();
+        (*c).interrupt_pending = true;
+        (*c).interrupt_pending_streak = 0;
+        write_doorbell(
+            ctx,
+            (*c).addressed_slot_id,
+            u32::from((*c).interrupt_endpoint_id),
+        );
+        if submission.advance.wrapped {
+            (*c).interrupt_ring_wraps += 1;
+            emit_interrupt_wrap_marker(ctx, submission);
+        }
+        true
     }
 }
 unsafe fn interrupt_endpoint_state(ctx: Context) -> Option<u8> {

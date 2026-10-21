@@ -139,6 +139,7 @@ pub(super) unsafe fn route_foreign_event(ctx: Context, event: Event) {
         if event_has_live_owner(ctx, event) {
             if (*state(ctx)).deferred_events.enqueue(event) {
                 super::xhci_async::signal_completion(ctx, event);
+                notify_input(ctx, event);
                 return;
             }
             clear_overflowed_interrupt_owner(ctx, event);
@@ -587,5 +588,36 @@ unsafe fn record_stale_event(ctx: Context, event: Event) {
         (*current(ctx)).last_stale_event_code = event.code;
         (*current(ctx)).last_stale_event_slot = event.slot_id;
         (*current(ctx)).last_stale_event_endpoint = event.endpoint_id;
+    }
+}
+
+// Publication to the exact report mailbox precedes this wake. A class
+// subscription is separate from generic interrupt transfers and retained by
+// runtime generation; slot reuse cannot notify an old/replacement binding.
+unsafe fn notify_input(ctx: Context, event: Event) {
+    unsafe {
+        let s = state(ctx);
+        let Some(hook) = (*s).input_hook else {
+            return;
+        };
+        for i in 0..8 {
+            let rt = ptr::addr_of!((*s).runtimes[i]).read();
+            if !rt.active
+                || rt.detach_pending
+                || (*s).input_generations[i] != rt.generation
+                || (*s).input_endpoints[i] != event.endpoint_id
+            {
+                continue;
+            }
+            let expected = if (*s).active_runtime_index == Some(i) {
+                current_interrupt_owner_match(ctx)
+            } else {
+                runtime_interrupt_owner_match(ctx, rt)
+            };
+            if expected.is_some_and(|m| event_router::matches(event, m)) {
+                hook();
+                return;
+            }
+        }
     }
 }

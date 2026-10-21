@@ -314,3 +314,45 @@ pub(super) unsafe fn select_device_handle(handle: *mut DeviceHandle) -> bool {
     };
     unsafe { xhci::select_device_handle(g.ctx, handle) }
 }
+
+// Only the resident HID owner supplies this wake-only callback. It cannot
+// consume a report or borrow class admission while controller state is owned.
+pub(super) unsafe fn input_interest(
+    endpoint: EndpointHandle,
+    hook: Option<super::xhci_state::TopologyHook>,
+) -> bool {
+    let Some(g) = Guard::for_id(endpoint.device.controller_id) else {
+        return false;
+    };
+    unsafe {
+        let s = xhci_state::state(g.ctx);
+        let Some(i) =
+            xhci::runtime_index_for_identity(g.ctx, endpoint.device.slot_id, endpoint.device.port)
+        else {
+            return hook.is_none();
+        };
+        if (*s).runtimes[i].generation != endpoint.device.generation {
+            return hook.is_none();
+        }
+        if let Some(callback) = hook {
+            let current_endpoint = if (*s).active_runtime_index == Some(i) {
+                (*xhci_state::current(g.ctx)).interrupt_endpoint_id
+            } else {
+                (*s).runtimes[i].interrupt_endpoint_id
+            };
+            if endpoint.kind != 1
+                || current_endpoint != endpoint.endpoint_id
+                || !xhci::device_handle_current(g.ctx, endpoint.device)
+            {
+                return false;
+            }
+            (*s).input_hook = Some(callback);
+            (*s).input_generations[i] = endpoint.device.generation;
+            (*s).input_endpoints[i] = endpoint.endpoint_id;
+        } else {
+            (*s).input_generations[i] = 0;
+            (*s).input_endpoints[i] = 0;
+        }
+    }
+    true
+}
