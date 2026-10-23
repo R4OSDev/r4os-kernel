@@ -1,188 +1,114 @@
-//! Complete extensible graphics payload prefixes. Only the admitted old
-//! header/prefix is touched; missing field groups keep their exact defaults.
+//! Admission of complete current graphics records. Read only the initialized
+//! header until its full current capacity is proven; future tails stay untouched.
 use crate::contract as a;
-use core::{ffi::c_void, mem::size_of, ptr};
-pub trait QueueRecord: Copy + Default {
-    const PREFIXES: &'static [u32];
-}
-impl QueueRecord for a::GfxBackendRegistration {
-    const PREFIXES: &'static [u32] = &[32, 40, 48];
-}
-impl QueueRecord for a::GfxBackendInfo {
-    const PREFIXES: &'static [u32] = &[136, 144, 152];
-}
-impl QueueRecord for a::GfxSubmission {
-    const PREFIXES: &'static [u32] = &[408, 432, 512];
-}
-impl QueueRecord for a::GfxDriverJob {
-    const PREFIXES: &'static [u32] = &[112, 136, 224, 272, 296];
-}
-impl QueueRecord for a::GfxOutputColorState {
-    const PREFIXES: &'static [u32] = &[128, 192];
-}
-pub fn prefix<T: QueueRecord>(available: u32) -> Option<u32> {
-    assert_eq!(T::PREFIXES.last().copied(), Some(size_of::<T>() as u32));
-    let mut size = None;
-    for &n in T::PREFIXES {
-        if n <= available {
-            size = Some(n);
-        }
-    }
-    size
-}
+use core::{mem::size_of, ptr};
+pub trait QueueRecord: Copy + Default {}
+impl QueueRecord for a::GfxBackendRegistration {}
+impl QueueRecord for a::GfxBackendInfo {}
+impl QueueRecord for a::GfxSubmission {}
+impl QueueRecord for a::GfxDriverJob {}
+impl QueueRecord for a::GfxOutputColorState {}
+
 /// # Safety
-/// The pointer retains a readable original eight-byte contract header, with
-/// the alignment promised by its original ABI. No complete T is read here.
+/// The pointer retains a readable initialized eight-byte header. No complete
+/// record or missing field is accessed before this capacity check succeeds.
 pub unsafe fn capacity<T: QueueRecord>(value: *const T) -> Option<u32> {
-    if value.is_null() || unsafe { value.cast::<u32>().read() } != 1 {
+    if value.is_null() || !value.is_aligned() {
         return None;
     }
-    prefix::<T>(unsafe { value.cast::<u32>().add(1).read() })
+    let version = unsafe { value.cast::<u32>().read() };
+    let bytes = unsafe { value.cast::<u32>().add(1).read() };
+    (version == 1 && bytes >= size_of::<T>() as u32).then_some(size_of::<T>() as u32)
 }
 /// # Safety
-/// Exact readable retained header and its declared complete released prefix.
+/// Caller retains the initialized header and its advertised complete current
+/// record. Larger capacity does not grant a different record interpretation.
 pub unsafe fn read<T: QueueRecord>(input: *const T) -> Option<T> {
     let bytes = unsafe { capacity(input) }?;
-    let mut value = T::default();
-    unsafe {
-        ptr::copy_nonoverlapping(
-            input.cast::<u8>(),
-            ptr::from_mut(&mut value).cast(),
-            bytes as usize,
-        );
-        ptr::from_mut(&mut value).cast::<u32>().add(1).write(bytes);
-    }
+    let mut value = unsafe { input.read() };
+    unsafe { ptr::from_mut(&mut value).cast::<u32>().add(1).write(bytes) };
     Some(value)
 }
 /// # Safety
-/// Exact writable previously admitted prefix; supplied complete snapshot is
-/// retained and disjoint from that output. No partial field group is written.
+/// The previously admitted complete writable record is disjoint from the
+/// retained snapshot. No bytes beyond the current record are written.
 pub unsafe fn write<T: QueueRecord>(out: *mut T, bytes: u32, mut value: T) {
-    assert_eq!(prefix::<T>(bytes), Some(bytes));
+    assert_eq!(bytes, size_of::<T>() as u32);
     unsafe {
         ptr::from_mut(&mut value).cast::<u32>().add(1).write(bytes);
-        ptr::copy_nonoverlapping(
-            ptr::from_ref(&value).cast::<u8>(),
-            out.cast(),
-            bytes as usize,
-        );
+        out.write(value);
     }
 }
 /// # Safety
-/// Same released-color header/prefix as capacity(), including legacy 128 bytes.
+/// Same initialized-header/current-capacity contract as capacity().
 pub unsafe fn color_capacity(value: *const a::GfxOutputColorState) -> Option<u32> {
-    if value.is_null() || !value.is_aligned() {
-        None
-    } else {
-        unsafe { capacity(value) }
-    }
+    unsafe { capacity(value) }
 }
 /// # Safety
-/// Exact retained color prefix. The new owner gets a complete representation.
+/// Same initialized-header/current-capacity contract as read().
 pub unsafe fn color_read(value: *const a::GfxOutputColorState) -> Option<a::GfxOutputColorState> {
-    let bytes = unsafe { color_capacity(value) }?;
-    let mut snapshot = a::GfxOutputColorState::default();
-    unsafe {
-        ptr::copy_nonoverlapping(
-            value.cast::<u8>(),
-            ptr::from_mut(&mut snapshot).cast(),
-            bytes as usize,
-        )
-    };
-    snapshot.size = size_of::<a::GfxOutputColorState>() as u32;
-    Some(snapshot)
-}
-unsafe fn dispatch<T: QueueRecord>(
-    op: u32,
-    input: *const c_void,
-    out: *mut c_void,
-    bytes: u32,
-    count: *mut u32,
-) -> bool {
-    match op {
-        0 => match prefix::<T>(bytes) {
-            Some(value) => {
-                unsafe { count.write(value) };
-                true
-            }
-            None => false,
-        },
-        1 => match unsafe { read(input.cast::<T>()) } {
-            Some(value) => {
-                unsafe { out.cast::<T>().write(value) };
-                true
-            }
-            None => false,
-        },
-        2 => match unsafe { capacity(input.cast::<T>()) } {
-            Some(value) => {
-                unsafe { count.write(value) };
-                true
-            }
-            None => false,
-        },
-        3 => {
-            unsafe { write(out.cast::<T>(), bytes, input.cast::<T>().read()) };
-            true
-        }
-        _ => panic!("graphics wire operation"),
-    }
-}
-/// # Safety
-/// Kind selects its exact unchanged Contract record. Headers, released prefix,
-/// full snapshots, output and scalar capacity obey that operation's lifetime.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_display_wire(
-    op: u32,
-    kind: u32,
-    input: *const c_void,
-    out: *mut c_void,
-    bytes: u32,
-    count: *mut u32,
-) -> bool {
-    match kind {
-        0 => unsafe { dispatch::<a::GfxBackendRegistration>(op, input, out, bytes, count) },
-        1 => unsafe { dispatch::<a::GfxBackendInfo>(op, input, out, bytes, count) },
-        2 => unsafe { dispatch::<a::GfxSubmission>(op, input, out, bytes, count) },
-        3 => unsafe { dispatch::<a::GfxDriverJob>(op, input, out, bytes, count) },
-        4 => match op {
-            0 => unsafe { dispatch::<a::GfxOutputColorState>(op, input, out, bytes, count) },
-            1 => match unsafe { color_read(input.cast()) } {
-                Some(value) => {
-                    unsafe { out.cast::<a::GfxOutputColorState>().write(value) };
-                    true
-                }
-                None => false,
-            },
-            2 => match unsafe { color_capacity(input.cast()) } {
-                Some(value) => {
-                    unsafe { count.write(value) };
-                    true
-                }
-                None => false,
-            },
-            3 => {
-                unsafe {
-                    write(
-                        out.cast::<a::GfxOutputColorState>(),
-                        bytes,
-                        input.cast::<a::GfxOutputColorState>().read(),
-                    )
-                };
-                true
-            }
-            _ => panic!("color wire operation"),
-        },
-        _ => panic!("graphics wire record"),
-    }
+    unsafe { read(value) }
 }
 const _: () = {
-    assert!(
-        size_of::<a::GfxBackendRegistration>() == 48
-            && size_of::<a::GfxBackendInfo>() == 152
-            && size_of::<a::GfxSubmission>() == 512
-            && size_of::<a::GfxDriverJob>() == 296
-            && size_of::<a::GfxOutputColorState>() == 192
-    );
-    assert!(core::mem::offset_of!(a::GfxOutputColorState, link_kind) == 128);
+    assert!(size_of::<a::GfxBackendRegistration>() == 48);
+    assert!(size_of::<a::GfxBackendInfo>() == 152);
+    assert!(size_of::<a::GfxSubmission>() == 512);
+    assert!(size_of::<a::GfxDriverJob>() == 296);
+    assert!(size_of::<a::GfxOutputColorState>() == 192);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn record<T: QueueRecord>() {
+        let size = size_of::<T>();
+        assert!(size <= 512 && core::mem::align_of::<T>() == 8);
+        let mut allocation = [0xA5A5_A5A5_A5A5_A5A5u64; 66];
+        let value = allocation.as_mut_ptr().cast::<T>();
+        for bytes in 0..size as u32 {
+            unsafe {
+                value.cast::<u32>().write(1);
+                value.cast::<u32>().add(1).write(bytes)
+            };
+            assert_eq!(unsafe { capacity(value) }, None);
+            assert!(unsafe { read(value) }.is_none());
+            let tail = unsafe {
+                core::slice::from_raw_parts(value.cast::<u8>().add(8), allocation.len() * 8 - 8)
+            };
+            assert!(tail.iter().all(|byte| *byte == 0xA5));
+        }
+        for bytes in [size as u32, size as u32 + 8] {
+            unsafe {
+                value.cast::<u32>().write(0);
+                value.cast::<u32>().add(1).write(bytes)
+            };
+            assert_eq!(unsafe { capacity(value) }, None);
+            unsafe { value.cast::<u32>().write(1) };
+            let admitted = unsafe { capacity(value) }.unwrap();
+            assert_eq!(admitted, size as u32);
+            unsafe { write(value, admitted, T::default()) };
+            assert!(unsafe { read(value) }.is_some());
+            assert_eq!(unsafe { value.cast::<u32>().add(1).read() }, size as u32);
+            let canary = unsafe {
+                core::slice::from_raw_parts(
+                    value.cast::<u8>().add(size),
+                    allocation.len() * 8 - size,
+                )
+            };
+            assert!(canary.iter().all(|byte| *byte == 0xA5));
+        }
+        assert_eq!(unsafe { capacity::<T>(ptr::null()) }, None);
+        assert_eq!(
+            unsafe { capacity(value.cast::<u8>().add(1).cast::<T>()) },
+            None
+        );
+    }
+    #[test]
+    fn current_records_reject_all_short_capacities_and_keep_future_tail_canaries() {
+        record::<a::GfxBackendRegistration>();
+        record::<a::GfxBackendInfo>();
+        record::<a::GfxSubmission>();
+        record::<a::GfxDriverJob>();
+        record::<a::GfxOutputColorState>();
+    }
+}

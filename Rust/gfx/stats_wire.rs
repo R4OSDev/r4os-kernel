@@ -1,82 +1,69 @@
-//! Original released56/136-byte statistics prefixes. Read only the caller's
-//! validated header, stage every field, and write exactly the admitted prefix.
+//! Complete current BO statistics. No projection to an old statistics prefix.
 use crate::contract::GfxBufferStats;
-use core::ptr;
+use core::mem::size_of;
 /// # Safety
-/// Non-null aligned caller pointer retains at least the initialized eight-byte
-/// header; no full136-byte reference is formed for a legacy56-byte allocation.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_gfx_stats_capacity(p: *const GfxBufferStats) -> u32 {
+/// Caller retains an initialized resident eight-byte header; no complete
+/// record is accessed until its current writable capacity has been admitted.
+pub unsafe fn capacity(p: *const GfxBufferStats) -> u32 {
     if p.is_null() || !p.is_aligned() {
         return 0;
     }
-    let version = unsafe { ptr::addr_of!((*p).version).read() };
-    let size = unsafe { ptr::addr_of!((*p).size).read() };
-    if version != 1 || size < 56 {
-        0
-    } else if size >= 136 {
-        136
+    let version = unsafe { p.cast::<u32>().read() };
+    let bytes = unsafe { p.cast::<u32>().add(1).read() };
+    if version == 1 && bytes >= size_of::<GfxBufferStats>() as u32 {
+        size_of::<GfxBufferStats>() as u32
     } else {
-        56
+        0
     }
 }
 /// # Safety
-/// Caller owns exactly count writable bytes after capacity validation and a
-/// complete initialized readable source record; admission stays with its owner.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_gfx_stats_write(
-    out: *mut GfxBufferStats,
-    count: u32,
-    value: *const GfxBufferStats,
-) {
-    assert!(matches!(count, 56 | 136));
-    let value = unsafe { value.read() };
-    let mut bytes = [0u8; 136];
-    for (i, v) in [
-        value.version,
-        count,
-        value.objects,
-        value.references,
-        value.leases,
-        value.reserved0,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
-    }
-    for (i, v) in [
-        value.committed_bytes,
-        value.retained_bytes,
-        value.budget_bytes,
-        value.producer_budget_bytes,
-        value.system_bytes,
-        value.device_bytes,
-        value.system_backed_bytes,
-        value.device_backed_bytes,
-        value.system_pinned_bytes,
-        value.device_pinned_bytes,
-        value.scanout_pinned_bytes,
-        value.device_mapped_bytes,
-        value.allocating_bytes,
-        value.destroying_bytes,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let start = 24 + i * 8;
-        bytes[start..start + 8].copy_from_slice(&v.to_le_bytes());
-    }
-    unsafe {
-        ptr::copy_nonoverlapping(bytes.as_ptr(), out.cast(), count as usize);
-    }
+/// Previously admitted complete writable output and disjoint complete source.
+pub unsafe fn write(out: *mut GfxBufferStats, count: u32, value: *const GfxBufferStats) {
+    assert_eq!(count, size_of::<GfxBufferStats>() as u32);
+    let mut value = unsafe { value.read() };
+    value.size = count;
+    unsafe { out.write(value) };
 }
 const _: () = {
-    assert!(core::mem::size_of::<GfxBufferStats>() == 136);
-    assert!(core::mem::align_of::<GfxBufferStats>() == 8);
-    assert!(core::mem::offset_of!(GfxBufferStats, version) == 0);
-    assert!(core::mem::offset_of!(GfxBufferStats, size) == 4);
-    assert!(core::mem::offset_of!(GfxBufferStats, objects) == 8);
-    assert!(core::mem::offset_of!(GfxBufferStats, committed_bytes) == 24);
-    assert!(core::mem::offset_of!(GfxBufferStats, system_bytes) == 56);
+    assert!(size_of::<GfxBufferStats>() == 136);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::ptr;
+    #[test]
+    fn current_statistics_refuse_short_headers_and_preserve_future_capacity() {
+        let mut memory = [0xA5A5_A5A5_A5A5_A5A5u64; 19];
+        let out = memory.as_mut_ptr().cast::<GfxBufferStats>();
+        for bytes in 0..136 {
+            unsafe {
+                out.cast::<u32>().write(1);
+                out.cast::<u32>().add(1).write(bytes)
+            };
+            assert_eq!(unsafe { capacity(out) }, 0);
+            let untouched = unsafe { core::slice::from_raw_parts(out.cast::<u8>().add(8), 144) };
+            assert!(untouched.iter().all(|byte| *byte == 0xA5));
+        }
+        for bytes in [136, 144] {
+            unsafe {
+                out.cast::<u32>().write(1);
+                out.cast::<u32>().add(1).write(bytes)
+            };
+            let count = unsafe { capacity(out) };
+            assert_eq!(count, 136);
+            let value = GfxBufferStats {
+                committed_bytes: 0x100000003,
+                system_bytes: 17,
+                ..Default::default()
+            };
+            unsafe { write(out, count, &value) };
+            assert_eq!(unsafe { (*out).system_bytes }, 17);
+            assert_eq!(unsafe { (*out).committed_bytes }, 0x100000003);
+            assert_eq!(memory[17], 0xA5A5_A5A5_A5A5_A5A5);
+            assert_eq!(memory[18], 0xA5A5_A5A5_A5A5_A5A5);
+        }
+        assert_eq!(unsafe { capacity(ptr::null()) }, 0);
+        assert_eq!(unsafe { capacity(out.cast::<u8>().add(1).cast()) }, 0);
+    }
+}

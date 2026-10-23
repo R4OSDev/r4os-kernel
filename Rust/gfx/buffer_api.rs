@@ -280,7 +280,7 @@ pub(crate) unsafe fn unmap(owner: Owner, input: *const a::GfxBufferHandle) -> Re
     Ok(())
 }
 pub(crate) unsafe fn stats(output: *mut a::GfxBufferStats) -> Result<(), Error> {
-    let count = unsafe { stats_wire::r4os_rust_gfx_stats_capacity(output) };
+    let count = unsafe { stats_wire::capacity(output) };
     if count == 0 {
         return Err(Error::Invalid);
     }
@@ -310,7 +310,7 @@ pub(crate) unsafe fn stats(output: *mut a::GfxBufferStats) -> Result<(), Error> 
         }
     };
     unsafe {
-        stats_wire::r4os_rust_gfx_stats_write(output, count, &value);
+        stats_wire::write(output, count, &value);
     }
     Ok(())
 }

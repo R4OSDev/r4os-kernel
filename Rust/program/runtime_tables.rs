@@ -1192,15 +1192,12 @@ fn configure_dev() {
             as usize,
         boot_info_memory_entry: r4dev::boot::r4os_rust_r4dev_boot_info_memory_entry as *const ()
             as usize,
-        program_instance_storage_summary:
-            r4dev::providers::r4os_rust_r4dev_program_instance_storage_summary as *const () as usize,
+        reserved_program_instance_storage_summary_v1: 0,
         program_instance_storage_self_test:
             r4dev::providers::r4os_rust_r4dev_program_instance_storage_self_test as *const ()
                 as usize,
-        program_registry_summary: r4dev::providers::r4os_rust_r4dev_program_registry_summary
-            as *const () as usize,
-        program_registry_self_test: r4dev::providers::r4os_rust_r4dev_program_registry_self_test
-            as *const () as usize,
+        reserved_program_registry_summary_v1: 0,
+        reserved_program_registry_self_test_v1: 0,
         program_registry_summary_v2: r4dev::providers::r4os_rust_r4dev_program_registry_summary_v2
             as *const () as usize,
         program_registry_self_test_v2:
@@ -1343,10 +1340,15 @@ const _: () = {
     assert!(mem::offset_of!(c::R4XStartR4Dev, boot_info_memory_entry) == 208);
     assert!(mem::offset_of!(c::R4XStartR4Dev, reserved0) == 216);
     assert!(mem::offset_of!(c::R4XStartR4Dev, reserved1) == 224);
-    assert!(mem::offset_of!(c::R4XStartR4Dev, program_instance_storage_summary) == 232);
+    assert!(
+        mem::offset_of!(
+            c::R4XStartR4Dev,
+            reserved_program_instance_storage_summary_v1
+        ) == 232
+    );
     assert!(mem::offset_of!(c::R4XStartR4Dev, program_instance_storage_self_test) == 240);
-    assert!(mem::offset_of!(c::R4XStartR4Dev, program_registry_summary) == 248);
-    assert!(mem::offset_of!(c::R4XStartR4Dev, program_registry_self_test) == 256);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, reserved_program_registry_summary_v1) == 248);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, reserved_program_registry_self_test_v1) == 256);
     assert!(mem::offset_of!(c::R4XStartR4Dev, program_registry_summary_v2) == 264);
     assert!(mem::offset_of!(c::R4XStartR4Dev, program_registry_self_test_v2) == 272);
     assert!(mem::offset_of!(c::R4XStartR4Dev, execution_inventory_summary) == 280);
