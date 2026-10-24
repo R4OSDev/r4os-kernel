@@ -49,7 +49,7 @@ unsafe fn vm_stats(instance: *const ProgramInstance, dynamic: bool) -> vm_query:
         out.assume_init()
     }
 }
-pub(super) unsafe fn instance_info(instance: *const ProgramInstance) -> Info {
+pub(super) unsafe fn lifecycle_info(instance: *const ProgramInstance) -> Info {
     unsafe {
         let mut flags = 0;
         if (*instance).desktop_host {
@@ -68,7 +68,6 @@ pub(super) unsafe fn instance_info(instance: *const ProgramInstance) -> Info {
         if program_info_terminal(instance) {
             flags |= 4;
         }
-        let usage = vm_stats(instance, false);
         Info {
             id: (*instance).id,
             task_id: (*instance).task_id,
@@ -78,19 +77,27 @@ pub(super) unsafe fn instance_info(instance: *const ProgramInstance) -> Info {
             flags,
             exit_code: (*instance).exit_code,
             window_id: program_info_window(instance),
-            memory_profile: (*instance).memory_profile,
-            reserved0: [0; 3],
-            memory_reserved_limit: (*instance).memory_limits.vm_reserve_limit,
-            memory_committed_limit: (*instance).memory_limits.vm_commit_limit,
-            memory_resident_limit: (*instance).memory_limits.resident_limit,
-            memory_reserved_bytes: usage.reserved_bytes,
-            memory_committed_bytes: usage.committed_bytes,
-            memory_resident_bytes: usage.resident_bytes,
-            memory_peak_resident_bytes: usage.peak_resident_bytes,
-            stack_reserved_bytes: (*instance).program_stack_reserve_size,
-            stack_committed_bytes: (*instance).program_stack_committed_size,
-            memory_tag: (*instance).memory_tag,
+            ..Info::default()
         }
+    }
+}
+pub(super) unsafe fn instance_info(instance: *const ProgramInstance) -> Info {
+    unsafe {
+        let mut out = lifecycle_info(instance);
+        let usage = vm_stats(instance, false);
+        out.memory_profile = (*instance).memory_profile;
+        out.reserved0 = [0; 3];
+        out.memory_reserved_limit = (*instance).memory_limits.vm_reserve_limit;
+        out.memory_committed_limit = (*instance).memory_limits.vm_commit_limit;
+        out.memory_resident_limit = (*instance).memory_limits.resident_limit;
+        out.memory_reserved_bytes = usage.reserved_bytes;
+        out.memory_committed_bytes = usage.committed_bytes;
+        out.memory_resident_bytes = usage.resident_bytes;
+        out.memory_peak_resident_bytes = usage.peak_resident_bytes;
+        out.stack_reserved_bytes = (*instance).program_stack_reserve_size;
+        out.stack_committed_bytes = (*instance).program_stack_committed_size;
+        out.memory_tag = (*instance).memory_tag;
+        out
     }
 }
 pub(super) unsafe fn completion_info(node: *const ProgramCompletionNode) -> Info {

@@ -205,6 +205,10 @@ fn configure_sys() {
             as usize,
         program_completion_read: crate::program::program_api::r4os_rust_program_api_completion_read
             as *const () as usize,
+        program_lifecycle_begin: super::inventory::r4os_rust_program_lifecycle_begin as *const ()
+            as usize,
+        program_lifecycle_programs: super::inventory::r4os_rust_program_lifecycle_programs
+            as *const () as usize,
         program_inventory_begin:
             crate::program::execution_inventory::r4os_rust_program_execution_begin as *const ()
                 as usize,
@@ -314,7 +318,10 @@ fn configure_sys() {
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1304);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1320);
+    assert!(mem::size_of::<c::ProgramLifecycleSnapshot>() == 40);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, program_lifecycle_begin) == 1304);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, program_lifecycle_programs) == 1312);
     assert!(mem::offset_of!(c::R4XStartR4Sys, entropy_source_info) == 1288);
     assert!(mem::offset_of!(c::R4XStartR4Sys, entropy_fill) == 1296);
     assert!(mem::offset_of!(c::R4XStartR4Sys, magic) == 0);

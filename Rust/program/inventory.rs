@@ -126,7 +126,7 @@ unsafe fn consider(
         }
     }
 }
-unsafe fn scan(after: u64, items: *mut Selection, len: usize) -> Scan {
+unsafe fn scan(after: u64, items: *mut Selection, len: usize, diagnostics: bool) -> Scan {
     unsafe {
         let mut counts = Counts::default();
         let mut eligible = 0u32;
@@ -162,7 +162,11 @@ unsafe fn scan(after: u64, items: *mut Selection, len: usize) -> Scan {
                                 version: u32::from(contract::program_inventory_version),
                                 size: mem::size_of::<Snapshot>() as u32,
                                 handle: registry::handle_for_slot(slot),
-                                info: info::instance_info(&slot.instance),
+                                info: if diagnostics {
+                                    info::instance_info(&slot.instance)
+                                } else {
+                                    info::lifecycle_info(&slot.instance)
+                                },
                                 state_generation: slot.generation,
                             },
                         );
@@ -245,12 +249,18 @@ unsafe fn scan(after: u64, items: *mut Selection, len: usize) -> Scan {
 fn try_lock() -> bool {
     unsafe { sync_locks::r4os_rust_sync_mutex((*state()).mutex, 0, 0) }
 }
-unsafe fn cursor_valid(cursor: *const Cursor) -> bool {
+unsafe fn cursor_base_valid(cursor: *const Cursor) -> bool {
     unsafe {
         (*cursor).version == u32::from(contract::program_inventory_version)
             && (*cursor).size >= mem::size_of::<Cursor>() as u32
             && (*cursor).snapshot_generation != 0
             && (*cursor).flags & contract::program_inventory_cursor_flag_initialized != 0
+    }
+}
+unsafe fn cursor_valid(cursor: *const Cursor) -> bool {
+    unsafe {
+        cursor_base_valid(cursor)
+            && (*cursor).flags & contract::program_inventory_cursor_flag_lifecycle == 0
     }
 }
 unsafe fn init_page(cursor: *const Cursor, out: *mut Page, kind: u32) {
@@ -317,7 +327,7 @@ pub unsafe extern "C" fn r4os_rust_program_inventory_scan(
     len: usize,
     out: *mut Scan,
 ) {
-    unsafe { out.write(scan(after, items, len)) };
+    unsafe { out.write(scan(after, items, len, true)) };
 }
 /// # Safety
 /// Exclusive aligned output; try-lock failure leaves it untouched.
@@ -327,7 +337,7 @@ pub unsafe extern "C" fn r4os_rust_program_inventory_registry(out: *mut Registry
         return false;
     }
     unsafe {
-        let current = scan(u64::MAX, ptr::null_mut(), 0);
+        let current = scan(u64::MAX, ptr::null_mut(), 0, true);
         let s = state();
         let stats = (*s).stats;
         out.write(RegistrySnapshot {
@@ -414,7 +424,12 @@ pub unsafe extern "C" fn r4os_rust_program_inventory_programs(
         let mut selections =
             MaybeUninit::<[Selection; contract::program_inventory_page_max as usize]>::uninit();
         let items = selections.as_mut_ptr().cast::<Selection>();
-        let result = scan((*cursor).program_after_generation, items, capacity as usize);
+        let result = scan(
+            (*cursor).program_after_generation,
+            items,
+            capacity as usize,
+            true,
+        );
         for index in 0..result.returned as usize {
             out.add(index).write((*items.add(index)).snapshot);
         }
@@ -453,3 +468,115 @@ const _: () = {
     assert!(mem::size_of::<Selection>() == 152);
     assert!(mem::offset_of!(Selection, snapshot) == 8);
 };
+
+/// # Safety
+/// Resident exclusive cursor or null. The same canonical registry owner admits
+/// its current epoch without walking programs, tasks, threads, heap or VM.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_program_lifecycle_begin(cursor: *mut Cursor) -> i32 {
+    if cursor.is_null() {
+        return contract::program_handle_error_invalid;
+    }
+    if !try_lock() {
+        return contract::program_handle_error_would_block;
+    }
+    unsafe {
+        let epoch = (*state()).epoch;
+        cursor.write(Cursor {
+            version: u32::from(contract::program_inventory_version),
+            size: mem::size_of::<Cursor>() as u32,
+            snapshot_generation: epoch,
+            program_epoch: epoch,
+            flags: contract::program_inventory_cursor_flag_initialized
+                | contract::program_inventory_cursor_flag_lifecycle,
+            ..Cursor::default()
+        });
+    }
+    registry::unlock();
+    0
+}
+/// # Safety
+/// Resident disjoint aligned cursor/output/page, or null. Only a complete
+/// sequence is authority; restart writes no rows and never advances the cursor.
+/// No raw owner or registry lock escapes this nonblocking acquisition.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_program_lifecycle_programs(
+    cursor: *mut Cursor,
+    out: *mut contract::ProgramLifecycleSnapshot,
+    capacity: u32,
+    page: *mut Page,
+) -> i32 {
+    if cursor.is_null() || out.is_null() || page.is_null() {
+        return contract::program_handle_error_invalid;
+    }
+    unsafe {
+        init_page(
+            cursor,
+            page,
+            u32::from(contract::program_inventory_kind_lifecycle),
+        );
+        if !cursor_base_valid(cursor)
+            || (*cursor).flags & contract::program_inventory_cursor_flag_lifecycle == 0
+            || capacity == 0
+            || capacity > u32::from(contract::program_inventory_page_max)
+        {
+            return contract::program_handle_error_invalid;
+        }
+        if !try_lock() {
+            return contract::program_handle_error_would_block;
+        }
+        if (*state()).epoch != (*cursor).program_epoch {
+            (*page).status = i32::from(contract::program_inventory_status_restart);
+            registry::unlock();
+            return 0;
+        }
+        let mut selections =
+            MaybeUninit::<[Selection; contract::program_inventory_page_max as usize]>::uninit();
+        let items = selections.as_mut_ptr().cast::<Selection>();
+        let result = scan(
+            (*cursor).program_after_generation,
+            items,
+            capacity as usize,
+            false,
+        );
+        for index in 0..result.returned as usize {
+            let row = (*items.add(index)).snapshot;
+            out.add(index).write(contract::ProgramLifecycleSnapshot {
+                version: u32::from(contract::program_inventory_version),
+                size: mem::size_of::<contract::ProgramLifecycleSnapshot>() as u32,
+                handle: row.handle,
+                task_id: row.info.task_id,
+                role: row.info.role,
+                app_class: row.info.app_class,
+                state: row.info.state,
+                flags: row.info.flags,
+                exit_code: row.info.exit_code,
+                window_id: row.info.window_id,
+            });
+        }
+        let after = if result.returned == 0 {
+            (*cursor).program_after_generation
+        } else {
+            (*items.add(result.returned as usize - 1)).generation
+        };
+        (*cursor).program_after_generation = after;
+        page.write(Page {
+            version: u32::from(contract::program_inventory_version),
+            size: mem::size_of::<Page>() as u32,
+            snapshot_generation: (*cursor).snapshot_generation,
+            next_generation: after,
+            total: result.counts.total,
+            returned: result.returned,
+            has_more: u32::from(result.has_more),
+            kind: u32::from(contract::program_inventory_kind_lifecycle),
+            status: i32::from(if result.has_more {
+                contract::program_inventory_status_more
+            } else {
+                contract::program_inventory_status_complete
+            }),
+            ..Page::default()
+        });
+    }
+    registry::unlock();
+    0
+}
