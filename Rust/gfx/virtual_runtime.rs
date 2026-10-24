@@ -10,7 +10,7 @@ use crate::{
     contract as a,
     driver::{api_admission, irq_router, treap::Tree, work},
     memory::heap,
-    platform::{monotonic, timer},
+    platform::monotonic,
     sched::{
         scheduler, sync_objects,
         sync_types::{Event, WaitQueue},
@@ -656,9 +656,9 @@ unsafe extern "C" fn notify_driver(index: usize) -> i32 {
         return -1;
     }
     let id = work::r4os_rust_driver_work_current();
-    if id == 0
-        || !api_admission::r4os_rust_driver_api_enter(id, u64::from(timer::frequency().max(1)) * 3)
-    {
+    // The exact pending VA request survives a refused attempt and service
+    // retries it; the shared Work lane must remain available meanwhile.
+    if id == 0 || !api_admission::r4os_rust_driver_api_enter(id, 0) {
         return -1;
     }
     struct Leave;

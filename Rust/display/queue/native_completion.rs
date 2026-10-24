@@ -528,7 +528,10 @@ pub(super) unsafe extern "C" fn notify_driver(index: usize) -> i32 {
     if id == 0 {
         return -1;
     }
-    if !api_admission::r4os_rust_driver_api_enter(id, u64::from(timer::frequency().max(1)) * 3) {
+    // This callback occupies the shared Work lane. A lifecycle owner can be
+    // waiting for another callback on that lane; leave it free to progress.
+    // The exact backend wake below retains this notification until admitted.
+    if !api_admission::r4os_rust_driver_api_enter(id, 0) {
         let retry = {
             let _bo = BoLock::acquire();
             unsafe { (*data()).backends[index] }

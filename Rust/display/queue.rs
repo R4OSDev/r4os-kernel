@@ -17,7 +17,7 @@ use crate::{
         types::{Handle, Owner},
         virtual_runtime,
     },
-    platform::{monotonic, timer},
+    platform::monotonic,
     sched::{
         scheduler, sync_objects,
         sync_types::{Event, WaitQueue},
