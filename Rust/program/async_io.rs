@@ -1,6 +1,7 @@
 //! Program-scoped asynchronous I/O. Request slots, resident workers, caller
 //! identities and cancellation/retirement anchors have one native owner. No
 //! request mutex spans a filesystem/service wait or dynamic Task retirement.
+mod dispatch;
 use super::{context, registry_state, registry_types::ProgramInstance, thread_retire, threads};
 use crate::{
     boot::foundation,
@@ -27,8 +28,9 @@ use core::{
     mem, ptr, slice,
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
-const CAPACITY: usize = 64;
-const WORKERS: usize = 8;
+use dispatch::Lane;
+const CAPACITY: usize = dispatch::REQUESTS;
+const WORKERS: usize = 2 * dispatch::WIDTH;
 const PATH: usize = c::file_path_max_bytes as usize + 1;
 const RETRIES: u32 = 64;
 const INVALID: i32 = -1;
@@ -86,6 +88,7 @@ impl Kind {
 }
 struct Request {
     used: bool,
+    enqueued: bool,
     id: u32,
     owner_id: u32,
     owner_generation: u64,
@@ -128,6 +131,7 @@ struct Request {
 impl Request {
     const EMPTY: Self = Self {
         used: false,
+        enqueued: false,
         id: 0,
         owner_id: 0,
         owner_generation: 0,
@@ -215,6 +219,7 @@ struct State {
     requests: [Request; CAPACITY],
     workers: [Worker; WORKERS],
     cursor: [usize; 2],
+    lanes: [Lane; 2],
     creations: u64,
     processed: u64,
     ranges: [Range; 64],
@@ -232,6 +237,7 @@ static STATE: Cell<State> = Cell(UnsafeCell::new(State {
     requests: [const { Request::EMPTY }; CAPACITY],
     workers: [const { Worker::empty() }; WORKERS],
     cursor: [0; 2],
+    lanes: [Lane::EMPTY; 2],
     creations: 0,
     processed: 0,
     ranges: [const { Range::EMPTY }; 64],
@@ -273,6 +279,30 @@ impl Drop for Locked {
 }
 fn lock() -> Option<Locked> {
     Locked::acquire(LOCK.0.get())
+}
+// All three operations require the existing Async owner. Unpublished failure
+// paths have enqueued=false; terminal reset cannot silently lose a count.
+unsafe fn enqueue(req: *mut Request) {
+    unsafe {
+        assert!((*req).used && (*req).state == 1 && !(*req).enqueued);
+        (*state()).lanes[usize::from((*req).kind == Kind::Service)].enqueue();
+        (*req).enqueued = true;
+    }
+}
+unsafe fn unqueue(req: *mut Request) {
+    unsafe {
+        if (*req).enqueued {
+            assert!((*req).used && (*req).state == 1);
+            (*state()).lanes[usize::from((*req).kind == Kind::Service)].remove_request();
+            (*req).enqueued = false;
+        }
+    }
+}
+unsafe fn clear_request(req: *mut Request) {
+    unsafe {
+        unqueue(req);
+        req.write(Request::EMPTY);
+    }
 }
 
 fn retry_allowed() -> bool {
@@ -415,6 +445,9 @@ unsafe fn ensure_workers(service: bool) -> bool {
                 continue;
             }
             if (*worker).task_id == 0 {
+                // A reused slot is reached only after exact Task retirement.
+                (*state()).lanes[usize::from(service)].withdraw(index % dispatch::WIDTH);
+                sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker).event), 1, 0);
                 let name = b"r4x-async-io";
                 let request = task_api::CreateRequest {
                     name: name.as_ptr(),
@@ -458,17 +491,31 @@ unsafe fn ensure_workers(service: bool) -> bool {
 }
 unsafe fn wake_workers(service: bool) {
     unsafe {
-        for i in 0..WORKERS {
-            let worker = ptr::addr_of_mut!((*state()).workers[i]);
-            if (*worker).task_id != 0 && !(*worker).retiring && (*worker).service == service {
-                sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker).event), 0, 0);
+        let lane = usize::from(service);
+        let base = lane * dispatch::WIDTH;
+        let mut active = 0;
+        for slot in 0..dispatch::WIDTH {
+            let worker = ptr::addr_of!((*state()).workers[base + slot]);
+            if (*worker).task_id != 0
+                && !(*worker).retiring
+                && (*worker).service == service
+                && (*worker).request.load(Ordering::Acquire).is_null()
+            {
+                active |= 1 << slot;
             }
+        }
+        while let Some(slot) = (*state()).lanes[lane].reserve(active) {
+            let worker = ptr::addr_of_mut!((*state()).workers[base + slot]);
+            sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker).event), 0, 0);
         }
     }
 }
 unsafe fn take_request(worker: *mut Worker) -> *mut Request {
     unsafe {
         let lane = usize::from((*worker).service);
+        if !(*state()).lanes[lane].unreserved() {
+            return ptr::null_mut();
+        }
         let start = (*state()).cursor[lane];
         for offset in 0..CAPACITY {
             let index = (start + offset) % CAPACITY;
@@ -480,6 +527,7 @@ unsafe fn take_request(worker: *mut Worker) -> *mut Request {
             {
                 continue;
             }
+            unqueue(req);
             (*req).task_id = (*worker).task_id;
             (*req).task_generation = (*worker).task_generation;
             (*req).last_worker_id = (*worker).task_id;
@@ -503,16 +551,26 @@ unsafe extern "C" fn worker_main() {
         if worker.is_null() {
             return;
         }
+        let Some(index) =
+            (0..WORKERS).find(|&i| ptr::eq(ptr::addr_of!((*state()).workers[i]), worker))
+        else {
+            return;
+        };
+        let lane = usize::from((*worker).service);
+        let slot = index % dispatch::WIDTH;
+        assert_eq!(index / dispatch::WIDTH, lane);
         loop {
             let Some(guard) = lock() else {
                 threads::exit_task()
             };
+            (*state()).lanes[lane].withdraw(slot);
             if (*worker).retiring {
                 drop(guard);
                 threads::exit_task();
             }
             let req = take_request(worker);
             if req.is_null() {
+                (*state()).lanes[lane].park(slot);
                 drop(guard);
                 sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker).event), 2, u64::MAX);
                 continue;
@@ -661,16 +719,17 @@ unsafe fn submit(
             n += 1;
         }
         if path.add(n).read() != 0 {
-            req.write(Request::EMPTY);
+            clear_request(req);
             return INVALID;
         }
         (*req).path[n] = 0;
         (*req).path_len = n;
         if !ensure_workers((*req).kind == Kind::Service) {
-            req.write(Request::EMPTY);
+            clear_request(req);
             return SPAWN_FAILED;
         }
         id.write((*req).id);
+        enqueue(req);
         wake_workers((*req).kind == Kind::Service);
         drop(guard);
         0
@@ -789,10 +848,11 @@ unsafe fn submit_service(
         (*req).service_response_capacity = capacity;
         (*req).service_timeout = timeout;
         if !ensure_workers(true) {
-            req.write(Request::EMPTY);
+            clear_request(req);
             return SPAWN_FAILED;
         }
         id.write((*req).id);
+        enqueue(req);
         wake_workers(true);
         drop(guard);
         0
@@ -1079,6 +1139,8 @@ unsafe fn retire(value: Claim) -> bool {
                 return false;
             }
             (*worker).retiring = true;
+            (*state()).lanes[usize::from((*worker).service)].withdraw(i % dispatch::WIDTH);
+            wake_workers((*worker).service);
             target = worker;
             break;
         }
@@ -1186,7 +1248,7 @@ unsafe fn close(id: u32, defer_on_busy: bool) -> i32 {
         };
         let req = claimed(value);
         if !req.is_null() {
-            req.write(Request::EMPTY);
+            clear_request(req);
         }
         drop(guard);
         if finish_retry(value.id) {
@@ -1259,6 +1321,7 @@ unsafe fn cancel_queued(req: *mut Request) {
         if (*req).state != 1 {
             return;
         }
+        unqueue(req);
         (*req).status = CANCELLED;
         (*req).result = CANCELLED;
         (*req).state = 4;
@@ -1348,7 +1411,7 @@ pub(super) unsafe fn cancel(handle: Handle, caller: Option<(u32, u64)>) -> bool 
                     );
                 }
                 if caller.is_none() && (*req).waiters == 0 && queue(req, 6) == 0 {
-                    req.write(Request::EMPTY);
+                    clear_request(req);
                 }
             }
         }
@@ -1370,7 +1433,7 @@ pub(super) unsafe fn purge(handle: Handle, caller: Option<(u32, u64)>) -> bool {
                 }
                 queue(req, 3);
                 (*req).waiters = 0;
-                req.write(Request::EMPTY);
+                clear_request(req);
             }
             return true;
         }
@@ -1385,6 +1448,7 @@ pub(super) unsafe fn purge(handle: Handle, caller: Option<(u32, u64)>) -> bool {
                     continue;
                 }
                 (*req).cancel_requested = true;
+                unqueue(req);
                 pending = Some(claim(i, req));
                 break;
             }
@@ -1402,7 +1466,7 @@ pub(super) unsafe fn purge(handle: Handle, caller: Option<(u32, u64)>) -> bool {
             if !req.is_null() {
                 queue(req, 3);
                 (*req).waiters = 0;
-                req.write(Request::EMPTY);
+                clear_request(req);
             }
         }
     }
@@ -1438,7 +1502,7 @@ pub(super) unsafe fn reap() -> u8 {
         let req = claimed(value);
         let mut reclaimed = false;
         if !req.is_null() && (*req).close_pending {
-            req.write(Request::EMPTY);
+            clear_request(req);
             reclaimed = true;
         }
         drop(guard);
