@@ -228,6 +228,10 @@ unsafe fn clean_budget() -> bool {
     }
 }
 pub unsafe fn fairness() -> bool {
+    if !scheduler::selection::self_test() {
+        return fail(b"local-fairness-phases");
+    }
+    puts(b"FAIRNESS08729 PASS phases=8 foreign=independent empty=retained urgent=retained fifo=8,16\r\n");
     unsafe {
         (*raw()).budget_turns = [0; BUDGET];
         (*raw()).budget_stop = false;

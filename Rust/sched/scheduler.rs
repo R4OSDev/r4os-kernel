@@ -1,6 +1,7 @@
 //! One scheduler state owner; runtime admission is mandatory after SMP start.
 //! Early safe-point counters use separate atomics; no State borrow spans a switch.
 pub(crate) mod rank_probe;
+pub(crate) mod selection;
 pub use super::scheduler_types::{CpuPreemptionStats, Stats, StructureStats};
 use super::{task::thread_placement, task_context};
 use crate::{
@@ -15,7 +16,7 @@ use core::{
     ptr,
     sync::atomic::{AtomicU64, Ordering},
 };
-const ROLE_COUNT: usize = 4;
+use selection::{Fairness, Order, ROLE_COUNT};
 const BUCKETS: usize = 5;
 const WAIT_FOREVER: u64 = u64::MAX;
 const TIMER_WAIT_OBJECT: u64 = 0x5449_4d45_5741_4954;
@@ -36,6 +37,7 @@ struct CpuState {
     pending: bool,
     current_work: bool,
     balance_next_cpu: u32,
+    fairness: Fairness,
 }
 impl CpuState {
     const EMPTY: Self = Self {
@@ -46,6 +48,7 @@ impl CpuState {
         pending: false,
         current_work: false,
         balance_next_cpu: 0,
+        fairness: Fairness::EMPTY,
     };
 }
 struct State {
@@ -444,6 +447,7 @@ pub fn init_secondary(index: u32) -> bool {
         s.current_work = false;
         s.boot_depth = 0;
         s.pending = false;
+        s.fairness = Fairness::EMPTY;
         s.initialized = true
     });
     let item = view(idle);
@@ -577,32 +581,29 @@ fn next_ready(force_priority: bool) -> Task {
         return ptr::null_mut();
     }
     refill_ready();
-    let ordinal = change(|s| {
-        s.priority_selects = s.priority_selects.wrapping_add(1);
-        s.priority_selects
+    // Attempt statistics retain their old meaning, but never drive policy.
+    change(|s| s.priority_selects = s.priority_selects.wrapping_add(1));
+    let cpu = u64::from(percpu::current_index());
+    // Copy the local policy; no mutable Scheduler borrow spans Task queries.
+    // Runtime retains the exact destination and Ready heads throughout.
+    let pick = local().fairness.choose(force_priority, |order| {
+        change(|s| s.ready_candidate_visit_count = s.ready_candidate_visit_count.wrapping_add(1));
+        let task = match order {
+            Order::Fifo => task_query(4, cpu),
+            Order::Rank(rank) => task_query(5, cpu | (u64::from(rank) << 32)),
+        };
+        (!task.is_null()).then_some(task)
     });
-    if !force_priority && ordinal % 8 == 0 {
-        change(|s| s.ready_candidate_visit_count = s.ready_candidate_visit_count.wrapping_add(1));
-        let task = task_query(4, u64::from(percpu::current_index()));
-        if !task.is_null() {
-            change(|s| s.priority_rr_picks = s.priority_rr_picks.wrapping_add(1));
-        }
-        return task;
+    let Some(next) = pick.task else {
+        return ptr::null_mut();
+    };
+    if !force_priority {
+        local_change(|s| s.fairness = pick.fairness);
     }
-    let mut best = ptr::null_mut();
-    for rank in 0..ROLE_COUNT {
-        change(|s| s.ready_candidate_visit_count = s.ready_candidate_visit_count.wrapping_add(1));
-        let task = task_query(
-            5,
-            u64::from(percpu::current_index()) | ((rank as u64) << 32),
-        );
-        if !task.is_null() {
-            best = task;
-            break;
-        }
-    }
-    if !best.is_null() {
-        let item = view(best);
+    if pick.fifo {
+        change(|s| s.priority_rr_picks = s.priority_rr_picks.wrapping_add(1));
+    } else {
+        let item = view(next);
         change(|s| {
             match item.priority {
                 0 => s.priority_picks_high = s.priority_picks_high.wrapping_add(1),
@@ -613,7 +614,7 @@ fn next_ready(force_priority: bool) -> Task {
             s.role_picks[item.role as usize] = s.role_picks[item.role as usize].wrapping_add(1);
         });
     }
-    best
+    next
 }
 fn restore_productive(task: Task) {
     if percpu::current_index() == 0 && !view(task).cpu_idle {
