@@ -1,6 +1,6 @@
 //! Intrusive AVL owner: nodes stay at stable addresses; rotations change only
 //! links. Registry runtime admission is supplied by the caller, no allocation.
-use core::{ffi::c_void, ptr::null_mut};
+use core::{cmp::Ordering, ffi::c_void, ptr::null_mut};
 type Node = *mut c_void;
 type Less = unsafe extern "C" fn(*const c_void, *const c_void) -> bool;
 
@@ -125,6 +125,38 @@ unsafe fn rebalance(index: *mut Index, start: Node, offset: usize) {
             }
             cursor = (*links(top, offset)).parent;
         }
+    }
+}
+/// Search an existing stable index by a scalar key, without constructing or
+/// dereferencing a foreign probe record. `compare` orders each resident node
+/// against the key. Last-equal selects the newest generation of an ID prefix.
+/// # Safety
+/// Caller retains the index owner and live nodes with Links at `offset`.
+/// Key comparison is pure, respects the index ordering and cannot reschedule.
+pub(crate) unsafe fn lookup(
+    index: *mut Index,
+    offset: usize,
+    mut compare: impl FnMut(Node) -> Ordering,
+    last_equal: bool,
+) -> Node {
+    unsafe {
+        let mut result = null_mut();
+        let mut cursor = (*index).root;
+        while !cursor.is_null() {
+            (*index).visits = (*index).visits.wrapping_add(1);
+            match compare(cursor) {
+                Ordering::Less => cursor = (*links(cursor, offset)).right,
+                Ordering::Greater => cursor = (*links(cursor, offset)).left,
+                Ordering::Equal => {
+                    if !last_equal {
+                        return cursor;
+                    }
+                    result = cursor;
+                    cursor = (*links(cursor, offset)).right;
+                }
+            }
+        }
+        result
     }
 }
 /// # Safety
@@ -289,3 +321,145 @@ const _: () = {
     assert!(core::mem::size_of::<Index>() == 32);
     assert!(core::mem::size_of::<Neighbors>() == 16);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::offset_of;
+
+    struct Record {
+        id: u32,
+        generation: u64,
+        identity: Links,
+        address: Links,
+    }
+    const ID: usize = offset_of!(Record, identity);
+    const ADDRESS: usize = offset_of!(Record, address);
+    fn record(id: u32, generation: u64) -> Box<Record> {
+        Box::new(Record {
+            id,
+            generation,
+            identity: Links::default(),
+            address: Links::default(),
+        })
+    }
+    fn node(r: &mut Record) -> Node {
+        core::ptr::from_mut(r).cast()
+    }
+    unsafe extern "C" fn id_before(a: *const c_void, b: *const c_void) -> bool {
+        unsafe {
+            let x = &*a.cast::<Record>();
+            let y = &*b.cast::<Record>();
+            (x.id, x.generation, a.addr()) < (y.id, y.generation, b.addr())
+        }
+    }
+    unsafe extern "C" fn address_before(a: *const c_void, b: *const c_void) -> bool {
+        a.addr() < b.addr()
+    }
+    unsafe fn identity(index: *mut Index, id: u32, generation: u64) -> Node {
+        unsafe {
+            lookup(
+                index,
+                ID,
+                |p| {
+                    let r = &*p.cast::<Record>();
+                    (r.id, r.generation).cmp(&(id, generation))
+                },
+                false,
+            )
+        }
+    }
+
+    #[test]
+    fn scalar_keys_cover_all_records_without_linear_visits() {
+        let mut index = Index::default();
+        let mut records: Vec<_> = (1..=257).map(|i| record(i, 1)).collect();
+        unsafe {
+            for r in &mut records {
+                insert(&mut index, node(r), ID, id_before);
+            }
+            assert_eq!(index.count, records.len());
+            for r in &mut records {
+                let before = index.visits;
+                assert_eq!(identity(&mut index, r.id, r.generation), node(r));
+                assert!(index.visits - before <= 10);
+            }
+            assert!(identity(&mut index, 0, 1).is_null());
+            assert!(identity(&mut index, 258, 1).is_null());
+            assert!(identity(&mut index, 128, 2).is_null());
+            let mut probe = record(128, 2);
+            let next = neighbors(&mut index, node(&mut probe), ID, id_before);
+            assert_eq!(next.previous, node(&mut records[127]));
+            assert_eq!(next.following, node(&mut records[128]));
+            for i in (0..records.len()).step_by(2) {
+                remove(&mut index, node(&mut records[i]), ID);
+            }
+            for (i, r) in records.iter_mut().enumerate() {
+                assert_eq!(identity(&mut index, r.id, 1).is_null(), i % 2 == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn same_address_reuse_rejects_old_generation_and_selects_newest_id() {
+        let mut index = Index::default();
+        let mut old = record(u32::MAX, 9);
+        let mut new = record(u32::MAX, 10);
+        unsafe {
+            let old_pointer = node(&mut old);
+            insert(&mut index, old_pointer, ID, id_before);
+            insert(&mut index, node(&mut new), ID, id_before);
+            let latest = lookup(
+                &mut index,
+                ID,
+                |p| (*p.cast::<Record>()).id.cmp(&u32::MAX),
+                true,
+            );
+            assert_eq!(latest, node(&mut new));
+            assert_eq!(identity(&mut index, u32::MAX, 9), old_pointer);
+            remove(&mut index, old_pointer, ID);
+            assert!(identity(&mut index, u32::MAX, 9).is_null());
+            old.generation = 11;
+            insert(&mut index, old_pointer, ID, id_before);
+            assert!(identity(&mut index, u32::MAX, 9).is_null());
+            assert_eq!(identity(&mut index, u32::MAX, 11), old_pointer);
+            assert_eq!(index.count, 2);
+        }
+    }
+
+    #[test]
+    fn independent_views_survive_remove_rollback_and_foreign_pointer_query() {
+        let mut ids = Index::default();
+        let mut addresses = Index::default();
+        let mut records: Vec<_> = (1..=63).rev().map(|i| record(i, i as u64)).collect();
+        unsafe {
+            for r in &mut records {
+                insert(&mut ids, node(r), ID, id_before);
+                insert(&mut addresses, node(r), ADDRESS, address_before);
+            }
+            let candidate = 1usize;
+            assert!(lookup(&mut addresses, ADDRESS, |p| p.addr().cmp(&candidate), false).is_null());
+            for r in &mut records {
+                let p = node(r);
+                remove(&mut ids, p, ID);
+                remove(&mut addresses, p, ADDRESS);
+                assert_eq!(ids.count, addresses.count);
+                assert!(identity(&mut ids, r.id, r.generation).is_null());
+                assert!(
+                    lookup(&mut addresses, ADDRESS, |n| n.addr().cmp(&p.addr()), false).is_null()
+                );
+                insert(&mut ids, p, ID, id_before);
+                insert(&mut addresses, p, ADDRESS, address_before);
+                assert_eq!(identity(&mut ids, r.id, r.generation), p);
+            }
+            for r in &mut records {
+                remove(&mut ids, node(r), ID);
+                remove(&mut addresses, node(r), ADDRESS);
+            }
+            assert_eq!(ids.count, 0);
+            assert_eq!(addresses.count, 0);
+            assert!(ids.root.is_null() && ids.first.is_null());
+            assert!(addresses.root.is_null() && addresses.first.is_null());
+        }
+    }
+}

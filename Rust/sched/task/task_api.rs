@@ -937,6 +937,10 @@ pub unsafe extern "C" fn r4os_rust_task_set_field(task: *mut c_void, field: u8, 
                 (*c).reap_linked = value != 0;
             }
             16 => {
+                assert!(
+                    !registry::contains(task.cast()),
+                    "Registered Task identity is immutable"
+                );
                 (*c).generation = value;
             }
             17 => {
@@ -958,6 +962,10 @@ pub unsafe extern "C" fn r4os_rust_task_set_field(task: *mut c_void, field: u8, 
                 (*c).critical_reserve_slot = value as u8;
             }
             23 => {
+                assert!(
+                    !registry::contains(task.cast()),
+                    "Registered Task identity is immutable"
+                );
                 (*c).id = value as u32;
             }
             24 => {

@@ -84,6 +84,8 @@ impl ReadyQueue {
 pub struct Registry {
     pub head: *mut Task,
     pub tail: *mut Task,
+    pub identities: Index,
+    pub addresses: Index,
     pub ready: [ReadyQueue; MAX_CPUS],
     pub role_activations: [u64; ROLE_COUNT],
     pub role_exhaustions: [u64; ROLE_COUNT],
@@ -128,6 +130,18 @@ impl Registry {
     const EMPTY: Self = Self {
         head: null_mut(),
         tail: null_mut(),
+        identities: Index {
+            root: null_mut(),
+            first: null_mut(),
+            count: 0,
+            visits: 0,
+        },
+        addresses: Index {
+            root: null_mut(),
+            first: null_mut(),
+            count: 0,
+            visits: 0,
+        },
         ready: [const { ReadyQueue::EMPTY }; MAX_CPUS],
         role_activations: [0; ROLE_COUNT],
         role_exhaustions: [0; ROLE_COUNT],
@@ -209,36 +223,40 @@ pub(super) unsafe fn bump_epoch() {
 }
 pub(super) unsafe fn contains(task: *const Task) -> bool {
     unsafe {
-        let mut cursor = (*raw()).head;
-        while !cursor.is_null() {
-            if ptr::eq(cursor, task) {
-                return true;
-            }
-            cursor = (*core(cursor)).registry_next;
-        }
-        false
+        // Only resident indexed nodes are read. An untrusted candidate is
+        // compared by address before any Task/TaskCore dereference.
+        !task_index::lookup(
+            ptr::addr_of_mut!((*raw()).addresses),
+            ADDRESS_OFFSET,
+            |node| node.addr().cmp(&task.addr()),
+            false,
+        )
+        .is_null()
     }
 }
 pub(super) unsafe fn find_id(id: u32) -> *mut Task {
     unsafe {
-        let mut cursor = (*raw()).head;
-        while !cursor.is_null() {
-            if (*core(cursor)).id == id {
-                return cursor;
-            }
-            cursor = (*core(cursor)).registry_next;
-        }
-        null_mut()
+        task_index::lookup(
+            ptr::addr_of_mut!((*raw()).identities),
+            IDENTITY_OFFSET,
+            |node| (*core(node.cast())).id.cmp(&id),
+            true,
+        )
+        .cast()
     }
 }
 pub(super) unsafe fn find_identity(id: u32, generation: u64) -> *mut Task {
     unsafe {
-        let found = find_id(id);
-        if !found.is_null() && (*core(found)).generation == generation {
-            found
-        } else {
-            null_mut()
-        }
+        task_index::lookup(
+            ptr::addr_of_mut!((*raw()).identities),
+            IDENTITY_OFFSET,
+            |node| {
+                let c = core(node.cast());
+                ((*c).id, (*c).generation).cmp(&(id, generation))
+            },
+            false,
+        )
+        .cast()
     }
 }
 pub(super) unsafe fn allocate_id() -> Option<u32> {
@@ -371,6 +389,18 @@ unsafe extern "C" fn timeout_before(a: *const c_void, b: *const c_void) -> bool 
 }
 const READY_OFFSET: usize = offset_of!(Task, core) + offset_of!(TaskCore, ready_index);
 const TIMEOUT_OFFSET: usize = offset_of!(Task, core) + offset_of!(TaskCore, timeout_index);
+const IDENTITY_OFFSET: usize = offset_of!(Task, core) + offset_of!(TaskCore, identity_index);
+const ADDRESS_OFFSET: usize = offset_of!(Task, core) + offset_of!(TaskCore, address_index);
+unsafe extern "C" fn identity_before(a: *const c_void, b: *const c_void) -> bool {
+    unsafe {
+        let x = core(a.cast_mut().cast());
+        let y = core(b.cast_mut().cast());
+        ((*x).id, (*x).generation, a.addr()) < ((*y).id, (*y).generation, b.addr())
+    }
+}
+unsafe extern "C" fn address_before(a: *const c_void, b: *const c_void) -> bool {
+    a.addr() < b.addr()
+}
 unsafe fn adjust_rank(task: *mut Task, old: u8, new: u8) {
     unsafe {
         crate::sched::mutex_pi::changed(task);
@@ -728,6 +758,20 @@ pub(super) unsafe fn rotate_reap(task: *mut Task) {
 }
 pub(super) unsafe fn link_registry(task: *mut Task) {
     unsafe {
+        // Both are views of this same owner publication. Dead pinned and
+        // metadata-retry records remain represented until exact unlink.
+        task_index::insert(
+            ptr::addr_of_mut!((*raw()).identities),
+            task.cast(),
+            IDENTITY_OFFSET,
+            identity_before,
+        );
+        task_index::insert(
+            ptr::addr_of_mut!((*raw()).addresses),
+            task.cast(),
+            ADDRESS_OFFSET,
+            address_before,
+        );
         let c = core(task);
         (*c).registry_prev = (*raw()).tail;
         (*c).registry_next = null_mut();
@@ -757,6 +801,18 @@ pub(super) unsafe fn unlink_registry(task: *mut Task) {
         unlink_ready(task);
         unlink_timeout(task);
         unlink_reap(task);
+        // Remove lookup visibility before metadata free or reserve reset;
+        // a failed free rejoins through the same link_registry publication.
+        task_index::remove(
+            ptr::addr_of_mut!((*raw()).identities),
+            task.cast(),
+            IDENTITY_OFFSET,
+        );
+        task_index::remove(
+            ptr::addr_of_mut!((*raw()).addresses),
+            task.cast(),
+            ADDRESS_OFFSET,
+        );
         let c = core(task);
         if (*c).registry_prev.is_null() {
             (*raw()).head = (*c).registry_next;

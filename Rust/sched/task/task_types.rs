@@ -98,6 +98,8 @@ pub struct Task {
 pub struct TaskCore {
     pub registry_prev: *mut Task,
     pub registry_next: *mut Task,
+    pub identity_index: Links,
+    pub address_index: Links,
     pub ready_prev: *mut Task,
     pub ready_next: *mut Task,
     pub ready_linked: bool,
@@ -213,6 +215,8 @@ impl Default for TaskCore {
         Self {
             registry_prev: null_mut(),
             registry_next: null_mut(),
+            identity_index: Links::default(),
+            address_index: Links::default(),
             ready_prev: null_mut(),
             ready_next: null_mut(),
             ready_linked: false,

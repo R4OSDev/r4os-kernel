@@ -4,7 +4,7 @@ use super::{fpu, helpers::*, state::*, workers};
 use crate::{
     arch::fpu as owner,
     sched::task::{
-        task_resources as resources,
+        task_lifecycle as lifetime, task_registry as registry, task_resources as resources,
         task_types::{Bytes, CreateFailure, Role, State},
     },
 };
@@ -154,26 +154,56 @@ pub unsafe fn reserve_probe() -> bool {
             return false;
         }
         let mut first_fpu: *const u8 = ptr::null();
+        let mut previous_identity = None;
         for _ in 0..2 {
             (*raw()).short_completed = 0;
             let mut failure = CreateFailure::None;
-            let t = resources::create_critical(
-                Bytes {
-                    pointer: b"taskreg-critical".as_ptr(),
-                    len: 16,
-                },
-                State::Ready,
-                critical_fpu,
-                Role::Interactive,
-                &mut failure,
-            );
+            // The existing two resident reserve cycles exercise real ID and
+            // address reuse. The outer admission prevents other creators
+            // from observing this temporary allocator cursor; real task
+            // generation, admission, execution and free receipts stay intact.
+            let (t, wrapped) = {
+                let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+                let r = registry::raw();
+                let saved = (*r).next_id;
+                (*r).next_id = u32::MAX;
+                let task = resources::create_critical(
+                    Bytes {
+                        pointer: b"taskreg-critical".as_ptr(),
+                        len: 16,
+                    },
+                    State::Ready,
+                    critical_fpu,
+                    Role::Interactive,
+                    &mut failure,
+                );
+                let wrapped = !task.is_null() && (*r).next_id == 1;
+                (*r).next_id = saved;
+                (task, wrapped)
+            };
             if t.is_null() {
                 return false;
             }
-            if failure != CreateFailure::None || !pin(t) {
+            if failure != CreateFailure::None || !wrapped || !pin(t) {
                 return false;
             }
             let v = view(t);
+            if v.id != u32::MAX || lifetime::pin(ptr::with_exposed_provenance_mut(1)) {
+                unpin(t);
+                return false;
+            }
+            if let Some((id, generation, pointer)) = previous_identity {
+                let stale = lifetime::pin_identity(id, Some(generation));
+                if !stale.is_null() {
+                    lifetime::unpin(stale);
+                    unpin(t);
+                    return false;
+                }
+                if t != pointer || v.generation == generation {
+                    unpin(t);
+                    return false;
+                }
+            }
             let stable = if let Some(memory) = v.fpu {
                 first_fpu.is_null() || first_fpu == memory.pointer
             } else {
@@ -191,9 +221,32 @@ pub unsafe fn reserve_probe() -> bool {
                 unpin(t);
                 return false;
             }
+            // A dead Task with a real retained pin still has both lookup
+            // views; this extra exact pin cannot authorize another generation.
+            let retained = lifetime::pin_identity(v.id, Some(v.generation));
+            if retained != t {
+                if !retained.is_null() {
+                    lifetime::unpin(retained);
+                }
+                unpin(t);
+                return false;
+            }
+            if !lifetime::unpin(retained) {
+                unpin(t);
+                return false;
+            }
             if !unpin(t) || !release(v.id, v.generation) {
                 return false;
             }
+            if lifetime::pin(t) || !lifetime::pin_identity(v.id, Some(v.generation)).is_null() {
+                return false;
+            }
+            let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+            let r = registry::raw();
+            if (*r).identities.count != (*r).count || (*r).addresses.count != (*r).count {
+                return false;
+            }
+            previous_identity = Some((v.id, v.generation, t));
         }
         if r4os_rust_task_control(4, 0, 0) != used_before {
             return false;
@@ -223,7 +276,11 @@ pub unsafe fn reserve_probe() -> bool {
             unpin(t);
             return false;
         }
-        unpin(t) && release(v.id, v.generation)
+        let passed = unpin(t) && release(v.id, v.generation);
+        if passed {
+            puts(b"TASKIDX08736 PASS real-reserve-reuse=2 id-wrap=2 old-generation-rejected=1 dead-pinned=2 foreign-pointer-rejected=2 views-clean=2\r\n");
+        }
+        passed
     }
 }
 
