@@ -2,6 +2,7 @@
 //! Early safe-point counters use separate atomics; no State borrow spans a switch.
 pub(crate) mod rank_probe;
 pub(crate) mod selection;
+pub(crate) mod slice_probe;
 pub use super::scheduler_types::{CpuPreemptionStats, Stats, StructureStats};
 use super::{task::thread_placement, task_context};
 use crate::{
@@ -24,7 +25,19 @@ const QUANTUM: u64 = {
     let ticks = (30 * pit::DEFAULT_HZ) / 1000;
     if ticks == 0 { 1 } else { ticks as u64 }
 };
+const INTERACTIVE_QUANTUM: u64 = {
+    let ticks = (8 * pit::DEFAULT_HZ) / 1000;
+    if ticks == 0 { 1 } else { ticks as u64 }
+};
+// Batch work, placement and periodic balancing retain the base interval.
 pub(crate) const PLACEMENT_COOLDOWN: u64 = QUANTUM;
+fn dispatch_quantum(rank: u8) -> u64 {
+    if rank <= 2 {
+        INTERACTIVE_QUANTUM
+    } else {
+        QUANTUM
+    }
+}
 const LONG_WARN: u64 = pit::DEFAULT_HZ as u64;
 const STARVE_WARN: u64 = 2 * pit::DEFAULT_HZ as u64;
 type Task = *mut c_void;
@@ -548,11 +561,12 @@ fn record_wait(latency: u64) {
 fn record_run(ticks: u64) {
     change(|s| s.run_without_switch_max_ticks = s.run_without_switch_max_ticks.max(ticks));
 }
-fn record_overrun(ticks: u64) {
-    if ticks <= QUANTUM {
+fn record_overrun(ticks: u64, rank: u8) {
+    let quantum = dispatch_quantum(rank);
+    if ticks <= quantum {
         return;
     }
-    let extra = ticks - QUANTUM;
+    let extra = ticks - quantum;
     change(|s| {
         s.quantum_overrun_count = s.quantum_overrun_count.wrapping_add(1);
         s.quantum_overrun_max_ticks = s.quantum_overrun_max_ticks.max(extra);
@@ -1246,7 +1260,7 @@ pub(crate) fn safe_reschedule() -> bool {
     if !priority {
         set_pending(false);
     }
-    if !priority && since(tick(), item.last_scheduled_tick) < QUANTUM {
+    if !priority && since(tick(), item.last_scheduled_tick) < dispatch_quantum(item.dispatch_rank) {
         runtime::restore_runtime(flags);
         return false;
     }
@@ -1398,7 +1412,7 @@ fn timer_preemption(now: u64, preemptible: bool) -> bool {
         set_pending(false);
     }
     let ticks = since(now, view(running).last_scheduled_tick);
-    if !priority && !placement && ticks < QUANTUM {
+    if !priority && !placement && ticks < dispatch_quantum(view(running).dispatch_rank) {
         change(|s| {
             s.preemption_deferred_quantum_count =
                 s.preemption_deferred_quantum_count.wrapping_add(1)
@@ -1483,7 +1497,7 @@ pub fn on_tick(now: u64, preemptible: bool, secondary: bool) -> bool {
                 }
                 let ticks = mutate(21, running, now, 0);
                 record_run(ticks);
-                record_overrun(ticks);
+                record_overrun(ticks, item.dispatch_rank);
             }
         }
     }

@@ -43,9 +43,17 @@ unsafe fn exact_pair(running: *mut Descriptor, ready: *mut Descriptor) -> bool {
             && (*b).ready_linked
             && (*b).running_cpu == 0xff
             && u32::from((*b).home_cpu) == cpu
-            && ready_count() == 1
     }
 }
+// A remote lower-rank enqueue legitimately publishes a pending IPI even
+// while this probe masks local IRQ delivery. Consume that non-urgent request
+// through the normal Scheduler owner before establishing the causal baseline.
+fn consume_nonurgent(running: Task) {
+    if !urgent(running) {
+        assert!(!preempt_pending(false));
+    }
+}
+unsafe extern "C" fn bystander() {}
 unsafe extern "C" fn runner() {
     let mode = MODE.load(Ordering::Relaxed);
     // The elapsed owner case separates actual accounting from asynchronous
@@ -69,6 +77,7 @@ unsafe extern "C" fn runner() {
     let initial = {
         let _runtime = RuntimeGuard::acquire();
         unsafe {
+            consume_nonurgent(t.cast());
             exact_pair(t, peer)
                 && !local().pending
                 && registry::dispatch_rank(t) == if mode == 2 { 2 } else { 0 }
@@ -84,35 +93,51 @@ unsafe extern "C" fn runner() {
                 let _runtime = RuntimeGuard::acquire();
                 view(t.cast()).last_scheduled_tick
             };
+            ARMED.store(true, Ordering::Release);
+            while !GO.load(Ordering::Acquire) && before(end) {
+                core::hint::spin_loop();
+            }
             while since(tick(), scheduled) < 2
                 && deadline.zip(clock()).is_some_and(|(end, now)| now < end)
             {
                 core::hint::spin_loop();
             }
-            let (published, elapsed) = {
+            let (published, elapsed, before_mask, after_mask, detail) = {
                 let _runtime = RuntimeGuard::acquire();
                 let now = tick();
                 let elapsed = since(now, scheduled);
                 unsafe {
-                    let before = exact_pair(t, peer)
-                        && !local().pending
-                        && registry::dispatch_rank(t) == 0
-                        && registry::dispatch_rank(peer) == 1
-                        && elapsed >= 2;
+                    consume_nonurgent(t.cast());
+                    let before_mask = u32::from(exact_pair(t, peer))
+                        | (u32::from(!local().pending) << 1)
+                        | (u32::from(registry::dispatch_rank(t) == 0) << 2)
+                        | (u32::from(registry::dispatch_rank(peer) == 1) << 3)
+                        | (u32::from(elapsed >= 2) << 4);
+                    let before = before_mask == 31;
                     if before {
                         // Same actual owner entry as on_tick, using fresh real
                         // elapsed time. IRQs cannot consume the edge first;
                         // the next IRQ accounts only the remaining delta.
                         let ticks = mutate(21, t.cast(), now, 0);
                         record_run(ticks);
-                        record_overrun(ticks);
+                        record_overrun(ticks, registry::dispatch_rank(t));
                     }
+                    let after_mask = u32::from(exact_pair(t, peer))
+                        | (u32::from(local().pending) << 1)
+                        | (u32::from(registry::dispatch_rank(t) == 2) << 2);
                     (
-                        before
-                            && exact_pair(t, peer)
-                            && local().pending
-                            && registry::dispatch_rank(t) == 2,
+                        before && after_mask == 7,
                         elapsed,
+                        before_mask,
+                        after_mask,
+                        [
+                            ready_count(),
+                            u64::from(registry::dispatch_rank(t)),
+                            u64::from(registry::dispatch_rank(peer)),
+                            u64::from((*registry::core(t)).role_budget_ticks_remaining),
+                            (*registry::core(t)).last_accounted_tick,
+                            now,
+                        ],
                     )
                 }
             };
@@ -127,6 +152,22 @@ unsafe extern "C" fn runner() {
             } else {
                 b" pending=FAILED\n"
             });
+            if !published {
+                for (label, value) in [
+                    (b"RANK08728 before-mask=".as_slice(), u64::from(before_mask)),
+                    (b" after-mask=", u64::from(after_mask)),
+                    (b" ready=", detail[0]),
+                    (b" rank=", detail[1]),
+                    (b" peer-rank=", detail[2]),
+                    (b" budget=", detail[3]),
+                    (b" accounted=", detail[4]),
+                    (b" now=", detail[5]),
+                ] {
+                    crate::boot::log_route::puts(label);
+                    crate::boot::log_route::dec(value);
+                }
+                crate::boot::log_route::puts(b"\n");
+            }
         } else if mode == 1 {
             // No pending request exists at this ordinary voluntary switch.
             // The selected peer consumes its last dispatch boost before Running.
@@ -190,7 +231,7 @@ unsafe extern "C" fn peer() {
     }
     DONE.fetch_or(2, Ordering::Release);
 }
-fn quiet_cpu() -> Option<u32> {
+pub(super) fn quiet_cpu() -> Option<u32> {
     let end = timer::tick_count().saturating_add(2000);
     while !kernel_check::cancelled() && timer::tick_count() < end {
         {
@@ -244,7 +285,12 @@ fn one(mode: u32) -> bool {
     );
     RUNNER.store(a, Ordering::Release);
     PEER.store(b, Ordering::Release);
-    let admitted = if a.is_null() || b.is_null() {
+    let extra = if mode == 0 {
+        tasks::create_on_cpu(b"spectra-rank-bystander", bystander, Role::Batch, cpu)
+    } else {
+        ptr::null_mut()
+    };
+    let admitted = if a.is_null() || b.is_null() || mode == 0 && extra.is_null() {
         false
     } else {
         let _runtime = RuntimeGuard::acquire();
@@ -262,6 +308,23 @@ fn one(mode: u32) -> bool {
     };
     let end = timer::tick_count().saturating_add(2000);
     let mut donated = false;
+    if admitted && mode == 0 {
+        while !ARMED.load(Ordering::Acquire)
+            && DONE.load(Ordering::Acquire) == 0
+            && before(end)
+            && !kernel_check::cancelled()
+        {
+            tasks::sleep(1, b"spectra-rank-bystander-ready");
+        }
+        // Only our own third Task: deterministically reproduce an unrelated
+        // lower-rank remote wake during the IF-off elapsed-time interval.
+        let queued = {
+            let _runtime = RuntimeGuard::acquire();
+            ARMED.load(Ordering::Acquire) && tasks::start(extra)
+        };
+        check(queued, 16_384);
+        GO.store(true, Ordering::Release);
+    }
     if admitted && mode == 2 {
         while !ARMED.load(Ordering::Acquire)
             && DONE.load(Ordering::Acquire) == 0
@@ -314,7 +377,7 @@ fn one(mode: u32) -> bool {
         }
     }
     let mut clean = true;
-    for t in [a, b] {
+    for t in [a, b, extra] {
         if !t.is_null() {
             clean &= tasks::finish_task(t, !passed);
         }
@@ -338,6 +401,6 @@ pub(crate) fn run() -> bool {
             return false;
         }
     }
-    crate::boot::log_route::puts(b"RANK08728 PASS elapsed-budget=1 dispatch-budget=1 remote-donation=1 returned=1 tasks=6 own=reaped\n");
+    crate::boot::log_route::puts(b"RANK08728 PASS elapsed-budget=1 dispatch-budget=1 remote-donation=1 returned=1 unrelated-wake=1 tasks=7 own=reaped\n");
     true
 }

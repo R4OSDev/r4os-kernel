@@ -30,6 +30,7 @@ pub struct Stats {
     pub preemption_deferred_quantum: u64,
     pub preemption_deferred_kernel_ip: u64,
     pub preemption_switch_ticks: u64,
+    /// Base/maximum slice. Effective interactive dispatch ranks use8ms.
     pub preemption_quantum_ticks: u32,
     pub preemption_quantum_expired: u64,
     pub preemption_app_code_ticks: u64,
