@@ -263,6 +263,7 @@ pub struct Gui {
     // Accepted building/committed/retired roots, excluding private candidates.
     pub frame_owned_bytes: u64,
     pub frame_owned_commands: u64,
+    pub activity: super::gui_activity::Channel,
 }
 
 #[repr(C)]
@@ -485,6 +486,7 @@ pub unsafe fn initialize(kind: u8, memory: *mut u8) {
             }
             6 => {
                 let payload = memory.cast::<Gui>();
+                ptr::addr_of_mut!((*payload).activity).write(super::gui_activity::Channel::EMPTY);
                 ptr::addr_of_mut!((*payload).operation_gate).write(UnwindGuard {
                     owner: 0,
                     owner_generation: 0,
@@ -782,7 +784,8 @@ const _: () = {
     assert!(mem::offset_of!(Frame, base_commands) == 272);
     assert!(mem::offset_of!(Frame, base_resources) == 280);
     assert!(mem::offset_of!(Frame, base_raster_words) == 288);
-    assert!(mem::size_of::<Gui>() == 3960);
+    assert!(mem::size_of::<Gui>() == 4032);
+    assert!(mem::offset_of!(Gui, activity) == 3960);
     assert!(mem::align_of::<Gui>() == 8);
     assert!(mem::offset_of!(Gui, operation_gate) == 2848);
     assert!(mem::offset_of!(Gui, header) == 3016);

@@ -17,6 +17,7 @@ pub mod failure;
 pub mod fault;
 pub mod gfx_output_api;
 pub mod gfx_queue_api;
+pub mod gui_activity;
 pub mod gui_api;
 pub mod gui_batch;
 pub mod gui_draw;

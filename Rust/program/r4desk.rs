@@ -225,6 +225,7 @@ fn bump_clipboard() {
             *p = 1
         }
     }
+    super::gui_activity::notify(a::gui_activity_shared_clipboard);
 }
 fn clear_clipboard() {
     unsafe {

@@ -164,6 +164,7 @@ pub unsafe extern "C" fn r4os_rust_program_exit_commit(h: Handle, code: i32, req
         if !console.is_null() {
             program_exit_console_close(console);
         }
+        super::gui_activity::close((*instance).gui_payload.cast());
         if boot_shell_exited {
             crate::boot::performance::fail_shell_exited(h.instance_id);
         }

@@ -166,5 +166,5 @@ const _: () = {
 };
 
 unsafe fn fs_directory_activity() {
-    crate::service::desktop_events::r4os_rust_desktop_signal();
+    crate::program::gui_activity::notify(crate::contract::gui_activity_shared_directory);
 }

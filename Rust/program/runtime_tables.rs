@@ -605,12 +605,17 @@ fn configure_desk() {
         console_push_events: super::console_input::push_events as *const () as usize,
         console_text_info: super::console::api_text_info as *const () as usize,
         console_set_encoding: super::console::api_set_encoding as *const () as usize,
+        gui_activity_wait: super::platform_callbacks::desk_gui_activity_wait as *const () as usize,
+        gui_activity_notify: super::platform_callbacks::desk_gui_activity_notify as *const ()
+            as usize,
         ..Default::default()
     };
     DESK.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Desk>() == 568);
+    assert!(mem::size_of::<c::R4XStartR4Desk>() == 584);
+    assert!(mem::offset_of!(c::R4XStartR4Desk, gui_activity_wait) == 568);
+    assert!(mem::offset_of!(c::R4XStartR4Desk, gui_activity_notify) == 576);
     assert!(mem::offset_of!(c::R4XStartR4Desk, console_text_info) == 552);
     assert!(mem::offset_of!(c::R4XStartR4Desk, console_set_encoding) == 560);
     assert!(mem::offset_of!(c::R4XStartR4Desk, console_read_events) == 536);

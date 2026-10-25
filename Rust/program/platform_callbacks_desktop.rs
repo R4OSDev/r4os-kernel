@@ -302,6 +302,17 @@ pub(super) unsafe extern "C" fn desk_desktop_activity_wait(
         )
     } as u32) as i32
 }
+pub(super) unsafe extern "C" fn desk_gui_activity_wait(
+    last: u64,
+    timeout: u64,
+    subscriptions: u32,
+    out: *mut u64,
+) -> i32 {
+    unsafe { crate::program::gui_activity::wait(last, timeout, subscriptions, out) }
+}
+pub(super) unsafe extern "C" fn desk_gui_activity_notify(categories: u32) -> i32 {
+    crate::program::gui_activity::notify(categories)
+}
 pub(super) unsafe extern "C" fn desk_remote_frame_map(out: *mut c::RemoteFrameMapInfo) -> i32 {
     (unsafe {
         crate::program::r4desk::r4os_rust_r4desk(

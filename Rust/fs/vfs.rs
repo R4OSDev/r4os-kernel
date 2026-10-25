@@ -240,7 +240,7 @@ pub unsafe extern "C" fn r4os_rust_vfs_mount(
                     true
                 }
             };
-            crate::service::desktop_events::r4os_rust_desktop_signal();
+            crate::program::gui_activity::notify(crate::contract::gui_activity_shared_directory);
             result
         }
         6 => {

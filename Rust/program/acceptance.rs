@@ -633,6 +633,9 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
         else {
             return false;
         };
+        if !super::gui_activity::probe::empty() {
+            return false;
+        }
         let before = storage_stats();
         let mut handles = [c::ProgramProcessHandle::default(); 3];
         let mut service = c::ServiceInfo::default();
@@ -730,7 +733,6 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
                 if gui_events::r4os_rust_program_gui_event_push(handle.instance_id, &key) != 0 {
                     return false;
                 }
-                crate::service::desktop_events::r4os_rust_desktop_signal();
                 while gui_events::r4os_rust_program_gui_revision_read(handle.instance_id)
                     == revision
                 {
@@ -741,6 +743,14 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
                 }
             }
             log(b"[PARALLEL-OWNERS] GUI frames and input OK\r\n");
+            if !super::gui_activity::probe::run(&handles[..2]) {
+                return false;
+            }
+            let Some(clipboard_before) =
+                super::gui_activity::probe::shared_sequences(&handles[..2])
+            else {
+                return false;
+            };
             if service_api::r4os_rust_program_service_lifecycle(
                 false,
                 span(b"CLIPSVC"),
@@ -767,6 +777,9 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
             ) != 0
                 || completion.exit_code != 0
             {
+                return false;
+            }
+            if !super::gui_activity::probe::shared_commits(&handles[..2], clipboard_before) {
                 return false;
             }
             if process::r4os_rust_program_process_close(&handles[0]) != 0
@@ -842,8 +855,10 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
             .load(Ordering::Acquire);
         let workers = AtomicU64::from_ptr(ptr::addr_of_mut!((*entry).probe_thread_mask))
             .load(Ordering::Acquire);
+        let subscriptions_empty = super::gui_activity::probe::empty();
         let ok = work
             && cleanup
+            && subscriptions_empty
             && mains & expected == expected
             && mains & !ap_mask == 0
             && services & ap_mask != 0
@@ -867,6 +882,8 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
         dec(work.into());
         log(b" cleanup=");
         dec(cleanup.into());
+        log(b" subscriptions_empty=");
+        dec(subscriptions_empty.into());
         log(b" payload_before=");
         dec(before.current_payload_bytes);
         log(b" payload_after=");

@@ -138,7 +138,7 @@ pub(super) unsafe fn pending(gui: *const t::Gui) -> u32 {
 pub(super) unsafe fn enqueue(gui: *mut t::Gui, event: *const Event) -> i32 {
     unsafe {
         let event = event.read();
-        let _guard = Guard::acquire(0);
+        let guard = Guard::acquire(0);
         (*state()).push_attempts = (*state()).push_attempts.wrapping_add(1);
         if event.kind == 5
             && let Some(index) = find_move(gui)
@@ -163,6 +163,8 @@ pub(super) unsafe fn enqueue(gui: *mut t::Gui, event: *const Event) -> i32 {
         if pending > (*gui).event_high_water {
             (*gui).event_high_water = pending;
         }
+        drop(guard);
+        super::gui_activity::signal(gui);
         0
     }
 }
@@ -262,10 +264,27 @@ pub unsafe extern "C" fn r4os_rust_program_gui_window_set(id: u32, info: *const 
             return -3;
         }
         let value = info.read();
-        let _guard = Guard::acquire(0);
+        let guard = Guard::acquire(0);
+        let previous = (*gui).window_info;
+        let changed = previous.window_id != value.window_id
+            || previous.frame_x != value.frame_x
+            || previous.frame_y != value.frame_y
+            || previous.frame_w != value.frame_w
+            || previous.frame_h != value.frame_h
+            || previous.client_x != value.client_x
+            || previous.client_y != value.client_y
+            || previous.client_w != value.client_w
+            || previous.client_h != value.client_h
+            || previous.flags != value.flags;
         (*gui).window_info = value;
         AtomicI32::from_ptr(ptr::addr_of_mut!((*gui).window_id))
             .store(value.window_id, Ordering::Release);
+        drop(guard);
+        // Hidden hosted windows also wait here. A real geometry/visibility
+        // change belongs to this instance; repeated desktop snapshots do not.
+        if changed {
+            super::gui_activity::signal(gui);
+        }
         0
     }
 }

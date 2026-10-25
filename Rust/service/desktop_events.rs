@@ -1,11 +1,8 @@
 //! IRQ-safe desktop activity revision and lost-wakeup-safe enrollment under
 //! the same scheduler runtime owner as the existing WaitQueue transport.
-use crate::{
-    arch::pit,
-    sched::{
-        sync_types::{Text, WaitQueue, WaitRequest},
-        sync_wait,
-    },
+use crate::sched::{
+    sync_types::{Text, WaitQueue, WaitRequest},
+    sync_wait,
 };
 use core::{cell::UnsafeCell, ffi::c_void, ptr};
 struct Activity {
@@ -46,36 +43,28 @@ pub extern "C" fn r4os_rust_desktop_sequence() -> u64 {
 unsafe extern "C" fn unchanged(raw: *mut c_void) -> bool {
     unsafe { *ACTIVITY.sequence.get() == *raw.cast::<u64>() }
 }
-const WAIT_SLICE: u64 = {
-    let ticks = 250 * pit::DEFAULT_HZ as u64 / 1000;
-    if ticks == 0 { 1 } else { ticks }
-};
 /// # Safety
 /// `output` is writable for this call; no output or sequence borrow crosses
 /// the original sleep/enrollment boundary.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_desktop_wait(last: u64, timeout: u64, output: *mut u64) -> i32 {
-    let mut waited = 0;
-    loop {
-        let current = r4os_rust_desktop_sequence();
-        if current != last {
-            unsafe { output.write(current) };
-            return 1;
+    let mut observed = last;
+    let request = WaitRequest::predicate(
+        timeout,
+        Text::literal(b"desk-activity"),
+        unchanged,
+        ptr::from_mut(&mut observed).cast(),
+    );
+    let result = unsafe { sync_wait::r4os_rust_sync_wait(ACTIVITY.queue.get(), &request) };
+    match result {
+        1 | 2 => {
+            let current = r4os_rust_desktop_sequence();
+            unsafe {
+                output.write(current);
+            }
+            i32::from(current != last || result == 1)
         }
-        if waited >= timeout {
-            break;
-        }
-        let slice = WAIT_SLICE.min(timeout - waited);
-        let mut observed = last;
-        let request = WaitRequest::predicate(
-            slice,
-            Text::literal(b"desk-activity"),
-            unchanged,
-            ptr::from_mut(&mut observed).cast(),
-        );
-        unsafe { sync_wait::r4os_rust_sync_wait(ACTIVITY.queue.get(), &request) };
-        waited += slice;
+        3 | 4 => -2,
+        _ => -3,
     }
-    unsafe { output.write(r4os_rust_desktop_sequence()) };
-    0
 }

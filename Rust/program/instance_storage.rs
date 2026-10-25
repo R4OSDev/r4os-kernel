@@ -299,6 +299,7 @@ pub(super) unsafe fn release(
         super::shared_raster::release_process((*completion).handle);
         let gui = (*instance).gui_payload.cast::<t::Gui>();
         if !gui.is_null() {
+            super::gui_activity::close(gui);
             if !gui::release_set(gui, (*instance).id) {
                 (*instance).storage_teardown_blocked = true;
                 return false;

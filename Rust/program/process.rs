@@ -519,6 +519,7 @@ const _: () = {
 
 unsafe fn program_process_input(handle: Handle) {
     crate::program::console_input::r4os_rust_program_console_input_signal_handle(handle);
+    super::gui_activity::signal_handle(handle);
 }
 
 unsafe fn program_process_console_link(instance: *const ProgramInstance) -> ConsoleLink {
