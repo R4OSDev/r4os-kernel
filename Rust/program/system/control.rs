@@ -5,7 +5,7 @@ use super::super::registry_format_types::Bytes;
 use super::{io, path, registry, registry_state};
 use crate::{
     arch::{
-        percpu, rtc,
+        percpu,
         runtime::{self, RuntimeGuard},
         smp,
     },
@@ -13,7 +13,7 @@ use crate::{
     contract as c,
     fs::page_cache,
     memory::heap,
-    platform::{acpi, monotonic, time, timer},
+    platform::{monotonic, time, timer},
     sched::{scheduler, sync_types::WaitQueue, sync_wait, task_context},
 };
 use core::{
@@ -62,16 +62,16 @@ pub extern "C" fn r4os_rust_sys_ticks() -> u64 {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_sys_seconds() -> u32 {
-    rtc::seconds_since_midnight(rtc::read_date_time(acpi::snapshot().fadt_century))
+    time::seconds_since_midnight()
 }
 /// # Safety
-/// Original exclusive public clock output and RTC caller context.
+/// Exclusive public output; the platform owns RTC/cache admission.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_sys_time_state(out: *mut c::TimeState) {
     unsafe { time::r4os_rust_time_state(out) }
 }
 /// # Safety
-/// Original readable public clock input and exclusive RTC mutation context.
+/// Readable public input; the platform serializes the whole RTC mutation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_sys_time_set(input: *const c::TimeState) -> i32 {
     unsafe { time::r4os_rust_time_set_state(input) }

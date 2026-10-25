@@ -5,6 +5,12 @@ use crate::{arch::rtc, contract::TimeState};
 fn century() -> u8 {
     acpi::snapshot().fadt_century
 }
+pub fn calendar() -> rtc::DateTime {
+    rtc::read_date_time(century())
+}
+pub fn seconds_since_midnight() -> u32 {
+    rtc::seconds_since_midnight(calendar())
+}
 fn date_time(value: TimeState) -> rtc::DateTime {
     rtc::DateTime {
         valid: value.valid != 0,
@@ -19,11 +25,11 @@ fn date_time(value: TimeState) -> rtc::DateTime {
     }
 }
 /// # Safety
-/// Caller owns one aligned writable Contract TimeState until return; the
-/// established RTC/ACPI caller context admits this bounded CMOS sampling.
+/// Caller owns one aligned writable Contract TimeState until return. The
+/// RTC owner has released its copied calendar before caller-storage output.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_time_state(output: *mut TimeState) {
-    let now = rtc::read_date_time(century());
+    let now = calendar();
     let value = TimeState {
         valid: u8::from(now.valid),
         century_source: now.century_source,
@@ -43,8 +49,8 @@ pub unsafe extern "C" fn r4os_rust_time_state(output: *mut TimeState) {
     unsafe { output.write(value) };
 }
 /// # Safety
-/// Input is a resident readable Contract TimeState for the whole call. RTC
-/// port/NMI context and exclusive hardware mutation are retained by the caller.
+/// Input is a readable Contract TimeState for the initial copy. RTC provides
+/// the complete short hardware/cache transaction and preserves caller IF.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_time_set_state(input: *const TimeState) -> i32 {
     let value = date_time(unsafe { input.read() });
@@ -69,7 +75,7 @@ pub(crate) fn log_status() {
         }
         crate::boot::log::r4os_rust_bootlog_dec(u64::from(value));
     }
-    let now = rtc::read_date_time(century());
+    let now = calendar();
     puts(b"[TIME] rtc=");
     two(now.day);
     puts(b"-");
@@ -82,6 +88,8 @@ pub(crate) fn log_status() {
     two(now.minute);
     puts(b":");
     two(now.second);
+    puts(b" valid=");
+    puts(if now.valid { b"yes" } else { b"no" });
     puts(b" century=");
     puts(match now.century_source {
         0 => b"pivot",

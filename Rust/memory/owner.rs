@@ -50,7 +50,7 @@ pub struct Lock {
 // created, including reentrant acquisitions or concurrent metric snapshots.
 unsafe impl Sync for Lock {}
 // Original named owner storage; one native instance per existing class.
-static NAMED: [Lock; 11] = [
+static NAMED: [Lock; 12] = [
     Lock::new(0, 1),
     Lock::new(1, 2),
     Lock::new(2, 2),
@@ -64,6 +64,8 @@ static NAMED: [Lock; 11] = [
     // Last leaf: only paired PCI configuration port instructions, never a
     // callback, allocation, mapping operation or acquisition of another owner.
     Lock::new(10, 85),
+    // RTC leaf: bounded CMOS/calendar/cache operations, no wait or peer owner.
+    Lock::new(11, 86),
 ];
 static HELD_RANK: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
 
@@ -327,6 +329,9 @@ impl Guard {
         })
     }
 }
+pub(crate) fn rtc_guard() -> Guard {
+    Guard::acquire(11)
+}
 pub(crate) fn pci_config_guard() -> Guard {
     Guard::acquire(10)
 }
@@ -388,7 +393,7 @@ const _: () = {
     assert!(core::mem::size_of::<Stats>() == 64);
 };
 
-pub(crate) const CLASS_NAMES: [&[u8]; 11] = [
+pub(crate) const CLASS_NAMES: [&[u8]; 12] = [
     b"program_state",
     b"storage",
     b"network",
@@ -400,6 +405,7 @@ pub(crate) const CLASS_NAMES: [&[u8]; 11] = [
     b"boot_log",
     b"serial_output",
     b"pci_config",
+    b"rtc",
 ];
 pub(crate) fn stats_for_class(class: u8) -> Stats {
     assert!((class as usize) < CLASS_NAMES.len());

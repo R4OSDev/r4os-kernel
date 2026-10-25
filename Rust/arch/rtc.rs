@@ -1,298 +1,160 @@
-//! Original bounded CMOS sampling and calendar policy. Port admission and
-//! NMI/IRQ context remain with the existing platform caller, without a new lock.
+//! Canonical short RTC owner for CMOS index/data, calendar writes and cache.
+//! No allocation, callback, wait or RuntimeGuard is acquired while held.
+#[path = "rtc/cache.rs"]
+mod cache;
+#[path = "rtc/calendar.rs"]
+mod calendar;
 use super::io;
-const CENTURY_FALLBACK: u8 = 0x32;
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct DateTime {
-    pub year: u16,
-    pub valid: bool,
-    pub month: u8,
-    pub day: u8,
-    pub weekday: u8,
-    pub hour: u8,
-    pub minute: u8,
-    pub second: u8,
-    pub century_register: u8,
-    pub century_source: u8,
-}
-impl Default for DateTime {
-    fn default() -> Self {
-        Self {
-            year: 1980,
-            valid: false,
-            month: 1,
-            day: 1,
-            weekday: 0,
-            hour: 0,
-            minute: 0,
-            second: 0,
-            century_register: 0,
-            century_source: 0,
-        }
+use crate::{memory::owner, platform::monotonic};
+pub use calendar::{DateTime, seconds_since_midnight, valid_date_time};
+use calendar::{Raw, encode};
+use core::cell::UnsafeCell;
+struct State(UnsafeCell<cache::Cache>);
+// SAFETY: every cache/hardware operation holds the same resident RTC owner.
+unsafe impl Sync for State {}
+static STATE: State = State(UnsafeCell::new(cache::Cache::EMPTY));
+const UIP: u8 = 0x80;
+const SET: u8 = 0x80;
+const UPDATE_IRQ: u8 = 0x10;
+// Keep R4OS's existing NMI policy. Port70 is write-only on supported Intel
+// profiles; reading it cannot recover an unknown previous index/NMI mask.
+const INDEX_NMI_DISABLED: u8 = 0x80;
+fn century(requested: u8) -> (u8, u8) {
+    if (0x0e..=0x7f).contains(&requested) {
+        (requested, 1)
+    } else {
+        (0x32, 2)
     }
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Raw {
-    second: u8,
-    minute: u8,
-    hour: u8,
-    weekday: u8,
-    day: u8,
-    month: u8,
-    year: u8,
-    century: u8,
-    status: u8,
-}
-impl Default for Raw {
-    fn default() -> Self {
-        Self {
-            second: 0,
-            minute: 0,
-            hour: 0,
-            weekday: 0,
-            day: 1,
-            month: 1,
-            year: 0,
-            century: 0,
-            status: 0,
-        }
-    }
-}
-fn read(reg: u8) -> u8 {
+fn read(_guard: &owner::Guard, reg: u8) -> u8 {
     unsafe {
-        io::outb(0x70, reg | 0x80);
+        io::outb(0x70, reg | INDEX_NMI_DISABLED);
         io::outb(0x80, 0);
         io::inb(0x71)
     }
 }
-fn write(reg: u8, value: u8) {
+fn write(_guard: &owner::Guard, reg: u8, value: u8) {
     unsafe {
-        io::outb(0x70, reg | 0x80);
+        io::outb(0x70, reg | INDEX_NMI_DISABLED);
         io::outb(0x80, 0);
         io::outb(0x71, value);
         io::outb(0x80, 0);
     }
 }
-fn wait_stable() {
-    for _ in 0..10000 {
-        if read(0x0a) & 0x80 == 0 {
-            return;
-        }
-    }
-}
-fn raw(century: u8) -> Raw {
+fn raw(guard: &owner::Guard, century: u8) -> Raw {
     Raw {
-        second: read(0),
-        minute: read(2),
-        hour: read(4),
-        weekday: read(6),
-        day: read(7),
-        month: read(8),
-        year: read(9),
-        century: if century != 0 { read(century) } else { 0 },
-        status: read(0x0b),
+        second: read(guard, 0),
+        minute: read(guard, 2),
+        hour: read(guard, 4),
+        weekday: read(guard, 6),
+        day: read(guard, 7),
+        month: read(guard, 8),
+        year: read(guard, 9),
+        century: read(guard, century),
+        status: read(guard, 0x0b),
     }
 }
-fn raw_stable(century: u8) -> Raw {
-    let mut last = Raw::default();
-    for _ in 0..4 {
-        wait_stable();
-        let a = raw(century);
-        wait_stable();
-        let b = raw(century);
-        if a == b {
-            return b;
+/// One bounded attempt; UIP never starts a spin/poll loop. First/last seconds,
+/// both whole samples (including century/mode), and final UIP must agree.
+fn sample(guard: &owner::Guard, register: u8, source: u8) -> Option<DateTime> {
+    let second = read(guard, 0);
+    if read(guard, 0x0a) & UIP != 0 {
+        return None;
+    }
+    let a = raw(guard, register);
+    if a.status & SET != 0 || a.second != second || read(guard, 0x0a) & UIP != 0 {
+        return None;
+    }
+    let b = raw(guard, register);
+    if a != b
+        || b.second != read(guard, 0)
+        || read(guard, 0x0a) & UIP != 0
+        || read(guard, 0x0d) & 0x80 == 0
+    {
+        return None;
+    }
+    calendar::decode_raw(b, register, source)
+}
+pub fn read_date_time(requested_century: u8) -> DateTime {
+    let guard = owner::rtc_guard();
+    let now = monotonic::now_nanoseconds();
+    if unsafe { (*STATE.0.get()).due(now, requested_century) } {
+        let (register, source) = century(requested_century);
+        let sampled = sample(&guard, register, source);
+        let now = monotonic::now_nanoseconds();
+        unsafe {
+            (*STATE.0.get()).publish(now, requested_century, sampled);
         }
-        last = b;
+        return unsafe { (*STATE.0.get()).current(now) };
     }
-    last
+    unsafe { (*STATE.0.get()).current(now) }
 }
-fn normalize(value: u8, binary: bool) -> u8 {
-    if binary {
-        value
-    } else {
-        (value >> 4) * 10 + (value & 15)
-    }
-}
-fn encode(value: u8, binary: bool) -> u8 {
-    if binary {
-        value
-    } else {
-        ((value / 10) << 4) | (value % 10)
-    }
-}
-pub fn read_date_time(century_register: u8) -> DateTime {
-    let raw = raw_stable(century_register);
-    let binary = raw.status & 4 != 0;
-    let mut second = normalize(raw.second, binary);
-    let mut minute = normalize(raw.minute, binary);
-    let pm = raw.hour & 0x80 != 0;
-    let mut hour = normalize(raw.hour & 0x7f, binary);
-    let mut weekday = normalize(raw.weekday, binary);
-    let mut day = normalize(raw.day, binary);
-    let mut month = normalize(raw.month, binary);
-    let year_two = normalize(raw.year, binary);
-    if raw.status & 2 == 0 {
-        if pm && hour < 12 {
-            hour += 12;
-        }
-        if !pm && hour == 12 {
-            hour = 0;
-        }
-    }
-    if second > 59 {
-        second = 0;
-    }
-    if minute > 59 {
-        minute = 0;
-    }
-    if hour > 23 {
-        hour = 0;
-    }
-    if weekday > 7 {
-        weekday = 0;
-    }
-    if !(1..=31).contains(&day) {
-        day = 1;
-    }
-    if !(1..=12).contains(&month) {
-        month = 1;
-    }
-    let mut year = 0u16;
-    let mut source = 0u8;
-    let mut register = 0u8;
-    if century_register != 0 {
-        let century = normalize(raw.century, binary);
-        if (19..=99).contains(&century) {
-            year = u16::from(century) * 100 + u16::from(year_two);
-            source = 1;
-            register = century_register;
-        }
-    }
-    if year == 0 && century_register == 0 {
-        let century = normalize(read(CENTURY_FALLBACK), binary);
-        if (19..=99).contains(&century) {
-            year = u16::from(century) * 100 + u16::from(year_two);
-            source = 2;
-            register = CENTURY_FALLBACK;
-        }
-    }
-    if year == 0 {
-        year = if year_two >= 80 {
-            1900 + u16::from(year_two)
-        } else {
-            2000 + u16::from(year_two)
-        };
-    }
-    DateTime {
-        year,
-        valid: (1980..=2099).contains(&year)
-            && (1..=12).contains(&month)
-            && (1..=31).contains(&day),
-        month,
-        day,
-        weekday,
-        hour,
-        minute,
-        second,
-        century_register: register,
-        century_source: source,
-    }
-}
-pub fn seconds_since_midnight(value: DateTime) -> u32 {
-    u32::from(value.hour) * 3600 + u32::from(value.minute) * 60 + u32::from(value.second)
-}
-pub fn days_in_month(year: u16, month: u8) -> u8 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    }
-}
-pub fn valid_date_time(value: DateTime) -> bool {
-    value.valid
-        && (1980..=2099).contains(&value.year)
-        && (1..=12).contains(&value.month)
-        && value.day >= 1
-        && value.day <= days_in_month(value.year, value.month)
-        && value.hour <= 23
-        && value.minute <= 59
-        && value.second <= 59
-}
-pub fn write_date_time(century_register: u8, value: DateTime) -> bool {
+pub fn write_date_time(requested_century: u8, mut value: DateTime) -> bool {
     if !valid_date_time(value) {
         return false;
     }
-    wait_stable();
-    let status = read(0x0b);
+    let guard = owner::rtc_guard();
+    if read(&guard, 0x0a) & UIP != 0 || read(&guard, 0x0d) & 0x80 == 0 {
+        return false;
+    }
+    let status = read(&guard, 0x0b);
+    if status & SET != 0 {
+        return false;
+    }
+    let (register, source) = century(requested_century);
     let binary = status & 4 != 0;
+    value.weekday = calendar::weekday(value);
+    value.century_register = register;
+    value.century_source = source;
     let hour = if status & 2 != 0 {
         encode(value.hour, binary)
     } else {
-        let pm = value.hour >= 12;
-        let mut hour = value.hour % 12;
-        if hour == 0 {
-            hour = 12;
-        }
-        let mut encoded = encode(hour, binary);
-        if pm {
-            encoded |= 0x80;
-        }
-        encoded
+        let hour = value.hour % 12;
+        encode(if hour == 0 { 12 } else { hour }, binary) | if value.hour >= 12 { 0x80 } else { 0 }
     };
-    let weekday = if value.weekday <= 6 {
-        value.weekday + 1
-    } else {
-        value.weekday
+    let expected = Raw {
+        second: encode(value.second, binary),
+        minute: encode(value.minute, binary),
+        hour,
+        weekday: encode(value.weekday + 1, binary),
+        day: encode(value.day, binary),
+        month: encode(value.month, binary),
+        year: encode((value.year % 100) as u8, binary),
+        century: encode((value.year / 100) as u8, binary),
+        // MC146818/QEMU clears UIE in SET mode. Mask it explicitly so the
+        // frozen readback also agrees on PCHs that retain the writable bit.
+        status: (status | SET) & !UPDATE_IRQ,
     };
-    let century = if century_register != 0 {
-        century_register
-    } else {
-        CENTURY_FALLBACK
-    };
-    write(0, encode(value.second, binary));
-    write(2, encode(value.minute, binary));
-    write(4, hour);
-    write(6, encode(weekday, binary));
-    write(7, encode(value.day, binary));
-    write(8, encode(value.month, binary));
-    write(9, encode((value.year % 100) as u8, binary));
-    write(century, encode((value.year / 100) as u8, binary));
-    true
-}
-const _: () = {
-    assert!(core::mem::size_of::<DateTime>() == 12);
-    assert!(core::mem::offset_of!(DateTime, valid) == 2);
-    assert!(core::mem::offset_of!(DateTime, century_source) == 10);
-};
-/// # Safety
-/// Caller owns the CMOS port transaction and one aligned writable C output.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_rtc_read(century: u8, output: *mut DateTime) {
-    unsafe { output.write(read_date_time(century)) };
-}
-/// # Safety
-/// Caller owns the CMOS port transaction and an initialized resident C input.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_rtc_write(century: u8, value: *const DateTime) -> bool {
-    write_date_time(century, unsafe { value.read() })
-}
-/// # Safety
-/// Caller owns one initialized resident read-only C value until return.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_rtc_value(operation: u8, value: *const DateTime) -> u32 {
-    let value = unsafe { value.read() };
-    match operation {
-        0 => seconds_since_midnight(value),
-        1 => u32::from(valid_date_time(value)),
-        _ => panic!("Invalid private calendar operation"),
+    // After the first hardware mutation a failed write cannot leave an older
+    // cached generation valid. Restore the original control byte on every exit.
+    unsafe {
+        (*STATE.0.get()).invalidate();
     }
+    write(&guard, 0x0b, expected.status);
+    let frozen = read(&guard, 0x0b) == expected.status && read(&guard, 0x0a) & UIP == 0;
+    let mut verified = false;
+    if frozen {
+        write(&guard, 0, expected.second);
+        write(&guard, 2, expected.minute);
+        write(&guard, 4, expected.hour);
+        write(&guard, 6, expected.weekday);
+        write(&guard, 7, expected.day);
+        write(&guard, 8, expected.month);
+        write(&guard, 9, expected.year);
+        write(&guard, register, expected.century);
+        verified = raw(&guard, register) == expected;
+    }
+    write(&guard, 0x0b, status);
+    verified &= read(&guard, 0x0b) == status;
+    if verified {
+        let now = monotonic::now_nanoseconds();
+        unsafe {
+            (*STATE.0.get()).publish(now, requested_century, Some(value));
+        }
+    }
+    verified
 }
+
+#[cfg(test)]
+#[path = "rtc/tests.rs"]
+mod tests;
