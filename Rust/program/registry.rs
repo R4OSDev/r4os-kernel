@@ -45,9 +45,9 @@ pub fn lock() -> bool {
 pub fn unlock() {
     unsafe { sync_locks::r4os_rust_sync_mutex((*state()).mutex, 2, 0) };
 }
-struct Guard;
+pub(super) struct Guard;
 impl Guard {
-    fn acquire() -> Option<Self> {
+    pub(super) fn acquire() -> Option<Self> {
         if lock() { Some(Self) } else { None }
     }
 }

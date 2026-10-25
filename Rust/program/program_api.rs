@@ -3,6 +3,7 @@
 use super::{
     console::{self, Lease},
     context, exit_state, launch, payload, payload_types as t, process, process_data, registry,
+    registry::Guard as Registry,
     util,
 };
 use crate::{
@@ -28,17 +29,6 @@ const ARGS: usize = 128;
 pub struct Target {
     pub drive: *mut Drive,
     pub path: Bytes,
-}
-struct Registry;
-impl Registry {
-    fn acquire() -> Option<Self> {
-        if registry::lock() { Some(Self) } else { None }
-    }
-}
-impl Drop for Registry {
-    fn drop(&mut self) {
-        registry::unlock()
-    }
 }
 fn separator(value: u8) -> bool {
     matches!(value, b'/' | b'\\')
@@ -297,12 +287,26 @@ pub unsafe extern "C" fn r4os_rust_program_api_window(
             if gui.is_null() {
                 return -10;
             }
+            // The exact lease survives this wait. Publish the visible value
+            // and its epoch together; never wait for Registry under Guard(0).
+            let Some(_registry) = Registry::acquire() else {
+                return -5;
+            };
+            if !registry::running((*lease.0.slot).state)
+                || AtomicBool::from_ptr(ptr::addr_of_mut!((*lease.0.instance).done))
+                    .load(Ordering::Acquire)
+            {
+                return -4;
+            }
             let _guard = Guard::acquire(0);
-            AtomicI32::from_ptr(ptr::addr_of_mut!((*gui).window_id))
-                .store(value, Ordering::Release);
+            let old = AtomicI32::from_ptr(ptr::addr_of_mut!((*gui).window_id))
+                .swap(value, Ordering::AcqRel);
             (*gui).window_info.window_id = value;
             AtomicBool::from_ptr(ptr::addr_of_mut!((*gui).start_attach_pending))
                 .store(false, Ordering::Release);
+            if old != value {
+                registry::epoch();
+            }
             0
         } else {
             process::r4os_rust_program_process_signal();
@@ -317,10 +321,21 @@ pub unsafe extern "C" fn r4os_rust_program_api_window(
             if gui.is_null() {
                 return -3;
             }
+            let Some(_registry) = Registry::acquire() else {
+                return -1;
+            };
+            if !registry::running((*lease.0.slot).state)
+                || AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).done)).load(Ordering::Acquire)
+            {
+                return -2;
+            }
             let _guard = Guard::acquire(0);
-            AtomicI32::from_ptr(ptr::addr_of_mut!((*gui).window_id))
-                .store(value, Ordering::Release);
+            let old = AtomicI32::from_ptr(ptr::addr_of_mut!((*gui).window_id))
+                .swap(value, Ordering::AcqRel);
             (*gui).window_info.window_id = value;
+            if old != value {
+                registry::epoch();
+            }
             0
         }
     }
@@ -336,7 +351,12 @@ pub extern "C" fn r4os_rust_program_api_console_host(id: u32, host: u32) -> i32 
             return -1;
         };
         let instance = lease.0.instance;
-        if AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).done)).load(Ordering::Acquire) {
+        let Some(_registry) = Registry::acquire() else {
+            return -1;
+        };
+        if !registry::running((*lease.0.slot).state)
+            || AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).done)).load(Ordering::Acquire)
+        {
             return -2;
         }
         if (*instance).app_class != 0 {
@@ -346,10 +366,14 @@ pub extern "C" fn r4os_rust_program_api_console_host(id: u32, host: u32) -> i32 
             return -4;
         }
         let console = payload::console(instance);
+        let changed = (*console).host != host;
         (*console).host = host;
         (*console).revision = (*console).revision.wrapping_add(1);
         if (*console).revision == 0 {
             (*console).revision = 1;
+        }
+        if changed {
+            registry::epoch();
         }
         0
     }

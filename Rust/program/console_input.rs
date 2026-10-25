@@ -287,14 +287,13 @@ struct Selected {
     lease: Option<Lease>,
     keyboard: bool,
 }
-unsafe fn selected() -> Result<Selected, i32> {
+// Copy the exact target before a pin/Registry wait. A redirected console must
+// never be kept as a cooperative raw pointer across that new wait.
+pub(super) unsafe fn target_handle() -> Option<(contract::ProgramProcessHandle, bool)> {
     unsafe {
         let source = context::current();
         if source.is_null() || (*source).app_class != 0 {
-            return Ok(Selected {
-                lease: None,
-                keyboard: true,
-            });
+            return None;
         }
         let source_console = payload::console(source);
         let redirected = (*source_console).io_target_id != 0;
@@ -309,7 +308,12 @@ unsafe fn selected() -> Result<Selected, i32> {
         } else {
             None
         };
-        let Some(handle) = handle else {
+        handle.map(|handle| (handle, redirected))
+    }
+}
+unsafe fn selected() -> Result<Selected, i32> {
+    unsafe {
+        let Some((handle, redirected)) = target_handle() else {
             return Ok(Selected {
                 lease: None,
                 keyboard: true,

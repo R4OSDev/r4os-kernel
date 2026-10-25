@@ -1724,6 +1724,9 @@ pub unsafe extern "C" fn r4os_rust_program_console_host(
         if super::threads::compute_worker() {
             return 0;
         }
+        if op == 5 {
+            return request_desktop();
+        }
         let instance = super::console_input::current();
         match op {
             0 => i32::from(!instance.is_null()),
@@ -1762,20 +1765,41 @@ pub unsafe extern "C" fn r4os_rust_program_console_host(
                     i32::try_from((*payload::console(instance)).host).expect("Console host")
                 }
             }
-            5 => {
-                if instance.is_null()
-                    || (*instance).role != 2
-                    || (*payload::console(instance)).host != 2
-                {
-                    return 0;
-                }
-                AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).desktop_requested))
-                    .store(true, Ordering::Release);
-                revision(instance, true, false);
-                1
-            }
             _ => unreachable!(),
         }
+    }
+}
+unsafe fn request_desktop() -> i32 {
+    unsafe {
+        let Some((handle, _)) = super::console_input::target_handle() else {
+            return 0;
+        };
+        let Some(lease) = Lease::handle(handle) else {
+            return 0;
+        };
+        let instance = lease.0.instance;
+        {
+            let Some(_registry) = registry::Guard::acquire() else {
+                return 0;
+            };
+            if !registry::running((*lease.0.slot).state)
+                || AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).done)).load(Ordering::Acquire)
+                || (*instance).role != 2
+                || (*instance).app_class != 0
+                || (*payload::console(instance)).host != 2
+            {
+                return 0;
+            }
+            if !AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).desktop_requested))
+                .swap(true, Ordering::AcqRel)
+            {
+                registry::epoch();
+            }
+        }
+        // Sink notification can enter other owners. The exact target stays
+        // pinned, while Registry has already published and been released.
+        revision(instance, true, false);
+        1
     }
 }
 const _: () = {
