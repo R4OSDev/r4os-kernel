@@ -2,6 +2,7 @@
 //! the sole registry, image, resource and resolver owners directly.
 pub mod boot;
 pub mod file;
+mod file_stats;
 pub mod format;
 pub mod r4d;
 pub mod r4m;

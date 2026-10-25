@@ -301,12 +301,24 @@ struct Reader {
     size: usize,
     windows: [file::Window; 2],
     stamp: u64,
+    totals: file::MetadataTotals,
+}
+// Fields are dropped in declaration order: publish before freeing scratch.
+struct ReaderWorkspace {
+    _statistics: file::MetadataPublication,
+    storage: Scratch<Reader>,
+}
+impl ReaderWorkspace {
+    fn as_mut_ptr(&self) -> *mut Reader {
+        self.storage.as_mut_ptr()
+    }
 }
 impl Reader {
-    unsafe fn create(source: *const file::Source) -> Option<Scratch<Self>> {
+    unsafe fn create(source: *const file::Source) -> Option<ReaderWorkspace> {
         let workspace = Scratch::<Self>::new()?;
         let reader = workspace.as_mut_ptr();
         unsafe {
+            ptr::addr_of_mut!((*reader).totals).write(file::MetadataTotals::EMPTY);
             ptr::addr_of_mut!((*reader).size).write((*source).entry.size as usize);
             ptr::copy_nonoverlapping(source, ptr::addr_of_mut!((*reader).source), 1);
             file::r4os_rust_module_file_reset(
@@ -314,7 +326,10 @@ impl Reader {
                 ptr::addr_of_mut!((*reader).stamp),
             );
         }
-        Some(workspace)
+        Some(ReaderWorkspace {
+            _statistics: unsafe { file::MetadataPublication::new(ptr::addr_of!((*reader).totals)) },
+            storage: workspace,
+        })
     }
 }
 #[repr(C)]
@@ -365,6 +380,7 @@ unsafe extern "C" fn cached(
         file::r4os_rust_module_file_cached(
             ptr::addr_of_mut!((*reader).windows).cast(),
             ptr::addr_of_mut!((*reader).stamp),
+            ptr::addr_of_mut!((*reader).totals),
             (*reader).size,
             offset,
             out,

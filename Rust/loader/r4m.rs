@@ -1,7 +1,7 @@
 //! Original R4M0 metadata/table/relocation reader. Wire acceptance and
 //! ordered failures stay unchanged; actual file I/O uses the caller cache.
 use crate::fs::vfs_types::Bytes;
-use core::{ffi::c_void, ptr};
+use core::{ffi::c_void, mem::MaybeUninit, ptr};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Header {
@@ -466,21 +466,77 @@ pub extern "C" fn r4os_rust_r4m_windows(count: usize) -> usize {
         1 + (count - 1) / (super::file::WINDOW_SIZE / 24)
     }
 }
+// Seventeen records occupy 408 bytes. Ten batches fit the same 170-record
+// metadata window without adding another heap allocation or a 4-KB stack copy.
+const RELOCATION_BATCH: usize = 17;
+pub(crate) struct RelocationCursor {
+    index: usize,
+    first: usize,
+    count: usize,
+    bytes: [MaybeUninit<u8>; RELOCATION_BATCH * 24],
+}
+impl RelocationCursor {
+    pub(crate) const EMPTY: Self = Self {
+        index: 0,
+        first: 0,
+        count: 0,
+        bytes: [MaybeUninit::uninit(); RELOCATION_BATCH * 24],
+    };
+}
 /// # Safety
-/// Resident immutable I/O/header and exclusive exact cursor/output. Failed
-/// reads leave cursor unchanged; no mutable reference spans a callback.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_r4m_next(
+/// Resident immutable I/O/header and private cursor/output for one exact file.
+/// Failed reads leave the current record pending; no exclusive Rust borrow
+/// spans the callback. Only successfully filled bytes reach the original decoder.
+pub(crate) unsafe fn next_relocation(
     io: *const Io,
     h: *const Header,
-    index: *mut usize,
+    cursor: *mut RelocationCursor,
     out: *mut RelocationRecord,
 ) -> bool {
-    let current = unsafe { index.read() };
-    if !unsafe { record(&*io, h.read(), current, 4, out.cast()) } {
+    let current = unsafe { (*cursor).index };
+    let h = unsafe { h.read() };
+    let io = unsafe { &*io };
+    if current >= h.reloc_count as usize {
         return false;
     }
-    unsafe { index.write(current + 1) };
+    if current >= unsafe { (*cursor).first + (*cursor).count } {
+        let count = RELOCATION_BATCH.min(h.reloc_count as usize - current);
+        let Some(offset) = current
+            .checked_mul(24)
+            .and_then(|v| v.checked_add(h.reloc_off as usize))
+        else {
+            return false;
+        };
+        if !range(io.file_size, offset, count * 24) {
+            return false;
+        }
+        // Invalidate before I/O: a failed/partial callback cannot publish bytes.
+        unsafe {
+            (*cursor).count = 0;
+        }
+        if !unsafe {
+            (io.read)(
+                io.context,
+                offset,
+                ptr::addr_of_mut!((*cursor).bytes).cast(),
+                count * 24,
+            )
+        } {
+            return false;
+        }
+        unsafe {
+            (*cursor).first = current;
+            (*cursor).count = count;
+        }
+    }
+    let local = (current - unsafe { (*cursor).first }) * 24;
+    let raw = unsafe {
+        core::slice::from_raw_parts(ptr::addr_of!((*cursor).bytes).cast::<u8>().add(local), 24)
+    };
+    unsafe {
+        out.write(relocation(raw));
+        (*cursor).index = current + 1;
+    }
     true
 }
 fn next(meta: &[u8], offset: &mut usize) -> Span {
@@ -637,3 +693,7 @@ const _: () = {
     assert!(core::mem::offset_of!(RelocationRecord, target_offset) == 16);
     assert!(core::mem::offset_of!(RelocationRecord, addend) == 20);
 };
+
+#[cfg(test)]
+#[path = "r4m_test.rs"]
+mod tests;

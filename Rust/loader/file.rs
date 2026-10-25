@@ -1,6 +1,7 @@
 //! Original module file streaming and bounded two-window metadata owner.
 use crate::{
     arch::runtime::RuntimeGuard,
+    boot::instrumentation,
     fs::{drive, request, vfs, vfs_types as t},
 };
 use core::{
@@ -12,62 +13,8 @@ use core::{
 };
 pub const WINDOW_SIZE: usize = 4096;
 pub const WINDOW_COUNT: usize = 2;
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Stats {
-    pub active_buffers: u64,
-    pub reserved_bytes: u64,
-    pub committed_bytes: u64,
-    pub peak_reserved_bytes: u64,
-    pub peak_committed_bytes: u64,
-    pub full_reads: u64,
-    pub range_reads: u64,
-    pub range_read_bytes: u64,
-    pub metadata_reader_initializations: u64,
-    pub metadata_logical_reads: u64,
-    pub metadata_logical_bytes: u64,
-    pub metadata_window_hits: u64,
-    pub metadata_window_fills: u64,
-    pub metadata_window_fill_bytes: u64,
-    pub metadata_direct_reads: u64,
-    pub metadata_direct_bytes: u64,
-    pub reserve_failures: u64,
-    pub commit_failures: u64,
-    pub read_failures: u64,
-    pub short_reads: u64,
-    pub release_failures: u64,
-    pub pressure_reclaim_attempts: u64,
-    pub pressure_reclaimed_frames: u64,
-    pub pressure_failures: u64,
-}
-impl Stats {
-    const EMPTY: Self = Self {
-        active_buffers: 0,
-        reserved_bytes: 0,
-        committed_bytes: 0,
-        peak_reserved_bytes: 0,
-        peak_committed_bytes: 0,
-        full_reads: 0,
-        range_reads: 0,
-        range_read_bytes: 0,
-        metadata_reader_initializations: 0,
-        metadata_logical_reads: 0,
-        metadata_logical_bytes: 0,
-        metadata_window_hits: 0,
-        metadata_window_fills: 0,
-        metadata_window_fill_bytes: 0,
-        metadata_direct_reads: 0,
-        metadata_direct_bytes: 0,
-        reserve_failures: 0,
-        commit_failures: 0,
-        read_failures: 0,
-        short_reads: 0,
-        release_failures: 0,
-        pressure_reclaim_attempts: 0,
-        pressure_reclaimed_frames: 0,
-        pressure_failures: 0,
-    };
-}
+pub(crate) use super::file_stats::MetadataTotals;
+pub use super::file_stats::Stats;
 struct Counters(UnsafeCell<Stats>);
 // SAFETY: Only bounded updates/snapshots under the existing runtime owner.
 unsafe impl Sync for Counters {}
@@ -76,6 +23,25 @@ static EXECUTION_DRIVE: AtomicU16 = AtomicU16::new(256);
 fn update(f: impl FnOnce(&mut Stats)) {
     let _owner = RuntimeGuard::acquire();
     unsafe { f(&mut *STATS.0.get()) };
+}
+/// Publishes only completed reader work. Must be dropped before the resident
+/// reader storage or its task pin is released, including all error returns.
+#[must_use]
+pub(crate) struct MetadataPublication(*const MetadataTotals);
+impl MetadataPublication {
+    /// # Safety
+    /// Exact initialized private totals remain resident through this guard.
+    pub(crate) unsafe fn new(totals: *const MetadataTotals) -> Self {
+        Self(totals)
+    }
+}
+impl Drop for MetadataPublication {
+    fn drop(&mut self) {
+        if instrumentation::DETAILED {
+            let totals = unsafe { self.0.read() };
+            update(|s| totals.publish(s));
+        }
+    }
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -304,13 +270,14 @@ pub unsafe extern "C" fn r4os_rust_module_file_reset(windows: *mut Window, stamp
     }
 }
 /// # Safety
-/// Two caller-owned resident windows/stamp; no exclusive Rust window borrow
+/// Two caller-owned resident windows/stamp/totals; no exclusive Rust window borrow
 /// spans read callbacks or waits. Callback initializes exactly its reported
 /// prefix. Output is disjoint from windows and readable caller metadata.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_module_file_cached(
+pub(crate) unsafe extern "C" fn r4os_rust_module_file_cached(
     windows: *mut Window,
     stamp: *mut u64,
+    totals: *mut MetadataTotals,
     file_size: usize,
     offset: usize,
     out: *mut u8,
@@ -318,10 +285,11 @@ pub unsafe extern "C" fn r4os_rust_module_file_cached(
     io: *const Io,
 ) -> bool {
     let io = unsafe { &*io };
-    update(|s| {
-        s.metadata_logical_reads = s.metadata_logical_reads.saturating_add(1);
-        s.metadata_logical_bytes = s.metadata_logical_bytes.saturating_add(len as u64);
-    });
+    if instrumentation::DETAILED {
+        let s = unsafe { &mut *totals };
+        s.logical_reads = s.logical_reads.saturating_add(1);
+        s.logical_bytes = s.logical_bytes.saturating_add(len as u64);
+    }
     if len == 0 {
         return offset <= file_size;
     }
@@ -331,10 +299,11 @@ pub unsafe extern "C" fn r4os_rust_module_file_cached(
         return false;
     }
     if len > WINDOW_SIZE {
-        update(|s| {
-            s.metadata_direct_reads = s.metadata_direct_reads.saturating_add(1);
-            s.metadata_direct_bytes = s.metadata_direct_bytes.saturating_add(len as u64);
-        });
+        if instrumentation::DETAILED {
+            let s = unsafe { &mut *totals };
+            s.direct_reads = s.direct_reads.saturating_add(1);
+            s.direct_bytes = s.direct_bytes.saturating_add(len as u64);
+        }
         let result = unsafe { (io.read)(io.context, offset, out, len) };
         if !result.present {
             return false;
@@ -356,7 +325,10 @@ pub unsafe extern "C" fn r4os_rust_module_file_cached(
                 len,
             );
         }
-        update(|s| s.metadata_window_hits = s.metadata_window_hits.saturating_add(1));
+        if instrumentation::DETAILED {
+            let s = unsafe { &mut *totals };
+            s.window_hits = s.window_hits.saturating_add(1);
+        }
         unsafe { touch(windows, stamp, index) };
         return true;
     }
@@ -377,12 +349,11 @@ pub unsafe extern "C" fn r4os_rust_module_file_cached(
     if !result.present {
         return false;
     }
-    update(|s| {
-        s.metadata_window_fills = s.metadata_window_fills.saturating_add(1);
-        s.metadata_window_fill_bytes = s
-            .metadata_window_fill_bytes
-            .saturating_add(result.len as u64);
-    });
+    if instrumentation::DETAILED {
+        let s = unsafe { &mut *totals };
+        s.window_fills = s.window_fills.saturating_add(1);
+        s.window_fill_bytes = s.window_fill_bytes.saturating_add(result.len as u64);
+    }
     if result.len < len {
         short_read(io.name, io.verbose, offset, len, result.len);
         return false;

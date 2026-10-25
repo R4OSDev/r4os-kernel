@@ -531,10 +531,12 @@ fn relocations(
         verbose: true,
     };
     let io = io(&mut c, r.file_size);
-    let mut index = 0;
+    let mut cursor = r4m::RelocationCursor::EMPTY;
     for _ in 0..r.header.reloc_count {
         let mut v = MaybeUninit::uninit();
-        if !unsafe { r4m::r4os_rust_r4m_next(&io, &r.header, &mut index, v.as_mut_ptr()) } {
+        if !unsafe {
+            r4m::next_relocation(&io, &r.header, ptr::addr_of_mut!(cursor), v.as_mut_ptr())
+        } {
             return None;
         }
         relocate(

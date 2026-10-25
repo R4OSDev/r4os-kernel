@@ -58,6 +58,7 @@ struct Reader {
     file_size: usize,
     windows: [file::Window; 2],
     stamp: u64,
+    totals: file::MetadataTotals,
 }
 struct ReadContext {
     source: *const file::Source,
@@ -73,17 +74,22 @@ unsafe extern "C" fn range_read(
     let c = unsafe { &*raw.cast::<ReadContext>() };
     unsafe { file::r4os_rust_module_file_range(c.source, offset, out, len, c.name, c.verbose) }
 }
-unsafe fn reader_init(reader: *mut Reader, source: *const file::Source) {
+unsafe fn reader_init(
+    reader: *mut Reader,
+    source: *const file::Source,
+) -> file::MetadataPublication {
     unsafe {
         // Preserve the original source identity directly in its resident
         // scratch field. A by-value 936-byte temporary would stay in every
         // recursive dependency frame on the bounded kernel stack.
+        ptr::addr_of_mut!((*reader).totals).write(file::MetadataTotals::EMPTY);
         ptr::addr_of_mut!((*reader).file_size).write((*source).entry.size as usize);
         ptr::copy_nonoverlapping(source, ptr::addr_of_mut!((*reader).source), 1);
         file::r4os_rust_module_file_reset(
             ptr::addr_of_mut!((*reader).windows).cast(),
             ptr::addr_of_mut!((*reader).stamp),
         );
+        file::MetadataPublication::new(ptr::addr_of!((*reader).totals))
     }
 }
 unsafe fn read(
@@ -109,6 +115,7 @@ unsafe fn read(
         file::r4os_rust_module_file_cached(
             ptr::addr_of_mut!((*reader).windows).cast(),
             ptr::addr_of_mut!((*reader).stamp),
+            ptr::addr_of_mut!((*reader).totals),
             (*reader).file_size,
             offset,
             out,
@@ -227,7 +234,7 @@ pub(crate) unsafe fn metadata_probe(
     name: &[u8],
 ) -> Option<usize> {
     let reader = ResidentScratch::<Reader>::new()?;
-    unsafe { reader_init(reader.as_mut_ptr(), source) };
+    let _statistics = unsafe { reader_init(reader.as_mut_ptr(), source) };
     let h = unsafe { header(reader.as_mut_ptr(), expected, name) }?;
     unsafe { metadata(reader.as_mut_ptr(), &h, output, name) }.map(|s| s.len())
 }
@@ -546,7 +553,7 @@ unsafe fn relocations(
         import_count: imports.len(),
     };
     let mut stats = RelocStats::default();
-    let mut cursor = 0;
+    let mut cursor = r4m::RelocationCursor::EMPTY;
     for i in 0..h.reloc_count as usize {
         let mut record = MaybeUninit::<r4m::RelocationRecord>::uninit();
         let ok = if let Some(data) = data {
@@ -557,7 +564,7 @@ unsafe fn relocations(
                 name: span(b"r4m-relocation-table"),
             };
             let io = unsafe { io(reader, &mut context, b"r4m-relocation-table") };
-            unsafe { r4m::r4os_rust_r4m_next(&io, h, &mut cursor, record.as_mut_ptr()) }
+            unsafe { r4m::next_relocation(&io, h, ptr::addr_of_mut!(cursor), record.as_mut_ptr()) }
         };
         if !ok {
             return None;
@@ -997,6 +1004,7 @@ pub unsafe extern "C" fn r4os_rust_mod_prepare(
     let Some(mut lease) = (unsafe { Lease::begin(peers) }) else {
         return false;
     };
+    let mut statistics = None;
     let default = unsafe { bytes(default) };
     let path = unsafe { bytes(path) };
     let (h, importer) = if source.is_null() {
@@ -1031,7 +1039,7 @@ pub unsafe extern "C" fn r4os_rust_mod_prepare(
             return report(b"[MOD] reserved ModuleKind: ", default);
         }
         let scratch = unsafe { scratch(&lease.load) };
-        unsafe { reader_init(ptr::addr_of_mut!((*scratch).reader), source) };
+        statistics = Some(unsafe { reader_init(ptr::addr_of_mut!((*scratch).reader), source) });
         let table = unsafe { ptr::addr_of_mut!((*scratch).tables) };
         if !unsafe {
             tables(
@@ -1089,6 +1097,7 @@ pub unsafe extern "C" fn r4os_rust_mod_prepare(
     } {
         return false;
     }
+    drop(statistics);
     unsafe { ptr::write(out, ptr::read(&lease.load)) };
     lease.transferred = true;
     true
@@ -1135,7 +1144,7 @@ unsafe fn probe(source: *const file::Source, file_name: &[u8], out: *mut Pending
     let Some(reader) = ResidentScratch::<Reader>::new() else {
         return report(b"[MOD] metadata reader allocation failed: ", file_name);
     };
-    unsafe { reader_init(reader.as_mut_ptr(), source) };
+    let _statistics = unsafe { reader_init(reader.as_mut_ptr(), source) };
     let Some(h) = (unsafe { header(reader.as_mut_ptr(), 2, b"r4l-metadata-probe") }) else {
         return false;
     };
@@ -1309,10 +1318,8 @@ unsafe fn resolve_pending(
     };
     let scratch = unsafe { scratch(&lease.load) };
     let source = unsafe { ptr::addr_of!((*p).source).cast::<file::Source>() };
-    unsafe {
-        reader_init(ptr::addr_of_mut!((*scratch).reader), source);
-        (*scratch).reader.file_size = (*p).file_size;
-    };
+    let statistics = unsafe { reader_init(ptr::addr_of_mut!((*scratch).reader), source) };
+    unsafe { (*scratch).reader.file_size = (*p).file_size };
     let table = unsafe { ptr::addr_of_mut!((*scratch).tables) };
     if !unsafe {
         tables(
@@ -1362,7 +1369,9 @@ unsafe fn resolve_pending(
             resolved(&lease.load, h.import_count),
             peers,
         )
-    } && unsafe { lease.commit() };
+    };
+    drop(statistics);
+    let success = success && unsafe { lease.commit() };
     super::performance::add_r4l_load_ticks(start);
     unsafe {
         (*p).state = if success { 3 } else { 4 };
