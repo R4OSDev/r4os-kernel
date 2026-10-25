@@ -49,6 +49,10 @@ pub struct Mutex {
     pub queue: WaitQueue,
     pub donation_rank: u8,
     pub handoff_pending: bool,
+    // Private kernel record. The held-lock count retains this exact owner;
+    // waiter nodes retain this mutex until their PI edge has been removed.
+    pub(crate) owner_task: *mut super::task::task_types::Task,
+    pub(crate) waiter_ranks: [usize; 4],
 }
 #[repr(C)]
 pub struct UnwindGuard {
@@ -140,6 +144,8 @@ impl Mutex {
         queue: WaitQueue::EMPTY,
         donation_rank: 255,
         handoff_pending: false,
+        owner_task: core::ptr::null_mut(),
+        waiter_ranks: [0; 4],
     };
 }
 impl WaitRequest {
@@ -178,7 +184,7 @@ const _: () = {
     assert!(core::mem::size_of::<Event>() == 48);
     assert!(core::mem::size_of::<Completion>() == 48);
     assert!(core::mem::size_of::<Semaphore>() == 48);
-    assert!(core::mem::size_of::<Mutex>() == 88);
+    assert!(core::mem::size_of::<Mutex>() == 128);
     assert!(core::mem::size_of::<UnwindGuard>() == 80);
     assert!(core::mem::size_of::<WaitRequest>() == 72);
     assert!(core::mem::size_of::<WaitSummary>() == 96);

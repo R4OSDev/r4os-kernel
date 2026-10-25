@@ -24,6 +24,9 @@ pub(super) fn enter() -> u64 {
     flags
 }
 pub(super) fn leave(flags: u64) {
+    unsafe {
+        super::mutex_pi::pump();
+    }
     preempt_enable();
     runtime::restore_runtime(flags);
 }
@@ -38,6 +41,12 @@ unsafe fn wake(target: *mut Task, result: WaitResult) -> bool {
 /// Queue storage is never touched after park: the producer may already close
 /// and free it once enrollment has detached. Only the running exact Task lives.
 pub(super) unsafe fn wait(queue: *mut WaitQueue, request: &WaitRequest) -> WaitResult {
+    unsafe { wait_impl(queue, request, ptr::null_mut()) }
+}
+pub(super) unsafe fn wait_mutex(mutex: *mut Mutex, request: &WaitRequest) -> WaitResult {
+    unsafe { wait_impl(ptr::addr_of_mut!((*mutex).queue), request, mutex) }
+}
+unsafe fn wait_impl(queue: *mut WaitQueue, request: &WaitRequest, mutex: *mut Mutex) -> WaitResult {
     unsafe {
         let target = current();
         if !request.consume_runtime && request.release.is_none() && target.is_null() {
@@ -95,11 +104,17 @@ pub(super) unsafe fn wait(queue: *mut WaitQueue, request: &WaitRequest) -> WaitR
             request.reason.len,
         ) as *mut Task;
         if blocked.is_null() {
-            wait_node::detach(ptr::addr_of_mut!((*c).wait_node));
+            super::mutex_pi::detach(target);
             leave(flags);
             note(super::sync_stats::WaitMetric::Drops);
             return WaitResult::Failed;
         }
+        if !mutex.is_null() && !super::mutex_pi::bind(target, mutex) {
+            // Failed cycle/depth validation is still an exact completed wait.
+            // Repair through the normal fast-wake park path and preserve IF.
+            wake(target, WaitResult::Failed);
+        }
+        super::mutex_pi::pump();
         // End queue/record use before handing the outer admission directly
         // to dispatch. A waker cannot interleave until the real saved switch.
         preempt_enable();
@@ -120,7 +135,7 @@ pub(super) unsafe fn pop_waiter(queue: *mut WaitQueue, directed: bool) -> *mut w
     unsafe {
         let core = ptr::addr_of_mut!((*queue).core);
         if !directed {
-            return wait_node::pop_front(core);
+            return take_node((*core).head);
         }
         let head = (*core).head;
         if head.is_null() {
@@ -145,13 +160,30 @@ pub(super) unsafe fn pop_waiter(queue: *mut WaitQueue, directed: bool) -> *mut w
             cursor = (*cursor).next;
         }
         if selected.is_null() {
-            return wait_node::pop_front(core);
+            return take_node(head);
         }
         if selected != head {
             note(super::sync_stats::WaitMetric::DirectedFifoBypasses);
         }
-        wait_node::detach(selected);
-        selected
+        take_node(selected)
+    }
+}
+// WaitQueue contains Task nodes. A stale-generation fallback must detach the
+// supplied node only; it may never erase a newer Task's own wait/PI edge.
+unsafe fn take_node(node: *mut wait_node::Node) -> *mut wait_node::Node {
+    unsafe {
+        if node.is_null() {
+            return node;
+        }
+        let task = (*node).owner.cast::<Task>();
+        let c = registry::core(task);
+        if (*c).generation == (*node).owner_generation && node == ptr::addr_of_mut!((*c).wait_node)
+        {
+            super::mutex_pi::detach(task);
+        } else {
+            wait_node::detach(node);
+        }
+        node
     }
 }
 pub(super) unsafe fn pop_wake(queue: *mut WaitQueue, result: WaitResult, directed: bool) -> u32 {

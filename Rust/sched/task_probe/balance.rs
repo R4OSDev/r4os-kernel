@@ -56,7 +56,7 @@ struct Facts {
     since: u64,
     role: (u8, u8),
     budgets: (u32, u16, u32, u16),
-    inherited: [u16; 4],
+    inherited: [u64; 4],
     stack: (u64, u64),
     fpu: (usize, u32),
     unwind: (usize, u32),

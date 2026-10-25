@@ -3,13 +3,12 @@ use super::{
     sync_types::*,
     sync_wait as wait,
     task::{
-        task_lifecycle as lifetime, task_registry as registry,
+        task_registry as registry,
         task_types::{Bytes, HeldLockRecord, State, Task, WaitResult},
     },
 };
 use crate::{arch::runtime, build_config::config, platform::timer, sched::scheduler};
 use core::{ffi::c_void, ptr};
-const NO_RANK: u8 = 255;
 fn current() -> *mut Task {
     scheduler::current().cast()
 }
@@ -140,6 +139,7 @@ unsafe fn mutex_try(m: *mut Mutex) -> bool {
                 (*m).owner_generation = (*c).generation;
                 (*m).depth = 1;
                 (*c).held_lock_count += 1;
+                super::mutex_pi::accept_owner(m, t);
                 record_acquire(t, m.addr() as u64, (*m).name, (*m).rank, (*m).mode);
                 true
             }
@@ -184,44 +184,6 @@ unsafe extern "C" fn mutex_owned(raw: *mut c_void) -> bool {
         (*m).owner != 0 || (*m).owner_generation != 0
     }
 }
-unsafe fn donate(m: *mut Mutex) {
-    unsafe {
-        let t = current();
-        if t.is_null() {
-            return;
-        }
-        let desired = registry::dispatch_rank(t);
-        let flags = wait::enter();
-        let c = registry::core(t);
-        if (*m).owner == 0
-            || (*m).owner_generation == 0
-            || ((*m).owner == (*c).id && (*m).owner_generation == (*c).generation)
-            || desired >= (*m).donation_rank
-        {
-            wait::leave(flags);
-            return;
-        }
-        let owner = lifetime::pin_identity((*m).owner, Some((*m).owner_generation));
-        if owner.is_null() {
-            wait::leave(flags);
-            return;
-        }
-        if desired < registry::dispatch_rank(owner) {
-            note(|s| s.role_inversions = s.role_inversions.wrapping_add(1));
-            if (*m).donation_rank != NO_RANK {
-                registry::remove_donation(owner, (*m).donation_rank);
-                (*m).donation_rank = NO_RANK;
-            }
-            let o = registry::core(owner);
-            if registry::donate((*o).id, (*o).generation, desired) {
-                (*m).donation_rank = desired;
-                note(|s| s.role_donations = s.role_donations.wrapping_add(1));
-            }
-        }
-        lifetime::unpin(owner);
-        wait::leave(flags);
-    }
-}
 pub(crate) unsafe fn mutex_lock(m: *mut Mutex, timeout: u64) -> bool {
     unsafe {
         if mutex_try(m) {
@@ -239,10 +201,9 @@ pub(crate) unsafe fn mutex_lock(m: *mut Mutex, timeout: u64) -> bool {
         };
         let mut remaining = timeout;
         loop {
-            donate(m);
             let request =
                 WaitRequest::predicate(remaining, Text::literal(b"mutex"), mutex_owned, m.cast());
-            if wait::wait(ptr::addr_of_mut!((*m).queue), &request) != WaitResult::Signaled {
+            if wait::wait_mutex(m, &request) != WaitResult::Signaled {
                 note(|s| s.contention_timeouts = s.contention_timeouts.wrapping_add(1));
                 return false;
             }
@@ -285,12 +246,14 @@ unsafe fn mutex_handoff(m: *mut Mutex) {
             (*m).depth = 1;
             (*m).handoff_pending = true;
             (*c).held_lock_count += 1;
+            super::mutex_pi::accept_owner(m, t);
             record_acquire(t, m.addr() as u64, (*m).name, (*m).rank, (*m).mode);
             if wake(t, WaitResult::Signaled) {
                 super::sync_stats::wait_add(super::sync_stats::WaitMetric::WakeOne, 1);
                 super::sync_stats::wait_add(super::sync_stats::WaitMetric::DirectedWakes, 1);
                 return;
             }
+            super::mutex_pi::release_owner(m);
             record_release(t, m.addr() as u64);
             (*c).held_lock_count -= 1;
             (*m).owner = 0;
@@ -316,6 +279,7 @@ pub(crate) unsafe fn mutex_unlock(m: *mut Mutex) -> bool {
         (*m).depth -= 1;
         note(|s| s.releases = s.releases.wrapping_add(1));
         if (*m).depth == 0 {
+            super::mutex_pi::release_owner(m);
             record_release(t, m.addr() as u64);
             if (*c).held_lock_count == 0 {
                 note(|s| s.unlock_mismatches = s.unlock_mismatches.wrapping_add(1));
@@ -325,12 +289,6 @@ pub(crate) unsafe fn mutex_unlock(m: *mut Mutex) -> bool {
             (*m).owner = 0;
             (*m).owner_generation = 0;
             (*m).handoff_pending = false;
-            if (*m).donation_rank != NO_RANK {
-                if registry::remove_donation(t, (*m).donation_rank) {
-                    note(|s| s.role_donation_releases = s.role_donation_releases.wrapping_add(1));
-                }
-                (*m).donation_rank = NO_RANK;
-            }
             mutex_handoff(m);
         }
         wait::leave(flags);

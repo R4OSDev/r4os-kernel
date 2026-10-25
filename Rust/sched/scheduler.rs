@@ -580,6 +580,9 @@ fn next_ready(force_priority: bool) -> Task {
     if !percpu::is_schedulable(percpu::current_index()) {
         return ptr::null_mut();
     }
+    unsafe {
+        super::mutex_pi::pump();
+    }
     refill_ready();
     // Attempt statistics retain their old meaning, but never drive policy.
     change(|s| s.priority_selects = s.priority_selects.wrapping_add(1));
@@ -1305,8 +1308,9 @@ fn wait_until_deadline() {
     let flags = runtime::save_runtime();
     let bsp = percpu::current_index() == 0;
     let due = bsp && poll_timed();
+    let pi_pending = unsafe { super::mutex_pi::pump() };
     refill_ready();
-    if due || ready_count() != 0 {
+    if due || pi_pending || ready_count() != 0 {
         runtime::restore_runtime(flags);
         return;
     }
@@ -1340,8 +1344,9 @@ pub(crate) fn idle_entry_still_empty() -> bool {
     let _owner = runtime::RuntimeGuard::acquire();
     let index = percpu::current_index();
     let due = index == 0 && wake_expired(tick());
+    let pi_pending = unsafe { super::mutex_pi::pump() };
     refill_ready();
-    !due && ready_count() == 0 && idle_switch_complete(index)
+    !due && !pi_pending && ready_count() == 0 && idle_switch_complete(index)
 }
 fn timer_preemption(now: u64, preemptible: bool) -> bool {
     change(|s| {
@@ -1469,6 +1474,9 @@ pub fn on_tick(now: u64, preemptible: bool, secondary: bool) -> bool {
     }
     if !secondary {
         wake_expired(now);
+    }
+    unsafe {
+        super::mutex_pi::pump();
     }
     let result = timer_preemption(now, preemptible);
     warnings(now);

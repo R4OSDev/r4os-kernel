@@ -110,15 +110,8 @@ impl Probe {
         budget_turns: [0; BUDGET],
         budget_stop: false,
         inversion_mutex: Mutex {
-            owner: 0,
-            owner_generation: 0,
-            depth: 0,
-            rank: 10,
-            mode: 0,
             name: Text::literal(b"taskreg-role-inversion"),
-            queue: WaitQueue::EMPTY,
-            donation_rank: 255,
-            handoff_pending: false,
+            ..Mutex::EMPTY
         },
         inversion_owned: false,
         inversion_release: false,

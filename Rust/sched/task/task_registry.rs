@@ -332,7 +332,17 @@ pub(crate) unsafe fn dispatch_rank(task: *mut Task) -> u8 {
     }
 }
 pub(crate) unsafe fn wake_rank(task: *mut Task) -> u8 {
-    unsafe { (*core(task)).role as u8 }
+    unsafe {
+        let c = core(task);
+        let base = (*c).role as u8;
+        if (*c).donation_budget_ticks_remaining != 0
+            && (*c).donation_budget_dispatches_remaining != 0
+        {
+            base.min(inherited_rank(task))
+        } else {
+            base
+        }
+    }
 }
 pub(super) unsafe fn configure_role(task: *mut Task, role: Role) {
     unsafe {
@@ -343,6 +353,9 @@ pub(super) unsafe fn configure_role(task: *mut Task, role: Role) {
         (*c).role_budget_ticks_remaining = ticks;
         (*c).role_budget_dispatches_remaining = dispatches;
         (*c).role_budget_exhausted_recorded = false;
+        // Placement can configure a saved blocked waiter directly, without
+        // adjust_rank (there is no Ready index to rebuild in that case).
+        crate::sched::mutex_pi::changed(task);
     }
 }
 unsafe extern "C" fn ready_before(a: *const c_void, b: *const c_void) -> bool {
@@ -360,6 +373,7 @@ const READY_OFFSET: usize = offset_of!(Task, core) + offset_of!(TaskCore, ready_
 const TIMEOUT_OFFSET: usize = offset_of!(Task, core) + offset_of!(TaskCore, timeout_index);
 unsafe fn adjust_rank(task: *mut Task, old: u8, new: u8) {
     unsafe {
+        crate::sched::mutex_pi::changed(task);
         if old == new {
             return;
         }
@@ -936,7 +950,7 @@ pub(super) unsafe fn finish_wait(
 ) -> u64 {
     unsafe {
         let c = core(task);
-        crate::sched::wait_node::detach(ptr::addr_of_mut!((*c).wait_node));
+        crate::sched::mutex_pi::detach(task);
         let ticks = if (*c).blocked_since_tick == 0 {
             0
         } else {
@@ -971,7 +985,7 @@ pub(super) unsafe fn transition_dead(
 ) {
     unsafe {
         let c = core(task);
-        crate::sched::wait_node::detach(ptr::addr_of_mut!((*c).wait_node));
+        crate::sched::mutex_pi::detach(task);
         unlink_ready(task);
         unlink_timeout(task);
         (*c).state = State::Dead;
@@ -990,30 +1004,62 @@ pub(super) unsafe fn transition_dead(
         bump_epoch();
     }
 }
+/// Replace one exact contribution atomically. The caller retains the live
+/// Task through its held Mutex or its explicit registry admission. The four
+/// tick/dispatch budgets refresh only for a newly stronger best rank, never
+/// for the transient empty state of a remove/add pair or a weaker replacement.
+pub(crate) unsafe fn replace_donation_owned(task: *mut Task, from: u8, to: u8) {
+    unsafe {
+        if from == to {
+            return;
+        }
+        assert!(from == NO_RANK || (from as usize) < ROLE_COUNT);
+        assert!(to == NO_RANK || (to as usize) < ROLE_COUNT);
+        let c = core(task);
+        let old = dispatch_rank(task);
+        let best = inherited_rank(task);
+        if from != NO_RANK {
+            assert!((*c).inherited_rank_counts[from as usize] != 0);
+            (*c).inherited_rank_counts[from as usize] -= 1;
+            (*raw()).donation_released = (*raw()).donation_released.wrapping_add(1);
+        }
+        if to != NO_RANK {
+            (*raw()).donation_requests = (*raw()).donation_requests.wrapping_add(1);
+            // Each held Mutex contributes at most once. Direct donations
+            // reserve u32::MAX slots for all possible held-lock contributions.
+            (*c).inherited_rank_counts[to as usize] = (*c).inherited_rank_counts[to as usize]
+                .checked_add(1)
+                .expect("Mutex donation source count");
+            (*raw()).donation_applied = (*raw()).donation_applied.wrapping_add(1);
+        }
+        let next = inherited_rank(task);
+        if next == NO_RANK {
+            (*c).donation_budget_ticks_remaining = 0;
+            (*c).donation_budget_dispatches_remaining = 0;
+            (*c).donation_budget_exhausted_recorded = false;
+        } else if next < best {
+            (*c).donation_budget_ticks_remaining = 4;
+            (*c).donation_budget_dispatches_remaining = 4;
+            (*c).donation_budget_exhausted_recorded = false;
+        }
+        adjust_rank(task, old, dispatch_rank(task));
+    }
+}
 pub(crate) unsafe fn donate(id: u32, generation: u64, rank: u8) -> bool {
     unsafe {
         if rank as usize >= ROLE_COUNT {
             return false;
         }
-        (*raw()).donation_requests = (*raw()).donation_requests.wrapping_add(1);
         let target = find_identity(id, generation);
         if target.is_null() || matches!((*core(target)).state, State::Unused | State::Dead) {
+            (*raw()).donation_requests = (*raw()).donation_requests.wrapping_add(1);
             return false;
         }
-        let c = core(target);
-        let old = dispatch_rank(target);
-        let best = inherited_rank(target);
-        if (*c).inherited_rank_counts[rank as usize] == u16::MAX {
+        if (*core(target)).inherited_rank_counts[rank as usize] >= u64::MAX - u64::from(u32::MAX) {
+            (*raw()).donation_requests = (*raw()).donation_requests.wrapping_add(1);
             return false;
         }
-        (*c).inherited_rank_counts[rank as usize] += 1;
-        if best == NO_RANK || rank < best {
-            (*c).donation_budget_ticks_remaining = 4;
-            (*c).donation_budget_dispatches_remaining = 4;
-            (*c).donation_budget_exhausted_recorded = false;
-        }
-        (*raw()).donation_applied = (*raw()).donation_applied.wrapping_add(1);
-        adjust_rank(target, old, dispatch_rank(target));
+        replace_donation_owned(target, NO_RANK, rank);
         true
     }
 }
@@ -1022,19 +1068,10 @@ pub(crate) unsafe fn remove_donation(task: *mut Task, rank: u8) -> bool {
         if rank as usize >= ROLE_COUNT || !contains(task) || (*core(task)).state == State::Unused {
             return false;
         }
-        let c = core(task);
-        if (*c).inherited_rank_counts[rank as usize] == 0 {
+        if (*core(task)).inherited_rank_counts[rank as usize] == 0 {
             return false;
         }
-        let old = dispatch_rank(task);
-        (*c).inherited_rank_counts[rank as usize] -= 1;
-        if inherited_rank(task) == NO_RANK {
-            (*c).donation_budget_ticks_remaining = 0;
-            (*c).donation_budget_dispatches_remaining = 0;
-            (*c).donation_budget_exhausted_recorded = false;
-        }
-        (*raw()).donation_released = (*raw()).donation_released.wrapping_add(1);
-        adjust_rank(task, old, dispatch_rank(task));
+        replace_donation_owned(task, rank, NO_RANK);
         true
     }
 }

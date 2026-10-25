@@ -394,9 +394,10 @@ pub unsafe extern "C" fn r4os_rust_task_mutate(
                 }
                 0
             }
-            21 => u64::from(crate::sched::wait_node::detach(ptr::addr_of_mut!(
-                (*registry::core(task)).wait_node
-            ))),
+            21 => {
+                let _owner = runtime::RuntimeGuard::acquire();
+                u64::from(crate::sched::mutex_pi::detach(task))
+            }
             22 => {
                 let f = runtime::save_runtime();
                 let value = registry::remove_donation(task, a as u8);
@@ -742,9 +743,9 @@ pub unsafe extern "C" fn r4os_rust_task_sequence(
     }
 }
 /// # Safety
-/// Exact live task and exclusive four-u16 C output under caller admission.
+/// Exact live task and exclusive four-u64 private output under caller admission.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_task_donation_counts(task: *mut c_void, output: *mut [u16; 4]) {
+pub unsafe extern "C" fn r4os_rust_task_donation_counts(task: *mut c_void, output: *mut [u64; 4]) {
     unsafe {
         output.write((*registry::core(task.cast())).inherited_rank_counts);
     }

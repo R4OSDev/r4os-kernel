@@ -15,7 +15,7 @@ use crate::{
     memory::owner::Guard,
     sched::{
         scheduler, sync_locks,
-        sync_types::{Mutex, Text, WaitQueue},
+        sync_types::{Mutex, Text},
         task::{self, task_resources, task_types},
     },
 };
@@ -71,15 +71,8 @@ struct Storage(UnsafeCell<Metadata>);
 unsafe impl Sync for Storage {}
 static STORAGE: Storage = Storage(UnsafeCell::new(Metadata::EMPTY));
 const EMPTY_MUTEX: Mutex = Mutex {
-    owner: 0,
-    owner_generation: 0,
-    depth: 0,
-    rank: 10,
-    mode: 0,
     name: Text::literal(b"dhcp-operation"),
-    queue: WaitQueue::EMPTY,
-    donation_rank: 255,
-    handoff_pending: false,
+    ..Mutex::EMPTY
 };
 struct OperationLock(UnsafeCell<Mutex>);
 // SAFETY: mutex fields and waiters belong exclusively to the native sync owner;

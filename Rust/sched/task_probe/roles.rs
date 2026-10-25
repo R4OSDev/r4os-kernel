@@ -395,7 +395,7 @@ pub unsafe fn inversion() -> bool {
         // holder, waiter's rank and private mutex before allowing release.
         let donated = {
             let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
-            let rank = crate::sched::task::scheduler_view(waiter.cast()).dispatch_rank;
+            let rank = crate::sched::task::task_registry::wake_rank(waiter);
             let c = crate::sched::task::task_registry::core(holder);
             let m = ptr::addr_of!((*raw()).inversion_mutex);
             rank < 3

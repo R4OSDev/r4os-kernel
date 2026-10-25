@@ -9,6 +9,7 @@ pub mod wait_node;
 #[path = "../kernel/deadman.rs"]
 pub mod deadman;
 pub(crate) mod kernel_check;
+pub(crate) mod mutex_pi;
 pub mod sync_locks;
 pub mod sync_objects;
 pub mod sync_selftest;

@@ -11,7 +11,9 @@ use core::cell::UnsafeCell;
 // before admitting the 65-task deadline case. 96 entries exhausted that
 // session despite every earlier task being reaped. This bounds diagnostic
 // history only; it is not the system Task capacity or a cleanup shortcut.
-const SESSION_RECORDS: usize = 128;
+// 0.87.30 adds 31 exact Mutex-chain receipts to the 104-task scheduler
+// profile; the combined profile also retains Sync/FPU/DriverWork receipts.
+const SESSION_RECORDS: usize = 192;
 struct Cell(UnsafeCell<Ledger<SESSION_RECORDS>>);
 // Exclusive gate -> BSP controller -> DONE acquire -> original caller.
 unsafe impl Sync for Cell {}

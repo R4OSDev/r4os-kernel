@@ -44,7 +44,11 @@ pub(crate) unsafe fn case(bit: u32) -> Option<bool> {
                 result
             }
             3 => roles::fairness() && super::balance::run() && kernel_check::park::run(),
-            4 => roles::inversion() && scheduler::rank_probe::run(),
+            4 => {
+                roles::inversion()
+                    && scheduler::rank_probe::run()
+                    && crate::sched::mutex_pi::probe::run()
+            }
             5 => real_deadlines(),
             6 => {
                 let mut status = core::mem::MaybeUninit::uninit();
