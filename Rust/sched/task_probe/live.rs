@@ -46,6 +46,7 @@ pub(crate) unsafe fn case(bit: u32) -> Option<bool> {
             3 => {
                 roles::fairness()
                     && scheduler::slice_probe::run()
+                    && scheduler::reschedule_probe::run()
                     && super::balance::run()
                     && kernel_check::park::run()
             }

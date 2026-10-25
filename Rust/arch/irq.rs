@@ -84,7 +84,7 @@ pub unsafe fn dispatch_ipi(frame: *const InterruptFrame) {
         0xf0 => {
             eoi();
             let rip = unsafe { core::ptr::addr_of!((*frame).rip).read() };
-            scheduler::on_reschedule(event(0, rip, 0) != 0);
+            scheduler::on_reschedule_irq(event(0, rip, 0) != 0);
         }
         0xf1 => {
             eoi();

@@ -204,6 +204,38 @@ fn case(report: &mut c::ProgramKernelCpuLifecycleCheck, bit: u32, ok: bool) {
         report.failed |= bit;
     }
 }
+fn reschedule_epoch(cpu: u32, epoch: u64) -> bool {
+    use super::super::{runtime::RuntimeGuard, smp, smp::reschedule};
+    let (before, after, sent) = {
+        let _runtime = RuntimeGuard::acquire();
+        let before = reschedule::snapshot(cpu);
+        let sent = smp::send_reschedule(cpu);
+        (before, reschedule::snapshot(cpu), sent)
+    };
+    let identity = after
+        .target
+        .is_some_and(|t| t.index == cpu && t.epoch == epoch);
+    // Only an already outstanding doorbell of this NEW identity can cover
+    // the request. Old-epoch credit must instead produce a fresh send.
+    let delivery = sent
+        && after.failed == before.failed
+        && (after.sent == before.sent + 1
+            || before.in_flight
+                && before.target == after.target
+                && after.merged == before.merged + 1);
+    let consumed = delivery && spin_until(|| reschedule::snapshot(cpu).consumed > before.consumed);
+    let ok = identity && consumed;
+    crate::boot::log_route::puts(if ok {
+        b"IPI08734 epoch PASS old="
+    } else {
+        b"IPI08734 epoch FAILED old="
+    });
+    crate::boot::log_route::dec(before.target.map_or(0, |t| t.epoch));
+    crate::boot::log_route::puts(b" new=");
+    crate::boot::log_route::dec(epoch);
+    crate::boot::log_route::puts(b"\n");
+    ok
+}
 pub(crate) fn run() -> c::ProgramKernelCpuLifecycleCheck {
     use super::super::{percpu, runtime::RuntimeGuard};
     let mut r = c::ProgramKernelCpuLifecycleCheck {
@@ -367,7 +399,10 @@ pub(crate) fn run() -> c::ProgramKernelCpuLifecycleCheck {
             && r.available_offline + 1 == r.available_before;
         let restarted = stopped && online(&claim, cpu, r.old_epoch).is_ok();
         r.new_epoch = crate::platform::cpu_topology::epoch(cpu);
-        let cycle_ok = restarted && r.new_epoch == r.old_epoch + 1 && percpu::state(cpu) == 4;
+        let cycle_ok = restarted
+            && r.new_epoch == r.old_epoch + 1
+            && percpu::state(cpu) == 4
+            && reschedule_epoch(cpu, r.new_epoch);
         let stale_ok = restarted
             && offline(&claim, cpu, r.old_epoch) == Err(Reason::Epoch)
             && online(&claim, cpu, r.old_epoch) == Err(Reason::Epoch)

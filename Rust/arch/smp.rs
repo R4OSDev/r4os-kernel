@@ -2,6 +2,7 @@
 //! The BSP owns configuration until execution publication; terminal shutdown
 //! owns the stop counter. Native per-CPU lifecycle atomics publish AP progress.
 //! Raw Task callbacks bind the native task owner without a second lifecycle.
+pub(crate) mod reschedule;
 use super::{
     ap_admission,
     apic_target::{self, Target},
@@ -625,13 +626,8 @@ fn stop_others() {
         }
     }
 }
-pub(crate) fn send_reschedule(index: u32) {
-    if index == percpu::current_index() {
-        return;
-    }
-    if let Some(target) = live_target(index).filter(|t| apic_target::current(*t, live_target)) {
-        lapic::r4os_rust_lapic_control(5, u64::from(target.apic_id), 0xf0);
-    }
+pub(crate) fn send_reschedule(index: u32) -> bool {
+    reschedule::live(index)
 }
 unsafe extern "C" fn send_tlb_ipi(index: u32, vector: u8) -> bool {
     if index == percpu::current_index() {
@@ -784,12 +780,7 @@ pub(crate) fn idle_stack_contains(index: u32, rsp: u64) -> bool {
     (start..start + STACK_SIZE as u64).contains(&rsp)
 }
 pub(crate) fn request_drain_reschedule(index: u32, expected: u64) -> bool {
-    let Some(target) = identity_target(index)
-        .filter(|t| t.epoch == expected && percpu::state(index) == percpu::DRAINING)
-    else {
-        return false;
-    };
-    lapic::r4os_rust_lapic_control(5, u64::from(target.apic_id), 0xf0) != 0
+    reschedule::draining(index, expected)
 }
 pub(crate) fn notify_irq(target: Target, vector: u32) -> bool {
     apic_target::current(target, live_target)

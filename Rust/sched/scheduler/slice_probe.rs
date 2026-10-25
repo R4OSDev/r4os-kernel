@@ -113,13 +113,17 @@ fn one(mode: u32) -> bool {
         )
     };
     let start_ns = clock();
+    let mut admission_mask = 0;
+    let mut queued_before = 0;
     let admitted = if started && ARMED.load(Ordering::Acquire) {
         let _runtime = runtime::RuntimeGuard::acquire();
         unsafe {
-            let exact = cpu_state(cpu).current == a.cast()
-                && (*registry::core(a)).state == TaskState::Running
-                && (*registry::core(a)).role == role
-                && query(3, ptr::null_mut(), u64::from(cpu)) == 0;
+            queued_before = query(3, ptr::null_mut(), u64::from(cpu));
+            admission_mask = u32::from(cpu_state(cpu).current == a.cast())
+                | (u32::from((*registry::core(a)).state == TaskState::Running) << 1)
+                | (u32::from((*registry::core(a)).role == role) << 2)
+                | (u32::from(queued_before == 0) << 3);
+            let exact = admission_mask == 15;
             if exact && tasks::start(b) {
                 WAKE_TICK.store(timer::tick_count(), Ordering::Relaxed);
                 GO.store(true, Ordering::Release);
@@ -178,6 +182,8 @@ fn one(mode: u32) -> bool {
     crate::boot::log_route::puts(if passed && clean { b"PASS" } else { b"FAIL" });
     for (label, value) in [
         (b" mode=".as_slice(), u64::from(mode)),
+        (b" admission-mask=", u64::from(admission_mask)),
+        (b" queued-before=", queued_before),
         (b" quantum=", quantum),
         (b" ready_ticks=", latency),
         (b" elapsed_ns=", elapsed),

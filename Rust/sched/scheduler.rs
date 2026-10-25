@@ -1,6 +1,7 @@
 //! One scheduler state owner; runtime admission is mandatory after SMP start.
 //! Early safe-point counters use separate atomics; no State borrow spans a switch.
 pub(crate) mod rank_probe;
+pub(crate) mod reschedule_probe;
 pub(crate) mod selection;
 pub(crate) mod slice_probe;
 pub use super::scheduler_types::{CpuPreemptionStats, Stats, StructureStats};
@@ -407,6 +408,28 @@ pub(crate) fn preempt_depth() -> u32 {
 }
 fn send_reschedule(index: u32) {
     crate::arch::smp::send_reschedule(index);
+}
+// Ready urgency is policy, independent of the transport's unconsumed IPI.
+// Equal/lower-ranked work on a productive CPU follows its normal slice;
+// idle/parking destinations still require a doorbell even for Batch work.
+fn notify_destination(target: u32, rank: u8) {
+    if target as usize >= MAX_CPUS || !cpu_state(target).initialized {
+        return;
+    }
+    let running = cpu_state(target).current;
+    let needed = running.is_null() || {
+        let item = view(running);
+        item.cpu_idle || item.state != 2 || rank < item.dispatch_rank
+    };
+    if needed {
+        cpu_change(target, |s| s.pending = true);
+        change(|s| {
+            s.wakeup_reschedule_request_count = s.wakeup_reschedule_request_count.wrapping_add(1)
+        });
+        if target != percpu::current_index() {
+            send_reschedule(target);
+        }
+    }
 }
 fn init() -> bool {
     unsafe { task_context::bind(ptr::null_mut()) };
@@ -950,11 +973,7 @@ fn balance_ready(transfer: super::task::balance::Transfer, now: impl FnMut() -> 
     if moved.is_null() {
         return ptr::null_mut();
     }
-    cpu_change(target, |s| s.pending = true);
-    change(|s| {
-        s.wakeup_reschedule_request_count = s.wakeup_reschedule_request_count.wrapping_add(1)
-    });
-    send_reschedule(target);
+    notify_destination(target, view(moved.cast()).dispatch_rank);
     moved.cast()
 }
 fn refill_ready() {
@@ -1101,26 +1120,7 @@ pub(crate) fn notify_ready(task: Task) {
     if moved == task && query(3, ptr::null_mut(), u64::from(target)) == 0 {
         return;
     }
-    let local_cpu = percpu::current_index();
-    if target != local_cpu && percpu::r4os_rust_percpu_control(13, target, 0, 0) != 0 {
-        cpu_change(target, |s| s.pending = true);
-        change(|s| {
-            s.wakeup_reschedule_request_count = s.wakeup_reschedule_request_count.wrapping_add(1)
-        });
-        send_reschedule(target);
-    } else {
-        let running = cpu_state(target).current;
-        if !running.is_null() {
-            let current = view(running);
-            if current.state == 2 && item.dispatch_rank < current.dispatch_rank {
-                cpu_change(target, |s| s.pending = true);
-                change(|s| {
-                    s.wakeup_reschedule_request_count =
-                        s.wakeup_reschedule_request_count.wrapping_add(1)
-                });
-            }
-        }
-    }
+    notify_destination(target, item.dispatch_rank);
 }
 fn wake_task(task: Task, result: u32) -> bool {
     let flags = runtime::save_runtime();
@@ -1512,7 +1512,20 @@ pub fn on_tick(now: u64, preemptible: bool, secondary: bool) -> bool {
     result
 }
 pub fn on_reschedule(preemptible: bool) {
+    reschedule::<false>(preemptible);
+}
+pub(crate) fn on_reschedule_irq(preemptible: bool) {
+    reschedule::<true>(preemptible);
+}
+fn reschedule<const VECTOR_RECEIVED: bool>(preemptible: bool) {
     let flags = runtime::save_runtime();
+    if VECTOR_RECEIVED {
+        // Actual0xf0 only, under this same outer switch admission. Scheduling
+        // deferral below must not retain the already consumed transport credit.
+        unsafe {
+            crate::arch::smp::reschedule::received_owned();
+        }
+    }
     let running = local().current;
     if percpu::state(percpu::current_index()) == percpu::DRAINING
         && !preemptible
