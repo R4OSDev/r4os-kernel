@@ -360,28 +360,33 @@ const READY_OFFSET: usize = offset_of!(Task, core) + offset_of!(TaskCore, ready_
 const TIMEOUT_OFFSET: usize = offset_of!(Task, core) + offset_of!(TaskCore, timeout_index);
 unsafe fn adjust_rank(task: *mut Task, old: u8, new: u8) {
     unsafe {
-        if !(*core(task)).ready_linked || old == new {
+        if old == new {
             return;
         }
-        let q = queue_for(task);
-        task_index::remove(
-            ptr::addr_of_mut!((*q).ranks[(*core(task)).ready_rank as usize]),
-            task.cast(),
-            READY_OFFSET,
-        );
-        (*core(task)).ready_rank = new;
-        task_index::insert(
-            ptr::addr_of_mut!((*q).ranks[new as usize]),
-            task.cast(),
-            READY_OFFSET,
-            ready_before,
-        );
-        if (old as usize) < ROLE_COUNT && (*q).dispatch_counts[old as usize] != 0 {
-            (*q).dispatch_counts[old as usize] -= 1;
+        if (*core(task)).ready_linked {
+            let q = queue_for(task);
+            task_index::remove(
+                ptr::addr_of_mut!((*q).ranks[(*core(task)).ready_rank as usize]),
+                task.cast(),
+                READY_OFFSET,
+            );
+            (*core(task)).ready_rank = new;
+            task_index::insert(
+                ptr::addr_of_mut!((*q).ranks[new as usize]),
+                task.cast(),
+                READY_OFFSET,
+                ready_before,
+            );
+            if (old as usize) < ROLE_COUNT && (*q).dispatch_counts[old as usize] != 0 {
+                (*q).dispatch_counts[old as usize] -= 1;
+            }
+            if (new as usize) < ROLE_COUNT {
+                (*q).dispatch_counts[new as usize] += 1;
+            }
         }
-        if (new as usize) < ROLE_COUNT {
-            (*q).dispatch_counts[new as usize] += 1;
-        }
+        // Queue order/counts and the exact rank are visible in this same
+        // Runtime admission before the scheduler publishes reconsideration.
+        crate::sched::scheduler::rank_changed(task, old, new);
     }
 }
 pub(super) unsafe fn reset_activation(task: *mut Task) {
@@ -448,6 +453,7 @@ pub(super) unsafe fn consume_run(task: *mut Task, elapsed: u64) {
         if elapsed == 0 {
             return;
         }
+        let old = dispatch_rank(task);
         let c = core(task);
         if high((*c).role) && (*c).role_budget_ticks_remaining != 0 {
             (*c).role_budget_ticks_remaining -=
@@ -459,6 +465,7 @@ pub(super) unsafe fn consume_run(task: *mut Task, elapsed: u64) {
                 elapsed.min(u64::from((*c).donation_budget_ticks_remaining)) as u32;
             donation_exhausted(task);
         }
+        adjust_rank(task, old, dispatch_rank(task));
     }
 }
 pub(super) unsafe fn link_ready(task: *mut Task) {

@@ -1,5 +1,6 @@
 //! One scheduler state owner; runtime admission is mandatory after SMP start.
 //! Early safe-point counters use separate atomics; no State borrow spans a switch.
+pub(crate) mod rank_probe;
 pub use super::scheduler_types::{CpuPreemptionStats, Stats, StructureStats};
 use super::{task::thread_placement, task_context};
 use crate::{
@@ -556,7 +557,17 @@ fn record_overrun(ticks: u64) {
 fn record_deferred(ticks: u64) {
     change(|s| s.preemption_deferred_max_ticks = s.preemption_deferred_max_ticks.max(ticks));
 }
-fn refresh_pending(running: Task) {
+fn refresh_pending(running: Task, rank_before_dispatch: u8) {
+    // Dispatch accounting can exhaust the selected task's last boost before
+    // it becomes current. Publish only that actual demotion; an unchanged
+    // lower-rank FIFO pick retains its existing fairness policy.
+    unsafe {
+        rank_changed(
+            running.cast(),
+            rank_before_dispatch,
+            view(running).dispatch_rank,
+        );
+    }
     if local().pending {
         set_pending(urgent(running));
     }
@@ -741,6 +752,7 @@ fn yield_owned() -> bool {
     } else {
         mutate(4, old, 0, 0);
     }
+    let rank_before_dispatch = view(next).dispatch_rank;
     let latency = mutate(5, next, now, 0);
     record_ready(next, latency);
     mutate(0, next, 0, 0);
@@ -750,7 +762,7 @@ fn yield_owned() -> bool {
     preempt_enable();
     publish_current(next);
     unsafe { task_context::bind(view(next).unwind_slot) };
-    refresh_pending(next);
+    refresh_pending(next, rank_before_dispatch);
     require_switch(old);
     let outgoing = view(old).rsp_slot;
     let incoming = view(next).rsp;
@@ -796,6 +808,7 @@ fn preempt_irq(rip: u64, timer: bool) {
         crate::sched::fpu_observation::timer_switch(rip);
     }
     mutate(if view(old).cpu_idle { 3 } else { 2 }, old, now, 0);
+    let rank_before_dispatch = view(next).dispatch_rank;
     let latency = mutate(5, next, now, 0);
     record_ready(next, latency);
     mutate(0, next, 0, 0);
@@ -809,7 +822,7 @@ fn preempt_irq(rip: u64, timer: bool) {
             s.wakeup_preemption_switch_count = s.wakeup_preemption_switch_count.wrapping_add(1)
         });
     }
-    refresh_pending(next);
+    refresh_pending(next, rank_before_dispatch);
     require_switch(old);
     let outgoing = view(old).rsp_slot;
     let incoming = view(next).rsp;
@@ -885,9 +898,11 @@ pub(crate) unsafe fn park_blocked_owned(task: Task, flags: u64) {
         // standalone path, a producer may already have woken this current.
         if view(task).state != 3 {
             if local().current == task && view(task).state == 1 {
+                let rank_before_dispatch = view(task).dispatch_rank;
                 let latency = mutate(5, task, tick(), 0);
                 record_ready(task, latency);
                 mutate(0, task, 0, 0);
+                refresh_pending(task, rank_before_dispatch);
             }
             runtime::restore_runtime(flags);
             return;
@@ -1008,6 +1023,50 @@ fn balance_wake(source: u32, ready_time: u64) -> Task {
         };
         balance_ready(transfer, || ready_time)
     })
+}
+/// # Safety
+/// Runtime retains this exact live descriptor and completed rank-index update.
+/// This requests a decision only; no owner, IF, stack or preemption guard is
+/// released here, and a rank change never re-enqueues or migrates the task.
+pub(crate) unsafe fn rank_changed(
+    task: *mut super::task::task_types::Task,
+    old: u8,
+    new: u8,
+) -> bool {
+    use super::task::{task_registry as registry, task_types::State};
+    if task.is_null() || old == new || !enabled() {
+        return false;
+    }
+    unsafe {
+        let c = registry::core(task);
+        let (target, running_changed) = match (*c).state {
+            State::Running if new > old => (u32::from((*c).running_cpu), true),
+            State::Ready if new < old && (*c).ready_linked && (*c).running_cpu == 0xff => {
+                (u32::from((*c).home_cpu), false)
+            }
+            _ => return false,
+        };
+        if target as usize >= MAX_CPUS
+            || !percpu::is_schedulable(target)
+            || !cpu_state(target).initialized
+        {
+            return false;
+        }
+        let running = cpu_state(target).current;
+        if running.is_null()
+            || view(running).state != 2
+            || running_changed && running != task.cast()
+            || !running_changed && new >= view(running).dispatch_rank
+            || query(7, running, u64::from(target)) == 0
+        {
+            return false;
+        }
+        cpu_change(target, |s| s.pending = true);
+        if target != percpu::current_index() {
+            send_reschedule(target);
+        }
+        true
+    }
 }
 // Runtime admission retains this exact published Ready task. Also used by the
 // existing live diagnostic after releasing its own temporary affinity pin.
