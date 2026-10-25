@@ -56,6 +56,14 @@
     "description": "Enable detail timing, stack scans and diagnostic instrumentation"
   },
   {
+    "name": "heap-poison",
+    "config": "heap_poison",
+    "type": "bool",
+    "default": 0,
+    "bit": 18,
+    "description": "Fill retired kernel-heap payloads with0xdd for explicit diagnosis; independent of metrics, functional release checks always remain"
+  },
+  {
     "name": "force-x2apic",
     "config": "force_x2apic",
     "type": "bool",

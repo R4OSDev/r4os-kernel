@@ -174,7 +174,25 @@ pub(super) unsafe fn prepare_resource(
     count: usize,
     kind: u16,
 ) -> Option<ResourceStorage> {
+    unsafe { prepare_resource_with(instance, frame, payload::ResourceInit::Zeroed(count), kind) }
+}
+/// The admitted blob remains readable through this call. The returned private
+/// reservation already owns a complete copy, including every final chunk byte.
+pub(super) unsafe fn prepare_blob(
+    instance: *mut ProgramInstance,
+    frame: *mut t::Frame,
+    bytes: &[u8],
+) -> Option<ResourceStorage> {
+    unsafe { prepare_resource_with(instance, frame, payload::ResourceInit::Copied(bytes), 4) }
+}
+unsafe fn prepare_resource_with(
+    instance: *mut ProgramInstance,
+    frame: *mut t::Frame,
+    init: payload::ResourceInit<'_>,
+    kind: u16,
+) -> Option<ResourceStorage> {
     unsafe {
+        let count = init.len();
         let gui = (*instance).gui_payload.cast::<t::Gui>();
         if gui.is_null() || (*frame).build_failed || count == 0 || !can_link(frame, 1) {
             return None;
@@ -187,7 +205,7 @@ pub(super) unsafe fn prepare_resource(
             }
             next_raster_words = (*frame).raster_words.checked_add((count / 4) as u64)?;
         }
-        let payload = payload::allocate_resource(
+        let payload = payload::allocate_resource_with(
             (*instance).id,
             (*frame).resource_len,
             if matches!(kind, 2 | 3) {
@@ -195,7 +213,7 @@ pub(super) unsafe fn prepare_resource(
             } else {
                 0
             },
-            count,
+            init,
             kind,
         );
         if payload.is_null() {

@@ -25,6 +25,11 @@ Kernelcode nutzt keine SIMD-Register und keine Red-Zone. Modulaufrufe
 behalten die bestehenden Task-/IRQ-FPU-Sicherungen. Keine Optimierung oder
 Abschwaechung der Pruefungen als Teil des Sprachwechsels.
 
+Seit0.87.27 schaltet -Dheap-poison=true die volle0xdd-Fuellung freigegebener
+Kernelheap-Nutzdaten ausdruecklich ein. Standard=false, unabhaengig von metrics.
+Boundary-Tags, Owner-/Groessenpruefungen, Retiring-Tickets und echte
+Freigabequittungen bleiben in beiden Modi. HEAPPROBE nennt off/full.
+
 BuildOptions.json definiert aktive Optionen. -Dmetrics=false ist Standard;
 -Dmetrics=true aktiviert Detailzeiten und diagnostische Scans. Betriebs- und
 Fehlerzaehler, Clocks, Deadlines, Guardseiten und Ressourcenabbau bleiben

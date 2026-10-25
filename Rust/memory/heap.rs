@@ -1,4 +1,4 @@
-//! Boundary-tag kernel allocator: original bins, coalescence, poison,
+//! Boundary-tag kernel allocator: original bins, coalescence, optional poison,
 //! growth serialization and exact partial-tail retention.
 mod release;
 
@@ -27,6 +27,19 @@ const BINS: usize = 24;
 const NONE: u64 = u64::MAX;
 const FREE_MAGIC: u64 = 0xf6ee_b10c_f6ee_b10c;
 const SCAN_LIMIT: usize = 16;
+pub(crate) const FULL_POISON: bool = crate::build_config::config::HEAP_POISON;
+
+/// Only the allocator's exact private live/retiring block may reach this fill.
+/// Boundary tags and free-list metadata are independent of this diagnostic.
+fn poison(offset: usize, size: usize) -> u64 {
+    if !FULL_POISON || size < OVERHEAD + GRANULE {
+        return 0;
+    }
+    unsafe {
+        core::ptr::write_bytes(payload(offset), 0xdd, size - OVERHEAD);
+    }
+    (size - OVERHEAD) as u64
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Stats {
@@ -200,12 +213,7 @@ impl Control {
         self.free_bytes -= size;
     }
     fn release_block(&mut self, offset: usize, size: usize) {
-        if size >= OVERHEAD + GRANULE {
-            unsafe {
-                core::ptr::write_bytes(payload(offset), 0xdd, size - OVERHEAD);
-            }
-            self.poison_bytes = self.poison_bytes.wrapping_add((size - OVERHEAD) as u64);
-        }
+        self.poison_bytes = self.poison_bytes.wrapping_add(poison(offset, size));
         self.publish_free(offset, size);
     }
     fn publish_free(&mut self, mut offset: usize, mut size: usize) {

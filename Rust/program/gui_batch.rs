@@ -101,18 +101,12 @@ unsafe fn append_blob(
         let mut copied = 0;
         while copied < resources.len() {
             let count = (resources.len() - copied).min(65536);
-            let Some(mut storage) = storage::prepare_resource(instance, frame, count, 4) else {
+            let Some(mut storage) =
+                storage::prepare_blob(instance, frame, &resources[copied..copied + count])
+            else {
                 return false;
             };
             assert!((*storage.payload).byte_count as usize == count);
-            ptr::copy_nonoverlapping(
-                resources.as_ptr().add(copied),
-                storage
-                    .payload
-                    .cast::<u8>()
-                    .add(mem::size_of::<t::Resource>()),
-                count,
-            );
             storage::commit_resource(&mut storage);
             copied += count;
         }

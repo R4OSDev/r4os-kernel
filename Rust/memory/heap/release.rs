@@ -38,13 +38,17 @@ pub(super) fn prepare(
 }
 
 pub(super) fn finish(retired: Retired, guard: &mut HeapGuard) {
-    // Entire kernel-heap blocks are resident. This phase only fills memory;
-    // it cannot perform VM/I/O work or gain permission to wait.
-    guard.suspend();
-    unsafe {
-        core::ptr::write_bytes(payload(retired.offset), 0xdd, retired.size - OVERHEAD);
-    }
-    guard.resume();
+    // Entire kernel-heap blocks are resident. Only the explicit diagnostic
+    // fills them outside owner4; it cannot perform VM/I/O work or gain wait
+    // permission. Both modes retain and authenticate the exact retiring ticket.
+    let poisoned = if FULL_POISON {
+        guard.suspend();
+        let bytes = poison(retired.offset, retired.size);
+        guard.resume();
+        bytes
+    } else {
+        0
+    };
     control(|state| {
         let header = retired.size as u64 | 1 | RETIRING;
         assert!(
@@ -57,9 +61,7 @@ pub(super) fn finish(retired: Retired, guard: &mut HeapGuard) {
                 && read(retired.offset + retired.size - FOOTER) == header,
             "heap retiring block identity"
         );
-        state.poison_bytes = state
-            .poison_bytes
-            .wrapping_add((retired.size - OVERHEAD) as u64);
+        state.poison_bytes = state.poison_bytes.wrapping_add(poisoned);
         if let Some(requested) = retired.requested {
             state.active_blocks -= 1;
             state.used_bytes -= requested;

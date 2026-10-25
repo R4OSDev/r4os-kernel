@@ -101,7 +101,11 @@ pub(crate) fn acceptance() -> crate::arch::smp_probe::HeapReport {
         && accounting
         && after.commit_failures == before.commit_failures
         && after.uncommit_failures == before.uncommit_failures
-        && poison >= REQUEST as u64 * ITERATIONS
+        && (if heap::FULL_POISON {
+            poison >= REQUEST as u64 * ITERATIONS
+        } else {
+            poison == 0
+        })
         && heap_check::boot_range(7, 7).status == crate::contract::kernel_heap_check_status_passed;
     crate::arch::smp_probe::HeapReport {
         ok,

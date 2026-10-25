@@ -447,6 +447,21 @@ pub(super) fn allocate_commands(owner: u32, offset: u64, capacity: u32) -> *mut 
         payload
     }
 }
+/// An allocation always returns completely initialized storage. Only copied
+/// private blobs omit zeroing their data; legacy zero-filled callers keep it.
+#[derive(Clone, Copy)]
+pub(super) enum ResourceInit<'a> {
+    Zeroed(usize),
+    Copied(&'a [u8]),
+}
+impl ResourceInit<'_> {
+    pub(super) fn len(self) -> usize {
+        match self {
+            Self::Zeroed(count) => count,
+            Self::Copied(bytes) => bytes.len(),
+        }
+    }
+}
 pub(super) fn allocate_resource(
     owner: u32,
     offset: u64,
@@ -454,6 +469,22 @@ pub(super) fn allocate_resource(
     count: usize,
     kind: u16,
 ) -> *mut t::Resource {
+    allocate_resource_with(
+        owner,
+        offset,
+        raster_offset,
+        ResourceInit::Zeroed(count),
+        kind,
+    )
+}
+pub(super) fn allocate_resource_with(
+    owner: u32,
+    offset: u64,
+    raster_offset: u64,
+    init: ResourceInit<'_>,
+    kind: u16,
+) -> *mut t::Resource {
+    let count = init.len();
     let Some(payload_kind) = resource_kind(kind) else {
         return ptr::null_mut();
     };
@@ -471,7 +502,9 @@ pub(super) fn allocate_resource(
         return ptr::null_mut();
     }
     unsafe {
-        ptr::write_bytes(memory, 0, bytes);
+        // Metadata is valid even before the data write. Nothing returns or
+        // links this private node until its entire payload has been initialized.
+        ptr::write_bytes(memory, 0, mem::size_of::<t::Resource>());
         let payload = memory.cast::<t::Resource>();
         (*payload).header = t::Header {
             magic: MAGIC,
@@ -484,6 +517,13 @@ pub(super) fn allocate_resource(
         (*payload).raster_word_offset = raster_offset;
         (*payload).byte_count = u32::try_from(count).expect("Resource byte count");
         (*payload).resource_kind = kind;
+        let data = memory.add(mem::size_of::<t::Resource>());
+        match init {
+            ResourceInit::Zeroed(_) => ptr::write_bytes(data, 0, count),
+            ResourceInit::Copied(source) => {
+                ptr::copy_nonoverlapping(source.as_ptr(), data, count);
+            }
+        }
         add64!(payload_allocations, 1);
         note_allocation(payload_kind, bytes);
         if !info::r4os_rust_program_info_by_id(owner).is_null() {

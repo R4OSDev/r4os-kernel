@@ -23,6 +23,9 @@ calls. The linker preserves the higher-half layout, Limine requests and the
 
 `BuildOptions.json` owns supported options, including explicit detailed
 metrics and fault probes. Defaults keep intrusive probes disabled.
+Since0.87.27, -Dheap-poison=true explicitly enables the full0xdd heap release
+fill, independently of metrics. Default=false preserves functional boundary
+tags, size/owner checks, retiring identities and release acknowledgments.
 `Build.sh fmt`, `check` and `clippy` provide current source/compiler checks.
 Runtime acceptance uses targeted existing diagnostics and QEMU SMP4.
 Retired Zig host selectors and temporary fixtures remain in Git and the

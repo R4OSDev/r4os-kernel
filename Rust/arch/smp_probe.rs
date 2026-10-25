@@ -454,6 +454,12 @@ unsafe fn smp_probe_report(report: *const Report) {
     probe_dec(report.heap_probe.release_suppressed);
     probe_text(b" poison_bytes=");
     probe_dec(report.heap_probe.poison_bytes);
+    probe_text(b" poison_mode=");
+    probe_text(if crate::memory::heap::FULL_POISON {
+        b"full"
+    } else {
+        b"off"
+    });
     probe_text(b" retained_pages=");
     probe_dec(report.heap_probe.retained_pages);
     probe_text(b" block_claims=");

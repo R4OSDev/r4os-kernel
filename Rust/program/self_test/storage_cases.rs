@@ -216,7 +216,9 @@ pub(super) unsafe fn atomic_growth_failure(id: u32, heap: &heap::Stats, base: &t
             storage::rollback(id, &mut storage);
             return false;
         }
-        ptr::write_bytes(resource, 0, BYTES);
+        for index in 0..BYTES {
+            resource.add(index).write(b'a' + (index % 26) as u8);
+        }
         let mut commands = [c::GuiFrameCommand {
             kind: c::gui_frame_command_kind_rect,
             ..Default::default()
@@ -256,8 +258,36 @@ pub(super) unsafe fn atomic_growth_failure(id: u32, heap: &heap::Stats, base: &t
             }
         }
         fail_after(None);
+        // Exercise a successful two-node blob as well as every allocation
+        // failure above. Mutating the caller's source must not change the
+        // private copy, including the byte across the64KB chunk boundary.
+        if batches_ok {
+            batches_ok = flow::begin(&mut fake, 0, &[]) == 0
+                && batch(&mut fake, &commands, slice::from_raw_parts(resource, BYTES)) == 0;
+            if batches_ok {
+                ptr::write_bytes(resource, b'?', BYTES);
+                let building = (*gui).building_frame;
+                let mut readback = [0u8; 257];
+                let mut offset = 0;
+                while offset < BYTES && batches_ok {
+                    let count = readback.len().min(BYTES - offset);
+                    batches_ok =
+                        view::resources(building, offset as u64, readback.as_mut_ptr(), count)
+                            == count
+                            && readback[..count]
+                                .iter()
+                                .enumerate()
+                                .all(|(index, byte)| *byte == b'a' + ((offset + index) % 26) as u8);
+                    offset += count;
+                }
+                batches_ok &= (*gui).committed_frame == committed
+                    && (*committed).generation == generation
+                    && hash(committed) == old_hash
+                    && accounting::checked(gui).is_some();
+            }
+        }
         if !(*gui).building_frame.is_null() {
-            flow::cancel(&mut fake);
+            batches_ok &= flow::cancel(&mut fake) == 0;
         }
         let resource_released = heap::r4os_rust_heap_free(resource, BYTES) == 0;
         let old_ready =
