@@ -41,12 +41,31 @@ unsafe fn wake(target: *mut Task, result: WaitResult) -> bool {
 /// Queue storage is never touched after park: the producer may already close
 /// and free it once enrollment has detached. Only the running exact Task lives.
 pub(super) unsafe fn wait(queue: *mut WaitQueue, request: &WaitRequest) -> WaitResult {
-    unsafe { wait_impl(queue, request, ptr::null_mut()) }
+    unsafe { wait_impl(queue, request, super::mutex_pi::Lock::None) }
 }
 pub(super) unsafe fn wait_mutex(mutex: *mut Mutex, request: &WaitRequest) -> WaitResult {
-    unsafe { wait_impl(ptr::addr_of_mut!((*mutex).queue), request, mutex) }
+    unsafe {
+        wait_impl(
+            ptr::addr_of_mut!((*mutex).queue),
+            request,
+            super::mutex_pi::Lock::Mutex(mutex),
+        )
+    }
 }
-unsafe fn wait_impl(queue: *mut WaitQueue, request: &WaitRequest, mutex: *mut Mutex) -> WaitResult {
+pub(super) unsafe fn wait_guard(guard: *mut UnwindGuard, request: &WaitRequest) -> WaitResult {
+    unsafe {
+        wait_impl(
+            ptr::addr_of_mut!((*guard).queue),
+            request,
+            super::mutex_pi::Lock::Guard(guard),
+        )
+    }
+}
+unsafe fn wait_impl(
+    queue: *mut WaitQueue,
+    request: &WaitRequest,
+    lock: super::mutex_pi::Lock,
+) -> WaitResult {
     unsafe {
         let target = current();
         if !request.consume_runtime && request.release.is_none() && target.is_null() {
@@ -77,8 +96,17 @@ unsafe fn wait_impl(queue: *mut WaitQueue, request: &WaitRequest, mutex: *mut Mu
         if let Some(predicate) = request.predicate
             && !predicate(request.context)
         {
+            let result = if let super::mutex_pi::Lock::Guard(g) = lock {
+                if super::sync_guard::guard_try(g) {
+                    WaitResult::Signaled
+                } else {
+                    WaitResult::Failed
+                }
+            } else {
+                WaitResult::Signaled
+            };
             leave(flags);
-            return WaitResult::Signaled;
+            return result;
         }
         if request.timeout == 0 {
             leave(flags);
@@ -87,6 +115,11 @@ unsafe fn wait_impl(queue: *mut WaitQueue, request: &WaitRequest, mutex: *mut Mu
         }
         super::sync_locks::note_sleep();
         let c = registry::core(target);
+        assert!((*c).guard_offer.is_empty());
+        if matches!(lock, super::mutex_pi::Lock::Guard(_)) && (*c).unwind_guard_count == u32::MAX {
+            leave(flags);
+            return WaitResult::Failed;
+        }
         if !wait_node::link(
             ptr::addr_of_mut!((*queue).core),
             ptr::addr_of_mut!((*c).wait_node),
@@ -109,7 +142,7 @@ unsafe fn wait_impl(queue: *mut WaitQueue, request: &WaitRequest, mutex: *mut Mu
             note(super::sync_stats::WaitMetric::Drops);
             return WaitResult::Failed;
         }
-        if !mutex.is_null() && !super::mutex_pi::bind(target, mutex) {
+        if lock != super::mutex_pi::Lock::None && !super::mutex_pi::bind(target, lock) {
             // Failed cycle/depth validation is still an exact completed wait.
             // Repair through the normal fast-wake park path and preserve IF.
             wake(target, WaitResult::Failed);
@@ -121,7 +154,14 @@ unsafe fn wait_impl(queue: *mut WaitQueue, request: &WaitRequest, mutex: *mut Mu
         note(super::sync_stats::WaitMetric::QueueWaits);
         scheduler::park_blocked_owned(blocked.cast(), flags);
         let resumed = registry::core(blocked);
-        let result = (*resumed).wait_result;
+        let result = if matches!(lock, super::mutex_pi::Lock::Guard(_)) {
+            let flags = enter();
+            let result = super::sync_guard::claim(blocked);
+            leave(flags);
+            result
+        } else {
+            (*resumed).wait_result
+        };
         let elapsed = (*resumed).last_wait_ticks;
         super::sync_stats::wait_latency(elapsed, result);
         result

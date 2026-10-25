@@ -83,8 +83,8 @@ fn blocked(i: usize, m: *mut Mutex) -> bool {
             && (*c).running_cpu == 0xff
             && (*c).wait_node.queue == ptr::addr_of_mut!((*m).queue.core)
             && (*c).wait_node.owner_generation == (*c).generation
-            && (*c).mutex_edge.mutex == m
-            && valid_edge(task(i), (*c).mutex_edge)
+            && (*c).lock_edge.lock == Lock::Mutex(m)
+            && valid_edge(task(i), (*c).lock_edge)
     }
 }
 fn dead(i: usize) -> bool {
@@ -141,7 +141,7 @@ fn cleanup() -> bool {
                 (*c).state == State::Dead
                     && (*c).held_lock_count == 0
                     && (*c).inherited_rank_counts == [0; 4]
-                    && (*c).mutex_edge.is_empty()
+                    && (*c).lock_edge.is_empty()
                     && !(*c).pi_queued
                     && (*c).wait_node.queue.is_null()
             }
@@ -430,7 +430,7 @@ unsafe extern "C" fn cycle_actor() {
                 let c = registry::core(task(i));
                 check(
                     (*c).wait_result == WaitResult::Failed
-                        && (*c).mutex_edge.is_empty()
+                        && (*c).lock_edge.is_empty()
                         && (*c).wait_node.queue.is_null()
                         && !(*c).pi_queued,
                     16,

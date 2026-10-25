@@ -84,6 +84,7 @@ static OWNER: Owner = Owner(UnsafeCell::new(UnwindGuard {
     depth: 0,
     name: Text::literal(b"net-app-ipv4"),
     queue: WaitQueue::EMPTY,
+    ..UnwindGuard::EMPTY
 }));
 struct Guard {
     _task_bound: PhantomData<*mut ()>,

@@ -50,6 +50,7 @@ pub(crate) unsafe fn abort_exhausted(
             || (*task).held_lock_count != 0
             || (*task).unwind_guard_count != 0
             || (*task).wait_handoff_guard_pending
+            || !(*task).guard_offer.is_empty()
             || (*thread).state != 2
             || !(*thread).execution_pinned
             || (*thread).stack_exhausted

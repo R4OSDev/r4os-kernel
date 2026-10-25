@@ -203,7 +203,7 @@ unsafe fn set_task(task: *mut Task, policy: Policy) -> i32 {
             && (((*core).state == State::Ready && !balance::saved_continuation(task, false))
                 || (*core).held_lock_count != 0
                 || (*core).preempt_disable_depth != 0
-                || (*core).wait_handoff_guard_pending
+                || ((*core).wait_handoff_guard_pending || !(*core).guard_offer.is_empty())
                 || (*core).rsp == 0
                 || ((*core).uses_fpu && (!(*core).fpu_state_valid || (*core).fpu_state.is_none())))
         {
@@ -323,7 +323,7 @@ unsafe fn stage_impl(task: *mut Task, depth: u32, drain: bool) -> bool {
         if matches!((*core).state, State::Unused | State::Dead)
             || (*core).held_lock_count != 0
             || (*core).preempt_disable_depth > depth
-            || (*core).wait_handoff_guard_pending
+            || ((*core).wait_handoff_guard_pending || !(*core).guard_offer.is_empty())
         {
             return false;
         }

@@ -10,6 +10,7 @@ pub mod wait_node;
 pub mod deadman;
 pub(crate) mod kernel_check;
 pub(crate) mod mutex_pi;
+pub(crate) mod sync_guard;
 pub mod sync_locks;
 pub mod sync_objects;
 pub mod sync_selftest;

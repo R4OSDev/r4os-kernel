@@ -100,7 +100,7 @@ pub(crate) unsafe fn scheduler_view(task: *mut c_void) -> TaskView {
             uses_fpu: (*c).uses_fpu,
             fpu_valid: (*c).fpu_state_valid,
             fpu_present: (*c).fpu_state.is_some(),
-            handoff_pending: (*c).wait_handoff_guard_pending,
+            handoff_pending: (*c).wait_handoff_guard_pending || !(*c).guard_offer.is_empty(),
         }
     }
 }

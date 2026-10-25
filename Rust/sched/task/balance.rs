@@ -40,7 +40,7 @@ pub(crate) unsafe fn saved_continuation(candidate: *mut Task, initial: bool) -> 
             && !(*c).rollback_pending
             && (*c).preempt_disable_depth == 0
             && (*c).held_lock_count == 0
-            && !(*c).wait_handoff_guard_pending
+            && (!(*c).wait_handoff_guard_pending && (*c).guard_offer.is_empty())
             && (*c).wait_node.queue.is_null()
             && !(*c).timeout_linked
             && (*c).wake_tick == 0

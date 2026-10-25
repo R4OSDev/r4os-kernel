@@ -1111,6 +1111,21 @@ pub(crate) fn notify_ready(task: Task) {
 fn wake_task(task: Task, result: u32) -> bool {
     let flags = runtime::save_runtime();
     preempt_disable();
+    // An offered guard is already Ready (or in the fast-wake park return),
+    // but still owns its original timeout. Cancel it without a second Ready
+    // insertion/wake activation; cancellation selects exactly one successor.
+    if result != 1
+        && unsafe { super::sync_guard::cancel(task.cast(), super::sync_types::wait_result(result)) }
+    {
+        change(|s| match result {
+            2 => s.object_timeout_count = s.object_timeout_count.wrapping_add(1),
+            3 => s.object_cancel_count = s.object_cancel_count.wrapping_add(1),
+            _ => {}
+        });
+        preempt_enable();
+        runtime::restore_runtime(flags);
+        return true;
+    }
     if view(task).state != 3 {
         preempt_enable();
         runtime::restore_runtime(flags);

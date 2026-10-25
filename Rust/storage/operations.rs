@@ -77,6 +77,7 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
         depth: 0,
         name: Text::literal(b"storage-topology"),
         queue: WaitQueue::EMPTY,
+        ..UnwindGuard::EMPTY
     },
     records: [const { MaybeUninit::uninit() }; 16],
     operations: [const { MaybeUninit::uninit() }; 16],

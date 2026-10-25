@@ -34,6 +34,7 @@ const fn guard(name: &'static [u8]) -> UnwindGuard {
         depth: 0,
         name: Text::literal(name),
         queue: WaitQueue::EMPTY,
+        ..UnwindGuard::EMPTY
     }
 }
 #[repr(C)]

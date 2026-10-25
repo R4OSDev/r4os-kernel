@@ -116,6 +116,7 @@ impl State {
                 depth: 0,
                 name: Text::literal(b"xhci-controller"),
                 queue: WaitQueue::EMPTY,
+                ..UnwindGuard::EMPTY
             },
             canonical_backend: HostDescriptor {
                 flags: 255,

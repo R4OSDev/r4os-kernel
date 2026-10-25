@@ -512,7 +512,8 @@ pub(super) unsafe fn release_resources(task: *mut Task) -> bool {
         let c = registry::core(task);
         if (*c).held_lock_count != 0
             || (*c).unwind_guard_count != 0
-            || !(*c).mutex_edge.is_empty()
+            || !(*c).guard_offer.is_empty()
+            || !(*c).lock_edge.is_empty()
             || (*c).pi_queued
         {
             puts(b"TASK RELEASE INVARIANT: owned synchronization remains id=");

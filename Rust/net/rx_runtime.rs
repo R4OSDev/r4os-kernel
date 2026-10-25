@@ -196,6 +196,7 @@ const POLL_INITIAL: UnwindGuard = UnwindGuard {
     depth: 0,
     name: Text::literal(b"net-poll"),
     queue: WaitQueue::EMPTY,
+    ..UnwindGuard::EMPTY
 };
 static POLL: PollOwner = PollOwner(UnsafeCell::new(POLL_INITIAL));
 const PROCESS_INITIAL: UnwindGuard = UnwindGuard {

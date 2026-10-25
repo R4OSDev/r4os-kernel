@@ -24,7 +24,8 @@ pub(super) unsafe fn eligible(task: *mut Task) -> bool {
             && (*c).pin_count == 0
             && !is_current(task)
             && (*c).wait_node.queue.is_null()
-            && (*c).mutex_edge.is_empty()
+            && (*c).guard_offer.is_empty()
+            && (*c).lock_edge.is_empty()
             && !(*c).pi_queued
             && (*c).held_lock_count == 0
             && (*c).unwind_guard_count == 0

@@ -19,6 +19,7 @@ impl Exclusive {
             depth: 0,
             name: Text::literal(name),
             queue: WaitQueue::EMPTY,
+            ..UnwindGuard::EMPTY
         }))
     }
     pub fn acquire(&self) -> Option<Permit<'_>> {

@@ -492,6 +492,7 @@ pub unsafe fn initialize(kind: u8, memory: *mut u8) {
                     depth: 0,
                     name: Text::literal(b"gui-operation"),
                     queue: WaitQueue::EMPTY,
+                    ..UnwindGuard::EMPTY
                 });
                 ptr::addr_of_mut!((*payload).header).write(Header {
                     magic: 0,
@@ -781,35 +782,35 @@ const _: () = {
     assert!(mem::offset_of!(Frame, base_commands) == 272);
     assert!(mem::offset_of!(Frame, base_resources) == 280);
     assert!(mem::offset_of!(Frame, base_raster_words) == 288);
-    assert!(mem::size_of::<Gui>() == 3904);
+    assert!(mem::size_of::<Gui>() == 3960);
     assert!(mem::align_of::<Gui>() == 8);
     assert!(mem::offset_of!(Gui, operation_gate) == 2848);
-    assert!(mem::offset_of!(Gui, header) == 2960);
+    assert!(mem::offset_of!(Gui, header) == 3016);
     assert!(mem::offset_of!(Gui, frame_lock) == 16);
     assert!(mem::offset_of!(Gui, committed_frame) == 144);
     assert!(mem::offset_of!(Gui, building_frame) == 152);
     assert!(mem::offset_of!(Gui, retired_frames) == 160);
-    assert!(mem::offset_of!(Gui, window_id) == 3040);
-    assert!(mem::offset_of!(Gui, window_info) == 3000);
+    assert!(mem::offset_of!(Gui, window_id) == 3096);
+    assert!(mem::offset_of!(Gui, window_info) == 3056);
     assert!(mem::offset_of!(Gui, events) == 184);
     assert!(mem::offset_of!(Gui, event_head) == 2744);
     assert!(mem::offset_of!(Gui, event_tail) == 2752);
-    assert!(mem::offset_of!(Gui, event_high_water) == 2988);
-    assert!(mem::offset_of!(Gui, text) == 3372);
-    assert!(mem::offset_of!(Gui, font_id) == 2992);
-    assert!(mem::offset_of!(Gui, title) == 3308);
-    assert!(mem::offset_of!(Gui, min_client_w) == 2984);
-    assert!(mem::offset_of!(Gui, min_client_h) == 2980);
-    assert!(mem::offset_of!(Gui, revision) == 2976);
+    assert!(mem::offset_of!(Gui, event_high_water) == 3044);
+    assert!(mem::offset_of!(Gui, text) == 3428);
+    assert!(mem::offset_of!(Gui, font_id) == 3048);
+    assert!(mem::offset_of!(Gui, title) == 3364);
+    assert!(mem::offset_of!(Gui, min_client_w) == 3040);
+    assert!(mem::offset_of!(Gui, min_client_h) == 3036);
+    assert!(mem::offset_of!(Gui, revision) == 3032);
     assert!(mem::offset_of!(Gui, frame_commits) == 2816);
     assert!(mem::offset_of!(Gui, frame_cancels) == 2824);
     assert!(mem::offset_of!(Gui, frame_oom) == 0);
     assert!(mem::offset_of!(Gui, frame_snapshot_reads) == 2760);
     assert!(mem::offset_of!(Gui, frame_generation_reads) == 2840);
-    assert!(mem::offset_of!(Gui, frame_delta_commits) == 2928);
-    assert!(mem::offset_of!(Gui, frame_full_commits) == 2936);
-    assert!(mem::offset_of!(Gui, frame_indexed8_commands) == 2944);
-    assert!(mem::offset_of!(Gui, frame_indexed8_resource_bytes) == 2952);
+    assert!(mem::offset_of!(Gui, frame_delta_commits) == 2984);
+    assert!(mem::offset_of!(Gui, frame_full_commits) == 2992);
+    assert!(mem::offset_of!(Gui, frame_indexed8_commands) == 3000);
+    assert!(mem::offset_of!(Gui, frame_indexed8_resource_bytes) == 3008);
     assert!(mem::offset_of!(Gui, frame_replacement_commits) == 2832);
     assert!(mem::offset_of!(Gui, frame_superseded_generations) == 2808);
     assert!(mem::offset_of!(Gui, frame_coalesced_generations) == 2800);
@@ -818,14 +819,14 @@ const _: () = {
     assert!(mem::offset_of!(Gui, frame_xrgb32_nearest_resource_bytes) == 2784);
     assert!(mem::offset_of!(Gui, frame_stream_peak_bytes) == 2776);
     assert!(mem::offset_of!(Gui, frame_avoided_clone_bytes) == 2768);
-    assert!(mem::offset_of!(Gui, frame_last_error) == 2996);
+    assert!(mem::offset_of!(Gui, frame_last_error) == 3052);
     assert!(mem::offset_of!(Gui, frame_peak_bytes) == 176);
     assert!(mem::offset_of!(Gui, frame_peak_commands) == 168);
-    assert!(mem::offset_of!(Gui, start_attach_pending) == 3884);
-    assert!(mem::offset_of!(Gui, host_launch_pending) == 3885);
-    assert!(mem::offset_of!(Gui, frame_owned_bytes) == 3888);
-    assert!(mem::offset_of!(Gui, frame_owned_commands) == 3896);
-    assert!(mem::offset_of!(Gui, host_launch_request) == 3044);
+    assert!(mem::offset_of!(Gui, start_attach_pending) == 3940);
+    assert!(mem::offset_of!(Gui, host_launch_pending) == 3941);
+    assert!(mem::offset_of!(Gui, frame_owned_bytes) == 3944);
+    assert!(mem::offset_of!(Gui, frame_owned_commands) == 3952);
+    assert!(mem::offset_of!(Gui, host_launch_request) == 3100);
     assert!(mem::size_of::<InstanceStorage>() == 32);
     assert!(mem::align_of::<InstanceStorage>() == 8);
     assert!(mem::offset_of!(InstanceStorage, runtime) == 0);

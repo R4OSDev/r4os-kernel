@@ -376,6 +376,7 @@ pub unsafe extern "C" fn r4os_rust_program_thread_program_exit(code: i32, reason
             || (*core).held_lock_count != 0
             || (*core).unwind_guard_count != 0
             || (*core).wait_handoff_guard_pending
+            || !(*core).guard_offer.is_empty()
         {
             return -7;
         }

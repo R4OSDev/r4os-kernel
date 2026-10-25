@@ -16,6 +16,7 @@ pub const fn execution(name: &'static [u8]) -> UnwindGuard {
         depth: 0,
         name: crate::sched::sync_types::Text::literal(name),
         queue: crate::sched::sync_types::WaitQueue::EMPTY,
+        ..UnwindGuard::EMPTY
     }
 }
 pub struct Execution(*mut UnwindGuard);

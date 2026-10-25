@@ -50,6 +50,7 @@ static STATE: Storage = Storage {
         depth: 0,
         name: Text::literal(b"r4d-owner"),
         queue: WaitQueue::EMPTY,
+        ..UnwindGuard::EMPTY
     }),
     callbacks: UnsafeCell::new(
         [Callback {

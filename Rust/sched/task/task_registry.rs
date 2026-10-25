@@ -800,7 +800,9 @@ pub(super) unsafe fn mark_ready(task: *mut Task, now: u64) {
             return;
         }
         let blocked = (*c).state == State::Blocked;
-        unlink_timeout(task);
+        if (*c).guard_offer.is_empty() {
+            unlink_timeout(task);
+        }
         (*c).state = State::Ready;
         refresh_current_work(task);
         (*c).running_cpu = 0xff;
@@ -823,7 +825,9 @@ pub(super) unsafe fn mark_running(task: *mut Task) {
         }
         let blocked = (*c).state == State::Blocked;
         unlink_ready(task);
-        unlink_timeout(task);
+        if (*c).guard_offer.is_empty() {
+            unlink_timeout(task);
+        }
         let cpu = percpu::current_index();
         assert!(!(*c).cpu_affinity_bound || u32::from((*c).home_cpu) == cpu);
         assert!((*c).placement_revision == 0 || super::thread_placement::allows(task, cpu));
@@ -928,6 +932,7 @@ pub(super) unsafe fn begin_wait(
     object: u64,
 ) {
     unsafe {
+        assert!((*core(task)).guard_offer.is_empty());
         unlink_ready(task);
         unlink_timeout(task);
         let c = core(task);
@@ -941,6 +946,13 @@ pub(super) unsafe fn begin_wait(
         refresh_current_work(task);
         link_timeout(task);
         bump_epoch();
+    }
+}
+// Runtime held; shared by successful guard claim and abortable offer cleanup.
+pub(crate) unsafe fn clear_guard_deadline(task: *mut Task) {
+    unsafe {
+        unlink_timeout(task);
+        (*core(task)).wake_tick = 0;
     }
 }
 pub(super) unsafe fn finish_wait(
@@ -958,11 +970,17 @@ pub(super) unsafe fn finish_wait(
         };
         (*c).last_wait_ticks = ticks;
         (*c).max_wait_ticks = (*c).max_wait_ticks.max(ticks);
-        unlink_timeout(task);
+        let offered = !(*c).guard_offer.is_empty();
+        assert!(!offered || result == super::task_types::WaitResult::Signaled);
+        if !offered {
+            unlink_timeout(task);
+        }
         (*c).state = State::Ready;
         refresh_current_work(task);
         (*c).ready_since_tick = now;
-        (*c).wake_tick = 0;
+        if !offered {
+            (*c).wake_tick = 0;
+        }
         (*c).blocked_since_tick = 0;
         (*c).wait_reason = super::task_types::Bytes::default();
         (*c).wait_object = 0;
@@ -985,6 +1003,7 @@ pub(super) unsafe fn transition_dead(
 ) {
     unsafe {
         let c = core(task);
+        crate::sched::sync_guard::cancel(task, result);
         crate::sched::mutex_pi::detach(task);
         unlink_ready(task);
         unlink_timeout(task);
@@ -1026,10 +1045,10 @@ pub(crate) unsafe fn replace_donation_owned(task: *mut Task, from: u8, to: u8) {
         if to != NO_RANK {
             (*raw()).donation_requests = (*raw()).donation_requests.wrapping_add(1);
             // Each held Mutex contributes at most once. Direct donations
-            // reserve u32::MAX slots for all possible held-lock contributions.
+            // reserve 2*u32::MAX+1 slots for held mutexes, guards and one offer.
             (*c).inherited_rank_counts[to as usize] = (*c).inherited_rank_counts[to as usize]
                 .checked_add(1)
-                .expect("Mutex donation source count");
+                .expect("Lock donation source count");
             (*raw()).donation_applied = (*raw()).donation_applied.wrapping_add(1);
         }
         let next = inherited_rank(task);
@@ -1055,7 +1074,9 @@ pub(crate) unsafe fn donate(id: u32, generation: u64, rank: u8) -> bool {
             (*raw()).donation_requests = (*raw()).donation_requests.wrapping_add(1);
             return false;
         }
-        if (*core(target)).inherited_rank_counts[rank as usize] >= u64::MAX - u64::from(u32::MAX) {
+        if (*core(target)).inherited_rank_counts[rank as usize]
+            >= u64::MAX - (2 * u64::from(u32::MAX) + 1)
+        {
             (*raw()).donation_requests = (*raw()).donation_requests.wrapping_add(1);
             return false;
         }

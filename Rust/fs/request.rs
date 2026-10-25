@@ -236,6 +236,7 @@ const fn guard(name: &'static [u8]) -> UnwindGuard {
                 generation: 1,
             },
         },
+        ..UnwindGuard::EMPTY
     }
 }
 struct Gates(UnsafeCell<[UnwindGuard; LANES]>);

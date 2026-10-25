@@ -62,6 +62,10 @@ pub struct UnwindGuard {
     pub depth: u32,
     pub name: Text,
     pub queue: WaitQueue,
+    pub(crate) owner_task: *mut super::task::task_types::Task,
+    pub(crate) waiter_ranks: [usize; 4],
+    pub(crate) donation_rank: u8,
+    pub(crate) handoff_epoch: u64,
 }
 pub type Predicate = unsafe extern "C" fn(*mut c_void) -> bool;
 pub type Release = unsafe extern "C" fn(*mut c_void);
@@ -148,6 +152,20 @@ impl Mutex {
         waiter_ranks: [0; 4],
     };
 }
+impl UnwindGuard {
+    pub const EMPTY: Self = Self {
+        owner: 0,
+        owner_generation: 0,
+        boot_owner: false,
+        depth: 0,
+        name: Text::literal(b"guard"),
+        queue: WaitQueue::EMPTY,
+        owner_task: core::ptr::null_mut(),
+        waiter_ranks: [0; 4],
+        donation_rank: 255,
+        handoff_epoch: 0,
+    };
+}
 impl WaitRequest {
     pub const fn predicate(
         timeout: u64,
@@ -185,7 +203,7 @@ const _: () = {
     assert!(core::mem::size_of::<Completion>() == 48);
     assert!(core::mem::size_of::<Semaphore>() == 48);
     assert!(core::mem::size_of::<Mutex>() == 128);
-    assert!(core::mem::size_of::<UnwindGuard>() == 80);
+    assert!(core::mem::size_of::<UnwindGuard>() == 136);
     assert!(core::mem::size_of::<WaitRequest>() == 72);
     assert!(core::mem::size_of::<WaitSummary>() == 96);
     assert!(core::mem::size_of::<LockSummary>() == 120);

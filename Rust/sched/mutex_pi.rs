@@ -1,4 +1,4 @@
-//! Mutex priority inheritance, serialized by the scheduler Runtime owner.
+//! Mutex/UnwindGuard priority inheritance, serialized by the scheduler Runtime owner.
 //!
 //! One exact waiter edge contributes to four per-lock rank counts. One lock
 //! contributes its minimum to its held owner, including masked donations.
@@ -7,7 +7,7 @@
 //! either can be recycled. No allocation, registry scan or recursive walk.
 pub(crate) mod probe;
 use super::{
-    sync_types::Mutex,
+    sync_types::{Mutex, UnwindGuard, WaitQueue},
     task::{
         task_registry as registry,
         task_types::{State, Task},
@@ -20,20 +20,51 @@ pub(crate) const NO_RANK: u8 = 255;
 pub(crate) const STEPS: usize = 8;
 const VALIDATION_STEPS: usize = 64;
 
+// Both lock kinds share the same dependency graph and bounded continuation.
+// A guard offer retains its exact task until cancellation/claim; actual owners
+// retain their original held-lock or unwind admission count.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Lock {
+    None,
+    Mutex(*mut Mutex),
+    Guard(*mut UnwindGuard),
+}
+macro_rules! field {
+    ($name:ident, $ty:ty) => {
+        unsafe fn $name(self) -> *mut $ty {
+            unsafe {
+                match self {
+                    Self::Mutex(p) => ptr::addr_of_mut!((*p).$name),
+                    Self::Guard(p) => ptr::addr_of_mut!((*p).$name),
+                    Self::None => panic!("Missing PI lock"),
+                }
+            }
+        }
+    };
+}
+impl Lock {
+    field!(queue, WaitQueue);
+    field!(owner, u32);
+    field!(owner_generation, u64);
+    field!(owner_task, *mut Task);
+    field!(donation_rank, u8);
+    field!(waiter_ranks, [usize; 4]);
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Edge {
-    mutex: *mut Mutex,
+    lock: Lock,
     generation: u64,
     rank: u8,
 }
 impl Edge {
     pub(crate) const EMPTY: Self = Self {
-        mutex: ptr::null_mut(),
+        lock: Lock::None,
         generation: 0,
         rank: NO_RANK,
     };
     pub(crate) fn is_empty(self) -> bool {
-        self.mutex.is_null()
+        self.lock == Lock::None
     }
 }
 struct Pending {
@@ -51,38 +82,46 @@ static PENDING: Cell = Cell(UnsafeCell::new(Pending {
 
 /// Caller holds Runtime and the exact held mutex. held_lock_count excludes
 /// retirement of owner_task until release_owner clears that pointer.
-unsafe fn owner(m: *mut Mutex) -> *mut Task {
+unsafe fn owner(m: Lock) -> *mut Task {
     unsafe {
-        let t = (*m).owner_task;
+        let t = *m.owner_task();
         if t.is_null() {
-            assert!((*m).owner == 0 && (*m).owner_generation == 0);
+            assert!((*m.owner()) == 0 && (*m.owner_generation()) == 0);
             return t;
         }
         let c = registry::core(t);
-        assert!((*c).id == (*m).owner && (*c).generation == (*m).owner_generation);
-        assert!((*c).held_lock_count != 0 && !matches!((*c).state, State::Unused | State::Dead));
+        assert!((*c).id == (*m.owner()) && (*c).generation == (*m.owner_generation()));
+        assert!(!matches!((*c).state, State::Unused | State::Dead));
+        match m {
+            Lock::Mutex(_) => assert!((*c).held_lock_count != 0),
+            Lock::Guard(g) => assert!(
+                (*g).depth != 0 && (*c).unwind_guard_count != 0
+                    || (*g).depth == 0 && super::sync_guard::offered(t, g)
+            ),
+            Lock::None => unreachable!(),
+        }
         t
     }
 }
-unsafe fn refresh(m: *mut Mutex) {
+unsafe fn refresh(m: Lock) {
     unsafe {
         let t = owner(m);
         if t.is_null() {
-            assert!((*m).donation_rank == NO_RANK);
+            assert!((*m.donation_rank()) == NO_RANK);
             return;
         }
         // Batch urgency cannot improve any role. Its count still tracks its
         // exact node so later promotion and detach use the same four buckets.
         let rank = (0..3)
-            .find(|&i| (*m).waiter_ranks[i] != 0)
+            .find(|&i| (*m.waiter_ranks())[i] != 0)
             .map_or(NO_RANK, |i| i as u8);
-        let old = (*m).donation_rank;
+        let old = *m.donation_rank();
         if rank == old {
             return;
         }
         let inversion = rank < registry::dispatch_rank(t);
         registry::replace_donation_owned(t, old, rank);
-        (*m).donation_rank = rank;
+        (*m.donation_rank()) = rank;
         super::sync_stats::lock_change(|s| {
             if old != NO_RANK {
                 s.role_donation_releases = s.role_donation_releases.wrapping_add(1);
@@ -96,32 +135,32 @@ unsafe fn refresh(m: *mut Mutex) {
         });
     }
 }
-pub(crate) unsafe fn accept_owner(m: *mut Mutex, t: *mut Task) {
+pub(super) unsafe fn accept_owner(m: Lock, t: *mut Task) {
     unsafe {
-        assert!((*m).owner_task.is_null() && (*m).donation_rank == NO_RANK);
-        (*m).owner_task = t;
+        assert!((*m.owner_task()).is_null() && (*m.donation_rank()) == NO_RANK);
+        (*m.owner_task()) = t;
         refresh(m);
     }
 }
-pub(crate) unsafe fn release_owner(m: *mut Mutex) {
+pub(super) unsafe fn release_owner(m: Lock) {
     unsafe {
         let t = owner(m);
         assert!(!t.is_null());
-        let old = (*m).donation_rank;
+        let old = *m.donation_rank();
         if old != NO_RANK {
             registry::replace_donation_owned(t, old, NO_RANK);
             super::sync_stats::lock_change(|s| {
                 s.role_donation_releases = s.role_donation_releases.wrapping_add(1)
             });
         }
-        (*m).donation_rank = NO_RANK;
-        (*m).owner_task = ptr::null_mut();
+        (*m.donation_rank()) = NO_RANK;
+        (*m.owner_task()) = ptr::null_mut();
     }
 }
 /// A prospective edge is rejected if it would close a cycle, or if bounded
 /// validation cannot prove it acyclic. This is an ordinary failed lock wait,
 /// not a claimed cycle result. Following owners uses their held lifetime.
-unsafe fn acyclic(waiter: *mut Task, m: *mut Mutex) -> bool {
+unsafe fn acyclic(waiter: *mut Task, m: Lock) -> bool {
     unsafe {
         let mut t = owner(m);
         for _ in 0..VALIDATION_STEPS {
@@ -131,14 +170,14 @@ unsafe fn acyclic(waiter: *mut Task, m: *mut Mutex) -> bool {
             if t == waiter {
                 return false;
             }
-            let edge = (*registry::core(t)).mutex_edge;
+            let edge = (*registry::core(t)).lock_edge;
             if edge.is_empty() {
                 return true;
             }
             if !valid_edge(t, edge) {
                 return false;
             }
-            t = owner(edge.mutex);
+            t = owner(edge.lock);
         }
         false
     }
@@ -150,26 +189,32 @@ unsafe fn valid_edge(t: *mut Task, edge: Edge) -> bool {
             && (*c).state == State::Blocked
             && (*c).wait_node.owner == t.cast()
             && (*c).wait_node.owner_generation == (*c).generation
-            && (*c).wait_node.queue == ptr::addr_of_mut!((*edge.mutex).queue.core)
-            && (*edge.mutex).queue.core.generation == edge.generation
-            && !(*edge.mutex).queue.core.closing
+            && (*c).wait_node.queue == ptr::addr_of_mut!((*edge.lock.queue()).core)
+            && (*edge.lock.queue()).core.generation == edge.generation
+            && !(*edge.lock.queue()).core.closing
+    }
+}
+pub(super) unsafe fn bound(t: *mut Task, lock: Lock) -> bool {
+    unsafe {
+        let edge = (*registry::core(t)).lock_edge;
+        edge.lock == lock && valid_edge(t, edge)
     }
 }
 /// After exact node enrollment and Blocked publication, before the saved park.
-pub(crate) unsafe fn bind(t: *mut Task, m: *mut Mutex) -> bool {
+pub(super) unsafe fn bind(t: *mut Task, m: Lock) -> bool {
     unsafe {
         let c = registry::core(t);
-        assert!((*c).mutex_edge.is_empty() && !(*c).pi_queued);
+        assert!((*c).lock_edge.is_empty() && !(*c).pi_queued);
         let edge = Edge {
-            mutex: m,
-            generation: (*m).queue.core.generation,
+            lock: m,
+            generation: (*m.queue()).core.generation,
             rank: registry::wake_rank(t),
         };
         if !valid_edge(t, edge) || !acyclic(t, m) {
             return false;
         }
-        (*m).waiter_ranks[edge.rank as usize] += 1;
-        (*c).mutex_edge = edge;
+        (*m.waiter_ranks())[edge.rank as usize] += 1;
+        (*c).lock_edge = edge;
         refresh(m);
         true
     }
@@ -179,7 +224,7 @@ pub(crate) unsafe fn bind(t: *mut Task, m: *mut Mutex) -> bool {
 pub(crate) unsafe fn changed(t: *mut Task) {
     unsafe {
         let c = registry::core(t);
-        if (*c).mutex_edge.is_empty() || (*c).pi_queued {
+        if (*c).lock_edge.is_empty() || (*c).pi_queued {
             return;
         }
         let p = PENDING.0.get();
@@ -222,18 +267,18 @@ unsafe fn unqueue(t: *mut Task) {
 pub(crate) unsafe fn detach(t: *mut Task) -> bool {
     unsafe {
         let c = registry::core(t);
-        let edge = (*c).mutex_edge;
+        let edge = (*c).lock_edge;
         unqueue(t);
-        (*c).mutex_edge = Edge::EMPTY;
+        (*c).lock_edge = Edge::EMPTY;
         if !edge.is_empty() {
-            let m = edge.mutex;
-            assert!((*c).wait_node.queue == ptr::addr_of_mut!((*m).queue.core));
+            let m = edge.lock;
+            assert!((*c).wait_node.queue == ptr::addr_of_mut!((*m.queue()).core));
             assert!(
                 (*c).wait_node.owner == t.cast()
                     && (*c).wait_node.owner_generation == (*c).generation
             );
-            assert!((*m).waiter_ranks[edge.rank as usize] != 0);
-            (*m).waiter_ranks[edge.rank as usize] -= 1;
+            assert!((*m.waiter_ranks())[edge.rank as usize] != 0);
+            (*m.waiter_ranks())[edge.rank as usize] -= 1;
             refresh(m);
         }
         wait_node::detach(ptr::addr_of_mut!((*c).wait_node))
@@ -253,17 +298,17 @@ pub(crate) unsafe fn pump() -> bool {
             }
             unqueue(t);
             let c = registry::core(t);
-            let edge = (*c).mutex_edge;
+            let edge = (*c).lock_edge;
             assert!(valid_edge(t, edge));
             let rank = registry::wake_rank(t);
             if rank == edge.rank {
                 continue;
             }
-            let m = edge.mutex;
-            assert!((*m).waiter_ranks[edge.rank as usize] != 0);
-            (*m).waiter_ranks[edge.rank as usize] -= 1;
-            (*m).waiter_ranks[rank as usize] += 1;
-            (*c).mutex_edge.rank = rank;
+            let m = edge.lock;
+            assert!((*m.waiter_ranks())[edge.rank as usize] != 0);
+            (*m.waiter_ranks())[edge.rank as usize] -= 1;
+            (*m.waiter_ranks())[rank as usize] += 1;
+            (*c).lock_edge.rank = rank;
             refresh(m);
         }
         !(*PENDING.0.get()).head.is_null()

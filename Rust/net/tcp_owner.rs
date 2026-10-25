@@ -17,6 +17,7 @@ static OWNER: Storage = Storage(UnsafeCell::new(UnwindGuard {
     depth: 0,
     name: Text::literal(b"net-tcp"),
     queue: WaitQueue::EMPTY,
+    ..UnwindGuard::EMPTY
 }));
 pub(super) struct Guard {
     _task_bound: PhantomData<*mut ()>,

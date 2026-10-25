@@ -237,7 +237,8 @@ unsafe fn queues_held() -> QueueSnapshot {
                 out.valid = false;
             }
             let ready = (*c).state == State::Ready && (*c).running_cpu == 0xff;
-            let timed = (*c).state == State::Blocked && (*c).wake_tick != 0;
+            let timed = ((*c).state == State::Blocked || !(*c).guard_offer.is_empty())
+                && (*c).wake_tick != 0;
             let reap = (*c).retire_pending && !(*c).release_in_progress;
             if (*c).ready_linked != ready
                 || (*c).timeout_linked != timed
@@ -328,7 +329,7 @@ unsafe fn queues_held() -> QueueSnapshot {
                 break;
             }
             if !(*c).timeout_linked
-                || (*c).state != State::Blocked
+                || ((*c).state != State::Blocked && (*c).guard_offer.is_empty())
                 || (*c).wake_tick == 0
                 || (*c).timeout_prev != previous
             {

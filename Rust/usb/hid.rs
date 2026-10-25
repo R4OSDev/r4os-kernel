@@ -33,6 +33,7 @@ static CLASS_OWNER: ClassOwner = ClassOwner(core::cell::UnsafeCell::new(
         depth: 0,
         name: Text::literal(b"usb-hid-class"),
         queue: crate::sched::sync_types::WaitQueue::EMPTY,
+        ..crate::sched::sync_types::UnwindGuard::EMPTY
     },
 ));
 struct Guard;

@@ -59,7 +59,7 @@ unsafe fn safe_saved(task: *mut Task) -> bool {
             && !(*c).rollback_pending
             && (*c).held_lock_count == 0
             && (*c).preempt_disable_depth == 0
-            && !(*c).wait_handoff_guard_pending
+            && (!(*c).wait_handoff_guard_pending && (*c).guard_offer.is_empty())
             && (*c).rsp != 0
             && (!(*c).uses_fpu || ((*c).fpu_state_valid && (*c).fpu_state.is_some()))
     }
@@ -101,7 +101,7 @@ pub(crate) unsafe fn preflight(cpu: u32, remaining: u64) -> Result<(), Reason> {
                     }
                     if (*c).held_lock_count != 0
                         || (*c).preempt_disable_depth != 0
-                        || (*c).wait_handoff_guard_pending
+                        || ((*c).wait_handoff_guard_pending || !(*c).guard_offer.is_empty())
                         || (*c).retire_pending
                         || (*c).release_in_progress
                         || (*c).rollback_pending
@@ -225,7 +225,7 @@ pub(crate) unsafe fn idle_receipt(cpu: u32) -> Option<u64> {
             || (*c).held_lock_count != 0
             || (*c).preempt_disable_depth != 0
             || (*c).unwind_guard_count != 0
-            || (*c).wait_handoff_guard_pending
+            || ((*c).wait_handoff_guard_pending || !(*c).guard_offer.is_empty())
             || (*c).placement_deferred
         {
             return None;

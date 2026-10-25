@@ -139,7 +139,7 @@ unsafe fn mutex_try(m: *mut Mutex) -> bool {
                 (*m).owner_generation = (*c).generation;
                 (*m).depth = 1;
                 (*c).held_lock_count += 1;
-                super::mutex_pi::accept_owner(m, t);
+                super::mutex_pi::accept_owner(super::mutex_pi::Lock::Mutex(m), t);
                 record_acquire(t, m.addr() as u64, (*m).name, (*m).rank, (*m).mode);
                 true
             }
@@ -246,14 +246,14 @@ unsafe fn mutex_handoff(m: *mut Mutex) {
             (*m).depth = 1;
             (*m).handoff_pending = true;
             (*c).held_lock_count += 1;
-            super::mutex_pi::accept_owner(m, t);
+            super::mutex_pi::accept_owner(super::mutex_pi::Lock::Mutex(m), t);
             record_acquire(t, m.addr() as u64, (*m).name, (*m).rank, (*m).mode);
             if wake(t, WaitResult::Signaled) {
                 super::sync_stats::wait_add(super::sync_stats::WaitMetric::WakeOne, 1);
                 super::sync_stats::wait_add(super::sync_stats::WaitMetric::DirectedWakes, 1);
                 return;
             }
-            super::mutex_pi::release_owner(m);
+            super::mutex_pi::release_owner(super::mutex_pi::Lock::Mutex(m));
             record_release(t, m.addr() as u64);
             (*c).held_lock_count -= 1;
             (*m).owner = 0;
@@ -279,7 +279,7 @@ pub(crate) unsafe fn mutex_unlock(m: *mut Mutex) -> bool {
         (*m).depth -= 1;
         note(|s| s.releases = s.releases.wrapping_add(1));
         if (*m).depth == 0 {
-            super::mutex_pi::release_owner(m);
+            super::mutex_pi::release_owner(super::mutex_pi::Lock::Mutex(m));
             record_release(t, m.addr() as u64);
             if (*c).held_lock_count == 0 {
                 note(|s| s.unlock_mismatches = s.unlock_mismatches.wrapping_add(1));
@@ -295,183 +295,9 @@ pub(crate) unsafe fn mutex_unlock(m: *mut Mutex) -> bool {
         true
     }
 }
-// Exact sync-owner metadata projection for passive FS diagnostics. The
-// filesystem never reads mutable guard ownership outside this boundary.
-pub(crate) struct GuardMetadata {
-    pub owner: u32,
-    pub generation: u64,
-    pub depth: u32,
-    pub boot_owner: bool,
-}
-/// # Safety
-/// Exact initialized guard storage remains resident through this bounded
-/// query. No pointer into task/queue state escapes the native sync owner.
-pub(crate) unsafe fn guard_metadata(g: *const UnwindGuard) -> GuardMetadata {
-    let _runtime = runtime::RuntimeGuard::acquire();
-    unsafe {
-        GuardMetadata {
-            owner: (*g).owner,
-            generation: (*g).owner_generation,
-            depth: (*g).depth,
-            boot_owner: (*g).boot_owner,
-        }
-    }
-}
-unsafe fn guard_free(g: *const UnwindGuard) -> bool {
-    unsafe { (*g).owner == 0 && (*g).owner_generation == 0 && !(*g).boot_owner && (*g).depth == 0 }
-}
-pub(crate) unsafe fn guard_owned(g: *const UnwindGuard) -> bool {
-    let _runtime = runtime::RuntimeGuard::acquire();
-    unsafe {
-        let t = current();
-        if t.is_null() {
-            return (*g).boot_owner && (*g).depth != 0;
-        }
-        let c = registry::core(t);
-        (*g).owner == (*c).id && (*g).owner_generation == (*c).generation && (*g).depth != 0
-    }
-}
-pub(crate) unsafe fn guard_try(g: *mut UnwindGuard) -> bool {
-    unsafe {
-        let t = current();
-        if t.is_null() {
-            if guard_free(g) {
-                (*g).boot_owner = true;
-                (*g).depth = 1;
-                return true;
-            }
-            if (*g).boot_owner && (*g).depth != u32::MAX {
-                (*g).depth += 1;
-                return true;
-            }
-            return false;
-        }
-        let flags = wait::enter();
-        let c = registry::core(t);
-        let result = if guard_free(g) {
-            if (*c).unwind_guard_count == u32::MAX {
-                false
-            } else {
-                (*g).owner = (*c).id;
-                (*g).owner_generation = (*c).generation;
-                (*g).depth = 1;
-                (*c).unwind_guard_count += 1;
-                true
-            }
-        } else if (*g).owner == (*c).id && (*g).owner_generation == (*c).generation {
-            if (*g).depth == u32::MAX {
-                false
-            } else {
-                (*g).depth += 1;
-                true
-            }
-        } else {
-            false
-        };
-        wait::leave(flags);
-        result
-    }
-}
-unsafe fn guard_permanent(g: *const UnwindGuard) -> bool {
-    let _runtime = runtime::RuntimeGuard::acquire();
-    unsafe {
-        let t = current();
-        if t.is_null() {
-            return (*g).boot_owner && (*g).depth == u32::MAX;
-        }
-        let c = registry::core(t);
-        if guard_free(g) {
-            return (*c).unwind_guard_count == u32::MAX;
-        }
-        (*g).owner == (*c).id && (*g).owner_generation == (*c).generation && (*g).depth == u32::MAX
-    }
-}
-unsafe extern "C" fn guard_needed(raw: *mut c_void) -> bool {
-    unsafe { !guard_free(raw.cast()) }
-}
-pub(crate) unsafe fn guard_enter(g: *mut UnwindGuard, timeout: u64) -> bool {
-    unsafe {
-        if guard_try(g) {
-            return true;
-        }
-        if guard_permanent(g) || timeout == 0 {
-            return false;
-        }
-        let bounded = timeout != u64::MAX;
-        let deadline = if bounded {
-            timer::r4os_rust_timer_control(7, timeout, 0)
-        } else {
-            0
-        };
-        let mut remaining = timeout;
-        loop {
-            let request = WaitRequest::predicate(remaining, (*g).name, guard_needed, g.cast());
-            if wait::wait(ptr::addr_of_mut!((*g).queue), &request) != WaitResult::Signaled {
-                return false;
-            }
-            if guard_try(g) {
-                return true;
-            }
-            if guard_permanent(g) {
-                return false;
-            }
-            if bounded {
-                let now = timer::tick_count();
-                if now >= deadline {
-                    return false;
-                }
-                remaining = deadline - now;
-            }
-        }
-    }
-}
-pub(crate) unsafe fn guard_leave(g: *mut UnwindGuard) -> bool {
-    unsafe {
-        let t = current();
-        if t.is_null() {
-            if !(*g).boot_owner || (*g).depth == 0 {
-                return false;
-            }
-            (*g).depth -= 1;
-            if (*g).depth == 0 {
-                (*g).boot_owner = false;
-                super::sync_wait::r4os_rust_sync_queue(
-                    ptr::addr_of_mut!((*g).queue),
-                    1,
-                    ptr::null_mut(),
-                    0,
-                    ptr::null_mut(),
-                );
-            }
-            return true;
-        }
-        let c = registry::core(t);
-        let flags = wait::enter();
-        if (*g).owner != (*c).id || (*g).owner_generation != (*c).generation || (*g).depth == 0 {
-            wait::leave(flags);
-            return false;
-        }
-        (*g).depth -= 1;
-        if (*g).depth == 0 {
-            if (*c).unwind_guard_count != 0 {
-                (*c).unwind_guard_count -= 1;
-            }
-            (*g).owner = 0;
-            (*g).owner_generation = 0;
-            // Wake all contenders while the outer owner is still held. Selection does
-            // not grant this guard: a killed waiter must not strand the free guard.
-            super::sync_wait::r4os_rust_sync_queue(
-                ptr::addr_of_mut!((*g).queue),
-                1,
-                ptr::null_mut(),
-                0,
-                ptr::null_mut(),
-            );
-        }
-        wait::leave(flags);
-        true
-    }
-}
+pub(crate) use super::sync_guard::{
+    guard_enter, guard_leave, guard_metadata, guard_owned, guard_try,
+};
 /// # Safety
 /// Mutex is stable exclusive C storage under its original caller lifetime;
 /// blocking calls retain no Rust borrow or runtime guard across dispatch.

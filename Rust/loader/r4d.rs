@@ -134,6 +134,7 @@ static GUARD: Guard = Guard(UnsafeCell::new(UnwindGuard {
             generation: 1,
         },
     },
+    ..UnwindGuard::EMPTY
 }));
 
 fn span(s: &[u8]) -> t::Bytes {

@@ -37,6 +37,7 @@ static OBJECTS: Cell = Cell(UnsafeCell::new(Objects {
         depth: 0,
         name: Text::literal(b"spectra-unwind"),
         queue: WaitQueue::EMPTY,
+        ..UnwindGuard::EMPTY
     },
 }));
 static CONTENDED: AtomicBool = AtomicBool::new(false);
@@ -225,6 +226,6 @@ pub(super) fn run() -> bool {
         if ok {
             update(|r| r.unwind_checks += 1);
         }
-        ok
+        ok && crate::sched::sync_guard::probe::run()
     }
 }

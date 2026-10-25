@@ -146,6 +146,7 @@ const CALL_OWNER: UnwindGuard = UnwindGuard {
     depth: 0,
     name: GuardText::literal(b"r4p-call"),
     queue: WaitQueue::EMPTY,
+    ..UnwindGuard::EMPTY
 };
 struct CallOwners(UnsafeCell<[UnwindGuard; N]>);
 // Only the native exact task/generation-bound guard mutates each record.

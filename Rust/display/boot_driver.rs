@@ -84,6 +84,7 @@ static EXECUTION: Storage<UnwindGuard> = Storage(UnsafeCell::new(UnwindGuard {
     depth: 0,
     name: Text::literal(b"boot-display-driver"),
     queue: WaitQueue::EMPTY,
+    ..UnwindGuard::EMPTY
 }));
 static BRIDGE: Storage<Option<Bridge>> = Storage(UnsafeCell::new(None));
 struct Execution;
