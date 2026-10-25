@@ -62,7 +62,7 @@ pub(super) unsafe fn lazy(
                 storage::rollback(id, &mut storage);
                 return false;
             }
-            (*gui(&fake)).building_frame = frame;
+            life::set_building(gui(&fake), frame);
             frame
         } else {
             ptr::null_mut()
@@ -111,7 +111,7 @@ pub(super) unsafe fn zero_initialization(id: u32, heap: &heap::Stats, base: &t::
             storage::rollback(id, &mut first);
             return false;
         }
-        (*gui(&first_fake)).building_frame = frame;
+        life::set_building(gui(&first_fake), frame);
         let Some(mut render) = gs::prepare_blit(&mut first_fake, frame, 1, 2) else {
             storage::rollback(id, &mut first);
             return false;
@@ -138,7 +138,7 @@ pub(super) unsafe fn zero_initialization(id: u32, heap: &heap::Stats, base: &t::
             storage::rollback(id + 1, &mut second);
             return false;
         }
-        (*gui(&second_fake)).building_frame = frame;
+        life::set_building(gui(&second_fake), frame);
         let Some(mut render) = gs::prepare_blit(&mut second_fake, frame, 1, 2) else {
             storage::rollback(id + 1, &mut second);
             return false;
@@ -204,6 +204,7 @@ pub(super) unsafe fn atomic_growth_failure(id: u32, heap: &heap::Stats, base: &t
                 || (*committed).generation != generation
                 || hash(committed) != old_hash
                 || flow::cancel(&mut fake) != 0
+                || accounting::checked(gui).is_none()
             {
                 storage::rollback(id, &mut storage);
                 return false;
@@ -243,7 +244,7 @@ pub(super) unsafe fn atomic_growth_failure(id: u32, heap: &heap::Stats, base: &t
                 && (*gui).committed_frame == committed
                 && (*committed).generation == generation
                 && hash(committed) == old_hash;
-            let cancelled = flow::cancel(&mut fake) == 0;
+            let cancelled = flow::cancel(&mut fake) == 0 && accounting::checked(gui).is_some();
             if !rejected
                 || !failed_build
                 || !old_unchanged

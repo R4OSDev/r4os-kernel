@@ -155,7 +155,16 @@ pub(super) unsafe fn commit_command(storage: *mut CommandStorage, command: t::Gu
         (*node).command_count += 1;
         (*frame).command_count += 1;
         payload::r4os_rust_program_payload_account(4, 0, 1);
-        gui_lifetime::refresh_peak((*storage).gui);
+        gui_lifetime::append(
+            (*storage).gui,
+            frame,
+            if (*storage).new_payload {
+                u64::from((*node).header.requested_bytes)
+            } else {
+                0
+            },
+            1,
+        );
         (*frame).command_count.min(i32::MAX as u64) as i32
     }
 }
@@ -223,7 +232,12 @@ pub(super) unsafe fn commit_resource(storage: *mut ResourceStorage) {
         (*frame).resource_tail = node;
         (*frame).resource_len = (*storage).next_resource_len;
         (*frame).raster_words = (*storage).next_raster_words;
-        gui_lifetime::refresh_peak((*storage).gui);
+        gui_lifetime::append(
+            (*storage).gui,
+            frame,
+            u64::from((*node).header.requested_bytes),
+            0,
+        );
     }
 }
 fn rollback_stat() {

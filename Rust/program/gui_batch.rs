@@ -173,6 +173,17 @@ unsafe fn splice(gui: *mut t::Gui, building: *mut t::Frame, delta: *mut t::Frame
             }
             (*building).resource_tail = (*delta).resource_tail;
         }
+        // Private delta nodes enter the accepted GUI graph exactly here.
+        // Its temporary frame header remains private and is released below.
+        life::append(
+            gui,
+            building,
+            (*delta)
+                .local_bytes
+                .checked_sub(u64::from((*delta).header.requested_bytes))
+                .expect("GUI batch node bytes"),
+            (*delta).command_count,
+        );
         (*building).command_count += (*delta).command_count;
         (*building).resource_len += (*delta).resource_len;
         (*building).raster_words += (*delta).raster_words;
@@ -186,7 +197,7 @@ unsafe fn splice(gui: *mut t::Gui, building: *mut t::Frame, delta: *mut t::Frame
         (*delta).resource_len = 0;
         (*delta).raster_words = 0;
         (*delta).node_sequence = 0;
-        life::refresh_peak(gui);
+        (*delta).local_bytes = u64::from((*delta).header.requested_bytes);
     }
 }
 struct Delta {

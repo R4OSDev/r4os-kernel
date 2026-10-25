@@ -13,7 +13,7 @@ pub(super) unsafe fn append_rasters(instance: *mut ProgramInstance, count: usize
             if frame.is_null() {
                 return false;
             }
-            (*gui).building_frame = frame;
+            life::set_building(gui, frame);
         }
         for index in 0..count {
             let Some(mut render) = gs::prepare_blit(instance, frame, PIXELS, 2) else {
@@ -66,8 +66,9 @@ pub(super) unsafe fn raster_growth(id: u32, heap: &heap::Stats, base: &t::Stats)
             && expected >= 256 * 384
             && crossing_valid
             && safe
-            && life::valid(frame, id);
-        (*gui).building_frame = ptr::null_mut();
+            && life::valid(frame, id)
+            && accounting::at_peak(gui);
+        life::set_building(gui, ptr::null_mut());
         let cleared = life::release_frame(frame, id);
         let retried = append_rasters(&mut fake, 1);
         let retry = (*gui).building_frame;
@@ -81,7 +82,8 @@ pub(super) unsafe fn raster_growth(id: u32, heap: &heap::Stats, base: &t::Stats)
             && !head.is_null()
             && (*head).logical_offset == 0
             && (*retry).resource_tail == head
-            && life::valid(retry, id);
+            && life::valid(retry, id)
+            && accounting::checked(gui).is_some();
         storage::rollback(id, &mut storage);
         full && cleared && valid && baseline(heap, base)
     }
@@ -115,7 +117,8 @@ pub(super) unsafe fn raster_growth_failure(id: u32, heap: &heap::Stats, base: &t
             && (*frame).command_count == old_commands
             && (*frame).raster_words == old_words
             && (*frame).resource_tail == old_tail
-            && life::valid(frame, id);
+            && life::valid(frame, id)
+            && accounting::at_peak(gui);
         storage::rollback(id, &mut storage);
         unchanged && baseline(heap, base)
     }
@@ -166,11 +169,14 @@ pub(super) unsafe fn dynamic_commands(id: u32, heap: &heap::Stats, base: &t::Sta
         boundaries = boundaries
             && view::r4os_rust_program_gui_view_command(building, 4096, false).is_null()
             && peak
-            && (*gui).frame_peak_bytes >= life::owned(gui, false)
+            && accounting::at_peak(gui)
             && life::valid(building, id);
+        let final_peak = accounting::peak(gui);
         let committed = boundaries
             && flow::commit(&mut fake) == 0
-            && (*(*gui).committed_frame).command_count == 4096;
+            && (*(*gui).committed_frame).command_count == 4096
+            && accounting::checked(gui).is_some()
+            && accounting::peak(gui) == final_peak;
         storage::rollback(id, &mut storage);
         committed && baseline(heap, base)
     }
@@ -256,9 +262,12 @@ pub(super) unsafe fn retired_reader(id: u32, heap: &heap::Stats, base: &t::Stats
             && (*capture.frame).generation == generation
             && hash(capture.frame) == old_hash
             && flow::capture(&mut fake, Some(generation), false).is_none()
-            && (*gui).frame_peak_bytes >= life::owned(gui, false);
+            && accounting::at_peak(gui);
+        let final_peak = accounting::peak(gui);
         flow::release_capture(&mut fake, &mut capture);
-        let released = (*gui).retired_frames.is_null();
+        let released = (*gui).retired_frames.is_null()
+            && accounting::checked(gui).is_some()
+            && accounting::peak(gui) == final_peak;
         storage::rollback(id, &mut storage);
         valid && released && baseline(heap, base)
     }
@@ -270,12 +279,24 @@ pub(super) unsafe fn batch(
     resources: &[u8],
 ) -> i32 {
     unsafe {
-        gui_batch::r4os_rust_program_gui_batch(
+        let gui = gui(instance);
+        let Some(before) = accounting::checked(gui) else {
+            return c::gui_frame_error_state;
+        };
+        let peak = accounting::peak(gui);
+        let result = gui_batch::r4os_rust_program_gui_batch(
             instance,
             commands.as_ptr(),
             commands.len(),
             span(resources),
-        )
+        );
+        if !accounting::after_append(gui, peak)
+            || (result != c::gui_frame_result_ok && accounting::checked(gui) != Some(before))
+        {
+            log(b"[PINSTSTOR] batch accounting mismatch\r\n");
+            return c::gui_frame_error_state;
+        }
+        result
     }
 }
 

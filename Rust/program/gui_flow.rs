@@ -90,6 +90,7 @@ pub(super) unsafe fn remove_retired(gui: *mut t::Gui, frame: *mut t::Frame) -> b
                 } else {
                     (*gui).retired_frames = (*cursor).retired_next;
                 }
+                life::remove_owned(gui, cursor);
                 (*cursor).retired_next = ptr::null_mut();
                 (*cursor).retired = false;
                 return true;
@@ -126,6 +127,7 @@ pub(super) unsafe fn remove_releasable(
                 } else {
                     (*gui).retired_frames = (*cursor).retired_next;
                 }
+                life::remove_owned(gui, cursor);
                 (*cursor).retired_next = ptr::null_mut();
                 (*cursor).retired = false;
                 return cursor;
@@ -169,6 +171,12 @@ pub(super) unsafe fn link_command(frame: *mut t::Frame, node: *mut t::Commands) 
         }
         (*frame).command_tail = node;
         (*frame).command_count += u64::from((*node).command_count);
+        life::append(
+            ptr::null_mut(),
+            frame,
+            u64::from((*node).header.requested_bytes),
+            0,
+        );
         payload::r4os_rust_program_payload_account(4, 0, u64::from((*node).command_count));
     }
 }
@@ -184,6 +192,12 @@ pub(super) unsafe fn link_resource(frame: *mut t::Frame, node: *mut t::Resource)
         }
         (*frame).resource_tail = node;
         (*frame).resource_len += u64::from((*node).byte_count);
+        life::append(
+            ptr::null_mut(),
+            frame,
+            u64::from((*node).header.requested_bytes),
+            0,
+        );
         if matches!((*node).resource_kind, 2 | 3) {
             (*frame).raster_words += u64::from((*node).byte_count) / 4;
         }
@@ -441,8 +455,7 @@ pub(super) unsafe fn begin(
                 result(gui, contract::gui_frame_error_state)
             };
         }
-        (*gui).building_frame = frame;
-        life::refresh_peak(gui);
+        life::set_building(gui, frame);
         storage::unlock(gui);
         if mode == 0 {
             0
@@ -464,8 +477,7 @@ pub(super) unsafe fn replace(instance: *mut ProgramInstance, explicit: bool) -> 
         }
         storage::lock(gui);
         let old = (*gui).building_frame;
-        (*gui).building_frame = frame;
-        life::refresh_peak(gui);
+        life::set_building(gui, frame);
         storage::unlock(gui);
         if !old.is_null() {
             life::release_frame(old, (*instance).id);
@@ -510,8 +522,7 @@ pub(super) unsafe fn ensure(instance: *mut ProgramInstance) -> *mut t::Frame {
                 if (*gui).committed_frame == captured.frame
                     && (*(*gui).committed_frame).generation == captured.generation
                 {
-                    (*gui).building_frame = clone;
-                    life::refresh_peak(gui);
+                    life::set_building(gui, clone);
                     storage::unlock(gui);
                     release_capture(instance, &mut captured);
                     return clone;
@@ -538,8 +549,7 @@ pub(super) unsafe fn ensure(instance: *mut ProgramInstance) -> *mut t::Frame {
                 };
             }
             if (*gui).committed_frame.is_null() {
-                (*gui).building_frame = empty;
-                life::refresh_peak(gui);
+                life::set_building(gui, empty);
                 storage::unlock(gui);
                 return empty;
             }
@@ -560,7 +570,7 @@ pub(super) unsafe fn cancel(instance: *mut ProgramInstance) -> i32 {
             storage::unlock(gui);
             return -3;
         }
-        (*gui).building_frame = ptr::null_mut();
+        life::set_building(gui, ptr::null_mut());
         (*gui).frame_cancels = (*gui).frame_cancels.wrapping_add(1);
         payload::add(mem::offset_of!(t::Stats, gui_frame_cancels), 8, 1);
         storage::unlock(gui);
@@ -652,8 +662,7 @@ pub(super) unsafe fn commit(instance: *mut ProgramInstance) -> i32 {
         (*building).explicit_build = false;
         if delta {
             assert!(!old.is_null());
-            (*building).base_frame = old;
-            (*building).chain_depth = (*old).chain_depth + 1;
+            life::set_base(building, old);
         }
         (*gui).committed_frame = building;
         (*gui).building_frame = ptr::null_mut();
@@ -678,6 +687,7 @@ pub(super) unsafe fn commit(instance: *mut ProgramInstance) -> i32 {
                         .saturating_add(u64::from((*old).chain_depth));
                 }
                 if !life::readers(old) {
+                    life::remove_owned(gui, old);
                     release_old = old;
                 } else {
                     if replacement {

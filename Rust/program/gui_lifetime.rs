@@ -335,51 +335,47 @@ unsafe fn committed(root: *const t::Frame, owner: u32, retired: bool) -> bool {
     }
 }
 unsafe fn local_bytes(frame: *const t::Frame) -> u64 {
-    unsafe {
-        let mut bytes = u64::from((*frame).header.requested_bytes);
-        let mut commands = (*frame).command_payload;
-        while !commands.is_null() {
-            bytes = bytes.wrapping_add(u64::from((*commands).header.requested_bytes));
-            commands = (*commands).next;
-        }
-        let mut resources = (*frame).resource_payload;
-        while !resources.is_null() {
-            bytes = bytes.wrapping_add(u64::from((*resources).header.requested_bytes));
-            resources = (*resources).next;
-        }
-        bytes
-    }
+    unsafe { (*frame).local_bytes }
 }
 pub(super) unsafe fn frame_bytes(frame: *const t::Frame) -> u64 {
+    if frame.is_null() {
+        return 0;
+    }
     unsafe {
-        let mut bytes = 0u64;
-        let mut cursor = frame;
-        let mut depth = 0;
-        while !cursor.is_null() {
-            if depth >= contract::gui_frame_max_delta_chain {
-                return u64::MAX;
-            }
-            bytes = bytes.saturating_add(local_bytes(cursor));
-            depth += 1;
-            cursor = (*cursor).base_frame;
-        }
-        bytes
+        (*frame)
+            .local_bytes
+            .checked_add((*frame).base_bytes)
+            .expect("GUI frame bytes")
     }
 }
 pub(super) unsafe fn chain_count(frame: *const t::Frame, kind: u8) -> u64 {
+    if frame.is_null() {
+        return 0;
+    }
     unsafe {
-        let mut count = 0u64;
-        let mut cursor = frame;
-        while !cursor.is_null() {
-            count = count.saturating_add(match kind {
-                0 => (*cursor).command_count,
-                1 => (*cursor).resource_len,
-                2 => (*cursor).raster_words,
-                _ => unreachable!(),
-            });
-            cursor = (*cursor).base_frame;
-        }
-        count
+        let (local, base) = match kind {
+            0 => ((*frame).command_count, (*frame).base_commands),
+            1 => ((*frame).resource_len, (*frame).base_resources),
+            2 => ((*frame).raster_words, (*frame).base_raster_words),
+            _ => unreachable!(),
+        };
+        local.checked_add(base).expect("GUI chain count")
+    }
+}
+/// Bind an immutable base, or detach it during terminal release. Ownership
+/// moves between roots without charging that same base a second time.
+pub(super) unsafe fn set_base(frame: *mut t::Frame, base: *mut t::Frame) {
+    unsafe {
+        (*frame).base_bytes = frame_bytes(base);
+        (*frame).base_commands = chain_count(base, 0);
+        (*frame).base_resources = chain_count(base, 1);
+        (*frame).base_raster_words = chain_count(base, 2);
+        (*frame).base_frame = base;
+        (*frame).chain_depth = if base.is_null() {
+            1
+        } else {
+            (*base).chain_depth + 1
+        };
     }
 }
 pub(super) unsafe fn readers(frame: *const t::Frame) -> bool {
@@ -412,45 +408,67 @@ pub(super) unsafe fn live_generations(gui: *const t::Gui) -> u32 {
 }
 pub(super) unsafe fn owned(gui: *const t::Gui, commands: bool) -> u64 {
     unsafe {
-        let mut count = 0u64;
-        let committed = (*gui).committed_frame;
-        let building = (*gui).building_frame;
-        if !committed.is_null() {
-            count = count.wrapping_add(if commands {
-                chain_count(committed, 0)
-            } else {
-                frame_bytes(committed)
-            });
+        if commands {
+            (*gui).frame_owned_commands
+        } else {
+            (*gui).frame_owned_bytes
         }
-        if !building.is_null() {
-            count = count.wrapping_add(if commands {
-                (*building).command_count
-            } else {
-                frame_bytes(building)
-            });
-        }
-        let mut retired = (*gui).retired_frames;
-        while !retired.is_null() {
-            count = count.wrapping_add(if commands {
-                chain_count(retired, 0)
-            } else {
-                frame_bytes(retired)
-            });
-            retired = (*retired).retired_next;
-        }
-        count
     }
 }
 pub(super) unsafe fn refresh_peak(gui: *mut t::Gui) {
     unsafe {
-        let bytes = owned(gui, false);
-        let commands = owned(gui, true);
-        if bytes > (*gui).frame_peak_bytes {
-            (*gui).frame_peak_bytes = bytes;
+        (*gui).frame_peak_bytes = (*gui).frame_peak_bytes.max((*gui).frame_owned_bytes);
+        (*gui).frame_peak_commands = (*gui).frame_peak_commands.max((*gui).frame_owned_commands);
+    }
+}
+unsafe fn add_owned(gui: *mut t::Gui, bytes: u64, commands: u64) {
+    unsafe {
+        (*gui).frame_owned_bytes = (*gui)
+            .frame_owned_bytes
+            .checked_add(bytes)
+            .expect("GUI owned bytes");
+        (*gui).frame_owned_commands = (*gui)
+            .frame_owned_commands
+            .checked_add(commands)
+            .expect("GUI owned commands");
+    }
+}
+pub(super) unsafe fn remove_owned(gui: *mut t::Gui, frame: *const t::Frame) {
+    unsafe {
+        (*gui).frame_owned_bytes = (*gui)
+            .frame_owned_bytes
+            .checked_sub(frame_bytes(frame))
+            .expect("GUI removed bytes");
+        (*gui).frame_owned_commands = (*gui)
+            .frame_owned_commands
+            .checked_sub(chain_count(frame, 0))
+            .expect("GUI removed commands");
+    }
+}
+/// The original GUI admission covers this bounded metadata operation. Reserved
+/// private nodes/batches are charged only when their links are adopted.
+pub(super) unsafe fn append(gui: *mut t::Gui, frame: *mut t::Frame, bytes: u64, commands: u64) {
+    unsafe {
+        (*frame).local_bytes = (*frame)
+            .local_bytes
+            .checked_add(bytes)
+            .expect("GUI local bytes");
+        if !gui.is_null() && (*gui).building_frame == frame {
+            add_owned(gui, bytes, commands);
+            refresh_peak(gui);
         }
-        if commands > (*gui).frame_peak_commands {
-            (*gui).frame_peak_commands = commands;
+    }
+}
+/// Adopt/replace/cancel a private building root under the existing GUI lock.
+pub(super) unsafe fn set_building(gui: *mut t::Gui, frame: *mut t::Frame) {
+    unsafe {
+        remove_owned(gui, (*gui).building_frame);
+        (*gui).building_frame = frame;
+        if !frame.is_null() {
+            assert!((*frame).base_frame.is_null());
+            add_owned(gui, frame_bytes(frame), (*frame).command_count);
         }
+        refresh_peak(gui);
     }
 }
 pub(super) unsafe fn release_local(frame: *mut t::Frame, owner: u32) -> bool {
@@ -503,6 +521,7 @@ pub(super) unsafe fn release_local(frame: *mut t::Frame, owner: u32) -> bool {
         (*frame).raster_words = 0;
         (*frame).command_count = 0;
         (*frame).node_sequence = 0;
+        (*frame).local_bytes = u64::from((*frame).header.requested_bytes);
         (*frame).retired_next = ptr::null_mut();
         if !super::shared_raster::release_frames(frame) {
             released = false;
@@ -522,8 +541,7 @@ pub(super) unsafe fn release_frame(frame: *mut t::Frame, owner: u32) -> bool {
         let mut cursor = frame;
         while !cursor.is_null() {
             let base = (*cursor).base_frame;
-            (*cursor).base_frame = ptr::null_mut();
-            (*cursor).chain_depth = 1;
+            set_base(cursor, ptr::null_mut());
             if !release_local(cursor, owner) {
                 released = false;
             }
@@ -593,6 +611,8 @@ pub(super) unsafe fn release_set(gui: *mut t::Gui, owner: u32) -> bool {
         (*gui).building_frame = ptr::null_mut();
         (*gui).committed_frame = ptr::null_mut();
         (*gui).retired_frames = ptr::null_mut();
+        (*gui).frame_owned_bytes = 0;
+        (*gui).frame_owned_commands = 0;
         let mut released = true;
         if !building.is_null() && !release_frame(building, owner) {
             released = false;

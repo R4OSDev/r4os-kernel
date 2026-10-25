@@ -432,6 +432,7 @@ pub(super) unsafe fn delta_indexed(
                 || (*gui).frame_indexed8_commands != 1
                 || (*gui).frame_indexed8_resource_bytes != resource.len() as u64
                 || (*gui).frame_avoided_clone_bytes < base_bytes
+                || !accounting::at_peak(gui)
             {
                 return false;
             }
@@ -507,11 +508,16 @@ pub(super) unsafe fn delta_indexed(
             if batch(&mut fake, &replacement, &[]) != 0
                 || flow::commit(&mut fake) != 0
                 || (*gui).retired_frames != delta
+                || !accounting::at_peak(gui)
             {
                 return false;
             }
+            let final_peak = accounting::peak(gui);
             flow::release_capture(&mut fake, &mut capture);
-            if !(*gui).retired_frames.is_null() {
+            if !(*gui).retired_frames.is_null()
+                || accounting::checked(gui).is_none()
+                || accounting::peak(gui) != final_peak
+            {
                 return false;
             }
             true
@@ -585,6 +591,7 @@ pub(super) unsafe fn replacement_xrgb(id: u32, heap: &heap::Stats, base: &t::Sta
                 || (*committed).replacement != (index != 0)
                 || life::chain_count(committed, 0) != 1
                 || life::chain_count(committed, 1) != resource.len() as u64
+                || accounting::checked(gui).is_none()
             {
                 lifecycle_ok = false;
                 break;
@@ -602,7 +609,10 @@ pub(super) unsafe fn replacement_xrgb(id: u32, heap: &heap::Stats, base: &t::Sta
                 }
                 flow::release_capture(&mut fake, capture.as_mut().expect("First frame capture"));
                 capture = None;
-                if !(*gui).retired_frames.is_null() || life::live_generations(gui) != 1 {
+                if !(*gui).retired_frames.is_null()
+                    || life::live_generations(gui) != 1
+                    || accounting::checked(gui).is_none()
+                {
                     lifecycle_ok = false;
                     break;
                 }

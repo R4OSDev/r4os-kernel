@@ -208,6 +208,13 @@ pub struct Frame {
     pub explicit_build: bool,
     pub replacement: bool,
     pub retired: bool,
+    // Requested bytes of this frame and its linked nodes. Private candidate
+    // allocations count only after linking; immutable base totals are separate.
+    pub local_bytes: u64,
+    pub base_bytes: u64,
+    pub base_commands: u64,
+    pub base_resources: u64,
+    pub base_raster_words: u64,
 }
 
 #[repr(C)]
@@ -253,6 +260,9 @@ pub struct Gui {
     pub text: [u8; 512],
     pub start_attach_pending: bool,
     pub host_launch_pending: bool,
+    // Accepted building/committed/retired roots, excluding private candidates.
+    pub frame_owned_bytes: u64,
+    pub frame_owned_commands: u64,
 }
 
 #[repr(C)]
@@ -544,6 +554,7 @@ pub unsafe fn initialize(kind: u8, memory: *mut u8) {
                         .write(contract::DisplayDamageRect::default());
                 }
                 ptr::addr_of_mut!((*payload).chain_depth).write(1);
+                ptr::addr_of_mut!((*payload).local_bytes).write(mem::size_of::<Frame>() as u64);
             }
             11 => {
                 let payload = memory.cast::<ConsoleTranscript>();
@@ -742,7 +753,7 @@ const _: () = {
     assert!(mem::offset_of!(Resource, byte_count) == 56);
     assert!(mem::offset_of!(Resource, resource_kind) == 60);
     assert!(mem::offset_of!(Resource, reserved) == 62);
-    assert!(mem::size_of::<Frame>() == 256);
+    assert!(mem::size_of::<Frame>() == 296);
     assert!(mem::align_of::<Frame>() == 8);
     assert!(mem::offset_of!(Frame, header) == 88);
     assert!(mem::offset_of!(Frame, command_payload) == 0);
@@ -765,7 +776,12 @@ const _: () = {
     assert!(mem::offset_of!(Frame, explicit_build) == 249);
     assert!(mem::offset_of!(Frame, replacement) == 250);
     assert!(mem::offset_of!(Frame, retired) == 251);
-    assert!(mem::size_of::<Gui>() == 3848);
+    assert!(mem::offset_of!(Frame, local_bytes) == 256);
+    assert!(mem::offset_of!(Frame, base_bytes) == 264);
+    assert!(mem::offset_of!(Frame, base_commands) == 272);
+    assert!(mem::offset_of!(Frame, base_resources) == 280);
+    assert!(mem::offset_of!(Frame, base_raster_words) == 288);
+    assert!(mem::size_of::<Gui>() == 3864);
     assert!(mem::align_of::<Gui>() == 8);
     assert!(mem::offset_of!(Gui, operation_gate) == 2808);
     assert!(mem::offset_of!(Gui, header) == 2920);
@@ -807,6 +823,8 @@ const _: () = {
     assert!(mem::offset_of!(Gui, frame_peak_commands) == 128);
     assert!(mem::offset_of!(Gui, start_attach_pending) == 3844);
     assert!(mem::offset_of!(Gui, host_launch_pending) == 3845);
+    assert!(mem::offset_of!(Gui, frame_owned_bytes) == 3848);
+    assert!(mem::offset_of!(Gui, frame_owned_commands) == 3856);
     assert!(mem::offset_of!(Gui, host_launch_request) == 3004);
     assert!(mem::size_of::<InstanceStorage>() == 32);
     assert!(mem::align_of::<InstanceStorage>() == 8);

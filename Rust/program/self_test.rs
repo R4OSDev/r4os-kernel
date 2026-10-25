@@ -162,7 +162,7 @@ unsafe fn warm() -> bool {
             storage::rollback(fake.id, &mut storage);
             return false;
         }
-        (*gui(&fake)).building_frame = frame;
+        life::set_building(gui(&fake), frame);
         let Some(mut render) = gs::prepare_blit(&mut fake, frame, PIXELS, 2) else {
             storage::rollback(fake.id, &mut storage);
             return false;
@@ -319,7 +319,7 @@ pub(super) unsafe fn run() -> bool {
         };
         log(b"[PINSTSTOR] result=OK cases=");
         dec(case.into());
-        log(b" heap_baseline=ok storage_baseline=ok zero_init=ok\r\n");
+        log(b" heap_baseline=ok storage_baseline=ok zero_init=ok accounting=scan peaks=exact\r\n");
         true
     }
 }
@@ -388,6 +388,7 @@ unsafe fn program_test_buffer_stats(out: *mut BufferStats) {
 }
 
 // Private operation modules share the sole state and original typed owners.
+mod accounting;
 mod command_rasters;
 mod resource_cases;
 mod shared_cases;
