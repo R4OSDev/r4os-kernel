@@ -8,10 +8,9 @@ use super::{
     ntfs_volume_types as t,
 };
 use crate::{
-    contract::TimeState,
     fs::{fat_state, page_cache},
     memory::heap,
-    platform::{time, timer},
+    platform::timer,
     storage::block_registry,
 };
 use core::{
@@ -171,12 +170,21 @@ pub(super) unsafe fn build(v: Mounted) -> t::Volume {
                 data: (*s).upcase,
                 len: if (*s).upcase.is_null() { 0 } else { 131072 },
             },
-            now_filetime: now_filetime(),
+            // No calendar acquisition for a read/cache/flush view. Timestamp
+            // writers must explicitly admit one current operation time.
+            now_filetime: 0,
             security_id_file: 265,
             security_id_dir: 264,
             cache_now_ticks: timer::tick_count(),
         }
     }
+}
+pub(super) fn with_write_time(mut volume: t::Volume) -> Option<t::Volume> {
+    volume.now_filetime = super::ntfs_adapter_time::now_filetime()?;
+    Some(volume)
+}
+pub(super) unsafe fn build_write(volume: Mounted) -> Option<t::Volume> {
+    unsafe { with_write_time(build(volume)) }
 }
 pub(super) unsafe fn release(s: *mut State) {
     unsafe {
@@ -341,29 +349,6 @@ pub(super) unsafe fn inspect(device: usize, first: u32, bound: Option<u64>) -> O
     }
 }
 
-pub fn now_filetime() -> u64 {
-    let mut now = TimeState::default();
-    unsafe { time::r4os_rust_time_state(&mut now) }
-    if now.valid == 0 || now.year < 1601 {
-        return 0;
-    }
-    let y = i64::from(now.year) - i64::from(now.month <= 2);
-    let era = (if y >= 0 { y } else { y - 399 }).div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (i64::from(now.month) + if now.month > 2 { -3 } else { 9 }) + 2).div_euclid(5)
-        + i64::from(now.day)
-        - 1;
-    let days =
-        era * 146097 + yoe * 365 + yoe.div_euclid(4) - yoe.div_euclid(100) + doy - 719468 + 134774;
-    if days < 0 {
-        return 0;
-    }
-    (days as u64 * 86400
-        + u64::from(now.hour) * 3600
-        + u64::from(now.minute) * 60
-        + u64::from(now.second))
-        * 10_000_000
-}
 fn dos(stamp: u64) -> (u16, u16) {
     if stamp == 0 {
         return (0, 0);

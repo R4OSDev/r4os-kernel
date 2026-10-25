@@ -16,6 +16,7 @@ pub mod fat_types;
 pub mod glob;
 pub mod ntfs_adapter;
 pub mod ntfs_adapter_state;
+mod ntfs_adapter_time;
 pub mod ntfs_adapter_types;
 pub mod ntfs_decoded_cache;
 pub mod ntfs_decoded_key;

@@ -352,6 +352,15 @@ unsafe fn write_range(a: Args) -> t::WriteProgress {
             return whole_progress(t::WriteStatus::Io, 0);
         };
         let name = View::of(&location.name[..location.name_len]);
+        // In-place sparse writes above retain their existing metadata contract.
+        // Growing/replacing the file needs a new timestamp before any mutation.
+        let Some(v) = s::with_write_time(v) else {
+            return t::WriteProgress {
+                status: t::WriteStatus::Io,
+                completed: 0,
+                uncertain: false,
+            };
+        };
         if a.number == e.size {
             return whole_progress(
                 append::append(v, location.parent, name, a.number, a.name, true),
@@ -487,16 +496,15 @@ pub unsafe extern "C" fn r4os_rust_ntfs_adapter(
                 present: list_root(a),
                 ..Output::default()
             },
-            17 => status(files::write(s::build(a.volume), a.number, a.name, a.other)),
-            18 => status(files::create(s::build(a.volume), a.number, a.name, a.other)),
-            19 | 20 => status(append::append(
-                s::build(a.volume),
-                a.number,
-                a.name,
-                a.second,
-                a.other,
-                op == 19,
-            )),
+            17 => status(s::build_write(a.volume).map_or(t::WriteStatus::Io, |v| {
+                files::write(v, a.number, a.name, a.other)
+            })),
+            18 => status(s::build_write(a.volume).map_or(t::WriteStatus::Io, |v| {
+                files::create(v, a.number, a.name, a.other)
+            })),
+            19 | 20 => status(s::build_write(a.volume).map_or(t::WriteStatus::Io, |v| {
+                append::append(v, a.number, a.name, a.second, a.other, op == 19)
+            })),
             21 => Output {
                 value: u64::from(diagnostic::append_stage()),
                 ..Output::default()
@@ -527,10 +535,15 @@ pub unsafe extern "C" fn r4os_rust_ntfs_adapter(
                     present: true,
                     status: 0,
                 }),
-            28 => status(dirs::create(s::build(a.volume), a.number, a.name)),
+            28 => status(
+                s::build_write(a.volume)
+                    .map_or(t::WriteStatus::Io, |v| dirs::create(v, a.number, a.name)),
+            ),
             29 => status(dirs::delete(s::build(a.volume), a.number, a.name)),
             30 => {
-                let st = rename::rename(s::build(a.volume), a.number, a.name, a.number, a.other);
+                let st = s::build_write(a.volume).map_or(t::WriteStatus::Io, |v| {
+                    rename::rename(v, a.number, a.name, a.number, a.other)
+                });
                 Output {
                     status: match st {
                         t::WriteStatus::Ok => 0,
@@ -541,31 +554,24 @@ pub unsafe extern "C" fn r4os_rust_ntfs_adapter(
                     ..Output::default()
                 }
             }
-            31 => status(rename::rename(
-                s::build(a.volume),
-                a.number,
-                a.name,
-                a.second,
-                a.other,
-            )),
+            31 => status(s::build_write(a.volume).map_or(t::WriteStatus::Io, |v| {
+                rename::rename(v, a.number, a.name, a.second, a.other)
+            })),
             32 => clusters::free_count(s::build(a.volume)).map_or(Output::default(), |x| Output {
                 value: x.min(u64::from(u32::MAX)),
                 present: true,
                 status: 0,
             }),
             33 => Output {
-                status: atomic::replace(
-                    s::build(a.volume),
-                    a.number,
-                    a.name,
-                    a.other,
-                    a.third,
-                    a.flag,
-                ) as i32,
+                status: s::build_write(a.volume).map_or(atomic::ReplaceResult::Io, |v| {
+                    atomic::replace(v, a.number, a.name, a.other, a.third, a.flag)
+                }) as i32,
                 ..Output::default()
             },
             34 => Output {
-                status: atomic::publish(s::build(a.volume), a.number, a.name, a.other) as i32,
+                status: s::build_write(a.volume).map_or(atomic::ReplaceResult::Io, |v| {
+                    atomic::publish(v, a.number, a.name, a.other)
+                }) as i32,
                 ..Output::default()
             },
             35 => publish_absent_backup(a),
@@ -590,7 +596,9 @@ unsafe fn publish_absent_backup(a: Args) -> Output {
         let st = match lookup::lookup(v, a.number, a.third, &mut backup, false, 0) {
             t::Lookup::Found => atomic::ReplaceResult::Conflict,
             t::Lookup::Io => atomic::ReplaceResult::Io,
-            t::Lookup::NotFound => atomic::publish(v, a.number, a.name, a.other),
+            t::Lookup::NotFound => s::with_write_time(v).map_or(atomic::ReplaceResult::Io, |v| {
+                atomic::publish(v, a.number, a.name, a.other)
+            }),
         };
         Output {
             status: st as i32,
