@@ -240,7 +240,7 @@ impl Counters {
         Self {
             enabled: AtomicBool::new(false),
             sector_bytes: AtomicU32::new(512),
-            capacity: AtomicU32::new(512),
+            capacity: AtomicU32::new(super::page_cache_policy::MAX_ENTRIES as u32),
             entries_used: AtomicU32::new(0),
             dirty_entries: AtomicU32::new(0),
             reads: AtomicU64::new(0),
@@ -295,7 +295,7 @@ impl Counters {
             selective_flushes: AtomicU64::new(0),
             selective_writeback_sectors: AtomicU64::new(0),
             selective_foreign_dirty_sectors_skipped: AtomicU64::new(0),
-            policy_version: AtomicU32::new(2),
+            policy_version: AtomicU32::new(3),
             policy_device_capacity: AtomicU32::new(8),
             policy_dirty_high_pages: AtomicU32::new(64),
             policy_dirty_low_pages: AtomicU32::new(32),
@@ -319,7 +319,7 @@ impl Counters {
             read_ahead_cancellations: AtomicU64::new(0),
             read_ahead_budget_skips: AtomicU64::new(0),
             capacity_min_pages: AtomicU32::new(64),
-            capacity_max_pages: AtomicU32::new(512),
+            capacity_max_pages: AtomicU32::new(super::page_cache_policy::MAX_ENTRIES as u32),
             capacity_ram_limit_pages: AtomicU32::new(64),
             capacity_active_limit_pages: AtomicU32::new(64),
             capacity_pressure_level: AtomicU32::new(0),
@@ -471,7 +471,8 @@ impl Counters {
     pub fn clear(&self) {
         self.enabled.store(false, Relaxed);
         self.sector_bytes.store(512, Relaxed);
-        self.capacity.store(512, Relaxed);
+        self.capacity
+            .store(super::page_cache_policy::MAX_ENTRIES as u32, Relaxed);
         self.entries_used.store(0, Relaxed);
         self.dirty_entries.store(0, Relaxed);
         self.reads.store(0, Relaxed);
@@ -527,7 +528,7 @@ impl Counters {
         self.selective_writeback_sectors.store(0, Relaxed);
         self.selective_foreign_dirty_sectors_skipped
             .store(0, Relaxed);
-        self.policy_version.store(2, Relaxed);
+        self.policy_version.store(3, Relaxed);
         self.policy_device_capacity.store(8, Relaxed);
         self.policy_dirty_high_pages.store(64, Relaxed);
         self.policy_dirty_low_pages.store(32, Relaxed);
@@ -552,7 +553,8 @@ impl Counters {
         self.read_ahead_cancellations.store(0, Relaxed);
         self.read_ahead_budget_skips.store(0, Relaxed);
         self.capacity_min_pages.store(64, Relaxed);
-        self.capacity_max_pages.store(512, Relaxed);
+        self.capacity_max_pages
+            .store(super::page_cache_policy::MAX_ENTRIES as u32, Relaxed);
         self.capacity_ram_limit_pages.store(64, Relaxed);
         self.capacity_active_limit_pages.store(64, Relaxed);
         self.capacity_pressure_level.store(0, Relaxed);

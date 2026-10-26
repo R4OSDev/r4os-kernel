@@ -14,7 +14,14 @@ unsafe fn snapshot() -> Summary {
         let used = c::index(14, 0, 0, false) as u32;
         let s = c::state();
         let dirty = (*s).dirty_pages;
-        let clean = used - dirty;
+        let index = policy::global_index();
+        let busy_dirty: u16 = (*index)
+            .devices
+            .iter()
+            .map(|device| device.busy_dirty)
+            .sum();
+        let busy_clean = u32::from((*index).busy_count - busy_dirty);
+        let clean = (used - dirty).saturating_sub(busy_clean);
         let frames = (*s).payload_frames;
         out.enabled = true;
         out.sector_bytes = c::SECTOR as u32;
@@ -34,7 +41,6 @@ unsafe fn snapshot() -> Summary {
         out.pmm_dirty_bytes = u64::from(dirty) * c::PAGE as u64;
         out.policy_worker_started = u32::from((*s).worker_started);
         out.policy_worker_task_id = (*s).worker_id;
-        let index = policy::global_index();
         out.policy_clean_device_probes = (*index).clean_device_probes;
         out.policy_dirty_device_probes = (*index).dirty_device_probes;
         let cap = c::capacity();

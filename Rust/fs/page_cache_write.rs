@@ -83,25 +83,28 @@ pub(super) unsafe fn write_sector(
 }
 unsafe fn release_pins(owned: &mut [u64; COUNT / 64], reserved: &mut [u64; COUNT / 64]) {
     unsafe {
-        for i in 0..COUNT {
-            let bit = 1u64 << (i % 64);
-            if owned[i / 64] & bit == 0 {
-                continue;
+        for word in 0..owned.len() {
+            let mut pending = owned[word];
+            while pending != 0 {
+                let bit_index = pending.trailing_zeros() as usize;
+                let bit = 1u64 << bit_index;
+                pending &= !bit;
+                let i = word * 64 + bit_index;
+                let e = c::entry(i);
+                if (*e).io_busy {
+                    (*e).io_busy = false;
+                    c::index(7, i, 0, (*e).dirty_mask != 0);
+                }
+                if reserved[i / 64] & bit != 0
+                    && (*e).valid
+                    && (*e).valid_mask == 0
+                    && (*e).dirty_mask == 0
+                {
+                    c::clear(i, false);
+                }
+                owned[i / 64] &= !bit;
+                reserved[i / 64] &= !bit;
             }
-            let e = c::entry(i);
-            if (*e).io_busy {
-                (*e).io_busy = false;
-                c::index(7, i, 0, (*e).dirty_mask != 0);
-            }
-            if reserved[i / 64] & bit != 0
-                && (*e).valid
-                && (*e).valid_mask == 0
-                && (*e).dirty_mask == 0
-            {
-                c::clear(i, false);
-            }
-            owned[i / 64] &= !bit;
-            reserved[i / 64] &= !bit;
         }
     }
 }

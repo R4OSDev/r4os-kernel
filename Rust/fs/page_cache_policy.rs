@@ -6,7 +6,10 @@ use core::{
     ptr,
 };
 
-pub const MAX_ENTRIES: usize = 512;
+pub const MAX_ENTRIES: usize = 8192;
+/// Bulk reads keep at most one bounded fill window in the cold LRU prefix.
+pub const STREAM_SECTORS: u32 = 32;
+pub const TRIM_PAGES: usize = 16;
 pub const MAX_DEVICES: usize = 8;
 pub const NO_INDEX: u16 = 0xffff;
 pub const NO_DEVICE: u8 = 0xff;
@@ -24,7 +27,7 @@ pub struct Capacity {
 }
 
 pub fn capacity_for_memory(reference_free_frames: u64, current_free_frames: u64) -> Capacity {
-    let ram_pages = (reference_free_frames / 128).clamp(64, 512) as u16;
+    let ram_pages = (reference_free_frames / 128).clamp(64, MAX_ENTRIES as u64) as u16;
     let (active_pages, pressure_level) = if current_free_frames <= 1024 {
         (ram_pages.min(64), 3)
     } else if current_free_frames <= 4096 {
@@ -133,6 +136,7 @@ pub struct Link {
     pub next: u16,
     pub device: u8,
     pub queue: Queue,
+    pub cold: bool,
 }
 impl Link {
     const EMPTY: Self = Self {
@@ -140,6 +144,7 @@ impl Link {
         next: NO_INDEX,
         device: NO_DEVICE,
         queue: Queue::Detached,
+        cold: false,
     };
 }
 #[derive(Clone, Copy)]
@@ -314,6 +319,7 @@ impl Index {
                 },
                 device: NO_DEVICE,
                 queue: Queue::Free,
+                cold: false,
             };
             index += 1;
         }
@@ -343,6 +349,9 @@ impl Index {
         Some(index)
     }
     fn attach_clean(&mut self, index: usize, device: usize) -> bool {
+        self.attach_class(index, device, false)
+    }
+    pub(super) fn attach_class(&mut self, index: usize, device: usize, cold: bool) -> bool {
         if index >= MAX_ENTRIES || device >= MAX_DEVICES {
             return false;
         }
@@ -351,7 +360,12 @@ impl Index {
         }
         self.links[index].device = device as u8;
         self.links[index].queue = Queue::Clean;
-        self.link_clean_tail(index, device);
+        self.links[index].cold = cold;
+        if cold {
+            self.link_clean_head(index, device);
+        } else {
+            self.link_clean_tail(index, device);
+        }
         self.devices[device].entries += 1;
         self.devices[device].clean += 1;
         true
@@ -361,6 +375,7 @@ impl Index {
             return;
         }
         let device = usize::from(self.links[index].device);
+        self.links[index].cold = false;
         if self.devices[device].clean_tail == index as u16 {
             return;
         }
@@ -389,6 +404,7 @@ impl Index {
             self.devices[device].pressure_active = true;
         }
         self.links[index].queue = Queue::Dirty;
+        self.links[index].cold = false;
         self.link_dirty_tail(index, device);
         true
     }
@@ -448,7 +464,11 @@ impl Index {
         match self.links[index].queue {
             Queue::BusyClean => {
                 self.links[index].queue = Queue::Clean;
-                self.link_clean_tail(index, device);
+                if self.links[index].cold {
+                    self.link_clean_head(index, device);
+                } else {
+                    self.link_clean_tail(index, device);
+                }
             }
             Queue::BusyDirty => {
                 self.devices[device].busy_dirty -= 1;
@@ -612,6 +632,17 @@ impl Index {
         }
         self.links[index].prev = NO_INDEX;
         self.links[index].next = NO_INDEX;
+    }
+    fn link_clean_head(&mut self, index: usize, device: usize) {
+        let old = self.devices[device].clean_head;
+        self.links[index].prev = NO_INDEX;
+        self.links[index].next = old;
+        if old == NO_INDEX {
+            self.devices[device].clean_tail = index as u16;
+        } else {
+            self.links[usize::from(old)].prev = index as u16;
+        }
+        self.devices[device].clean_head = index as u16;
     }
     fn link_clean_tail(&mut self, index: usize, device: usize) {
         self.link_tail(index, device, false);
@@ -841,12 +872,13 @@ const _: () = {
     assert!(size_of::<SequentialDecision>() == 16);
     assert!(size_of::<Sequential>() == 24);
     assert!(offset_of!(Sequential, last_end_page) == 8);
-    assert!(size_of::<Link>() == 6);
+    assert!(size_of::<Link>() == 8);
     assert!(size_of::<Device>() == 20);
     assert!(size_of::<ReadAheadRequest>() == 24);
     assert!(size_of::<ReadAhead>() == 72);
     assert!(offset_of!(ReadAhead, sequential) == 48);
-    assert!(size_of::<Index>() == 3264);
-    assert!(offset_of!(Index, devices) == 3072);
-    assert!(offset_of!(Index, clean_device_probes) == 3248);
+    assert!(MAX_ENTRIES < u16::MAX as usize);
+    assert!(size_of::<Index>() == MAX_ENTRIES * size_of::<Link>() + 192);
+    assert!(offset_of!(Index, devices) == MAX_ENTRIES * size_of::<Link>());
+    assert!(offset_of!(Index, clean_device_probes) == MAX_ENTRIES * size_of::<Link>() + 176);
 };

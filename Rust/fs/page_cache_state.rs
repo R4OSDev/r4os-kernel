@@ -13,7 +13,8 @@ use crate::{
 use core::{cell::UnsafeCell, ptr, sync::atomic::Ordering::Relaxed};
 pub(super) const SECTOR: usize = 512;
 pub(super) const PAGE: usize = 4096;
-pub(super) const COUNT: usize = 512;
+pub(super) const COUNT: usize = policy::MAX_ENTRIES;
+const BUCKETS: usize = COUNT * 2;
 pub(super) const DEVICES: usize = 8;
 pub(super) const NONE: u16 = 0xffff;
 pub(super) const FULL: u8 = 0xff;
@@ -75,7 +76,7 @@ const fn readahead_empty() -> policy::ReadAhead {
 }
 pub(super) struct State {
     pub entries: [Entry; COUNT],
-    pub buckets: [u16; 1024],
+    pub buckets: [u16; BUCKETS],
     pub clock: u64,
     pub dirty_clock: u64,
     pub write_clock: u64,
@@ -102,7 +103,7 @@ struct Resident(UnsafeCell<State>);
 unsafe impl Sync for Resident {}
 static CACHE: Resident = Resident(UnsafeCell::new(State {
     entries: [Entry::EMPTY; COUNT],
-    buckets: [NONE; 1024],
+    buckets: [NONE; BUCKETS],
     clock: 0,
     dirty_clock: 0,
     write_clock: 0,
@@ -160,7 +161,7 @@ fn bucket(device: usize, page: u64) -> usize {
         .wrapping_add(1)
         .wrapping_mul(0xc2b2ae3d27d4eb4f);
     h ^= h >> 29;
-    (h & 1023) as usize
+    (h as usize) & (BUCKETS - 1)
 }
 // The existing policy owner exposes only this same resident Index pointer;
 // no second table or policy instance is created by the cache.
@@ -206,11 +207,11 @@ pub(super) unsafe fn find(device: usize, page: u64) -> Option<usize> {
         let mut cursor = (*state()).buckets[bucket(device, page)];
         while cursor != NONE {
             let i = usize::from(cursor);
-            let e = entry(i).read();
-            if e.valid && e.device == device && e.page == page {
+            let e = entry(i);
+            if (*e).valid && (*e).device == device && (*e).page == page {
                 return Some(i);
             }
-            cursor = e.next;
+            cursor = (*e).next;
         }
         None
     }
@@ -637,6 +638,9 @@ pub(super) unsafe fn ensure_payload(i: usize) -> *mut u8 {
     }
 }
 pub(super) unsafe fn create(device: usize, page: u64) -> Option<usize> {
+    unsafe { create_class(device, page, false) }
+}
+pub(super) unsafe fn create_class(device: usize, page: u64, cold: bool) -> Option<usize> {
     unsafe {
         if device >= DEVICES {
             return None;
@@ -651,7 +655,7 @@ pub(super) unsafe fn create(device: usize, page: u64) -> Option<usize> {
             phys,
             ..Entry::EMPTY
         });
-        if ensure_payload(i).is_null() || index(2, i, device, false) == 0 {
+        if ensure_payload(i).is_null() || !(*policy::global_index()).attach_class(i, device, cold) {
             let phys = (*entry(i)).phys;
             entry(i).write(Entry {
                 phys,
@@ -673,12 +677,12 @@ pub(super) unsafe fn reset() {
             entry(i).write(Entry::EMPTY);
         }
         let s = state();
-        for b in 0..1024 {
+        for b in 0..BUCKETS {
             (*s).buckets[b] = NONE;
         }
         STATS.clear();
         STATS.enabled.store(true, Relaxed);
-        STATS.policy_version.store(2, Relaxed);
+        STATS.policy_version.store(3, Relaxed);
         STATS.policy_device_capacity.store(DEVICES as u32, Relaxed);
         STATS.policy_dirty_high_pages.store(64, Relaxed);
         STATS.policy_dirty_low_pages.store(32, Relaxed);

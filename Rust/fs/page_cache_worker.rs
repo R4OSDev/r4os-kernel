@@ -78,11 +78,15 @@ unsafe extern "C" fn main() {
                 }
             }
             // Idle policy trims clean excess capacity without speculative I/O.
+            let mut trimmed = 0;
             if pages == 0 && !failed {
-                trim_one();
-                scheduler::safe_reschedule();
+                while trimmed < policy::TRIM_PAGES && trim_one() {
+                    trimmed += 1;
+                    // One exact clear has returned both owners before switch.
+                    scheduler::safe_reschedule();
+                }
             }
-            if pages == 4 && prompt_wake() {
+            if (pages == 4 || trimmed == policy::TRIM_PAGES) && prompt_wake() {
                 c::sleep((DEFAULT_HZ as u64 / 100).max(1), b"pgcache-policy-yield");
                 c::signal();
             }
@@ -248,12 +252,14 @@ pub(super) unsafe fn demand_start(dev: usize, page: u64) {
         }
     }
 }
-pub(super) unsafe fn demand_hit(i: usize) {
+pub(super) unsafe fn demand_hit(i: usize, streaming: bool) {
     unsafe {
         if i >= COUNT || !(*c::entry(i)).valid {
             return;
         }
-        c::index(3, i, 0, false);
+        if !streaming {
+            c::index(3, i, 0, false);
+        }
         let e = c::entry(i);
         if !(*e).read_ahead || (*e).device >= DEVICES {
             return;

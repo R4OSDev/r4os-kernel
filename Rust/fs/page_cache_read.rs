@@ -144,6 +144,11 @@ pub(super) fn readable_mask(sectors: usize) -> u8 {
         ((1u16 << sectors) - 1) as u8
     }
 }
+pub(super) struct FillMode {
+    pub speculative: bool,
+    pub streaming: bool,
+}
+
 pub(super) unsafe fn fill_run(
     guard: bool,
     device: usize,
@@ -151,8 +156,12 @@ pub(super) unsafe fn fill_run(
     requested: u16,
     staging: *mut u8,
     len: usize,
-    speculative: bool,
+    mode: FillMode,
 ) -> bool {
+    let FillMode {
+        speculative,
+        streaming,
+    } = mode;
     unsafe {
         let Some(info) = block_registry::cache_view(device) else {
             return false;
@@ -200,7 +209,7 @@ pub(super) unsafe fn fill_run(
                 if speculative {
                     worker::create_readahead(device, page)
                 } else {
-                    c::create(device, page)
+                    c::create_class(device, page, streaming)
                 }
             });
             let Some(i) = chosen else { break };
@@ -389,7 +398,7 @@ pub(super) unsafe fn read_sector(device: usize, lba: u64, out: *mut u8, len: usi
                     return false;
                 }
                 (*e).last_use = c::next_clock();
-                worker::demand_hit(i);
+                worker::demand_hit(i, false);
                 ptr::copy_nonoverlapping(
                     frame.add(c::offset(lba)),
                     snapshot.as_mut_ptr().cast::<u8>(),
@@ -453,6 +462,7 @@ pub(super) unsafe fn read_sectors(
             return false;
         }
         let final_page = c::page(end - 1);
+        let streaming = count >= policy::STREAM_SECTORS;
         let mut snapshot = [MaybeUninit::<u8>::uninit(); PAGE];
         let mut staging = Staging {
             data: ptr::null_mut(),
@@ -479,7 +489,8 @@ pub(super) unsafe fn read_sectors(
             let mut busy = 0usize;
             let mut missed = false;
             loop {
-                let chosen = c::find(device, page).or_else(|| c::create(device, page));
+                let chosen =
+                    c::find(device, page).or_else(|| c::create_class(device, page, streaming));
                 let Some(i) = chosen else {
                     if wb::oldest().is_some() {
                         if !wb::write_oldest(held.owned, wb::Reason::Pressure) {
@@ -539,7 +550,10 @@ pub(super) unsafe fn read_sectors(
                             run,
                             staging.data,
                             staging.len,
-                            false,
+                            FillMode {
+                                speculative: false,
+                                streaming,
+                            },
                         )
                     } else {
                         fill(held.owned, i)
@@ -568,7 +582,7 @@ pub(super) unsafe fn read_sectors(
                     .fetch_add(bytes as u64, Relaxed);
                 STATS.read_publish_lock_drops.fetch_add(1, Relaxed);
                 (*e).last_use = c::next_clock();
-                worker::demand_hit(i);
+                worker::demand_hit(i, streaming);
                 if !missed {
                     STATS.hits.fetch_add(span as u64, Relaxed);
                 }
