@@ -295,7 +295,7 @@ impl Counters {
             selective_flushes: AtomicU64::new(0),
             selective_writeback_sectors: AtomicU64::new(0),
             selective_foreign_dirty_sectors_skipped: AtomicU64::new(0),
-            policy_version: AtomicU32::new(3),
+            policy_version: AtomicU32::new(4),
             policy_device_capacity: AtomicU32::new(8),
             policy_dirty_high_pages: AtomicU32::new(64),
             policy_dirty_low_pages: AtomicU32::new(32),
@@ -528,7 +528,7 @@ impl Counters {
         self.selective_writeback_sectors.store(0, Relaxed);
         self.selective_foreign_dirty_sectors_skipped
             .store(0, Relaxed);
-        self.policy_version.store(3, Relaxed);
+        self.policy_version.store(4, Relaxed);
         self.policy_device_capacity.store(8, Relaxed);
         self.policy_dirty_high_pages.store(64, Relaxed);
         self.policy_dirty_low_pages.store(32, Relaxed);

@@ -141,3 +141,81 @@ fn existing_confirmed_fill_bounds_remain_independent_from_larger_residency() {
     assert_eq!(policy::MAX_FILL_PAGES, 16);
     assert_eq!(policy::TRIM_PAGES, 16);
 }
+
+fn ahead() -> policy::ReadAhead {
+    policy::ReadAhead {
+        generation: 1,
+        pending: false,
+        pending_page: 0,
+        pending_pages: 0,
+        inflight: false,
+        inflight_page: 0,
+        inflight_pages: 0,
+        resident_pages: 0,
+        sequential: policy::Sequential {
+            have_last: false,
+            last_end_page: 0,
+            window_pages: 0,
+        },
+    }
+}
+#[test]
+fn sequential_evidence_adapts_one_two_four_and_random_or_pressure_stops_it() {
+    let mut a = ahead();
+    assert_eq!(a.sequential.observe(10, 11, 4).pages, 0);
+    assert_eq!(a.sequential.observe(11, 12, 4).pages, 1);
+    assert_eq!(a.sequential.observe(12, 13, 4).pages, 2);
+    for first in 13..100 {
+        assert_eq!(a.sequential.observe(first, first + 1, 4).pages, 4);
+    }
+    let random = a.sequential.observe(500, 501, 4);
+    assert!(random.random_reset);
+    assert_eq!(random.pages, 0);
+    assert_eq!(a.sequential.observe(501, 502, 0).pages, 0);
+    for free in [8192, 4096, 1024, 0] {
+        assert_eq!(
+            policy::capacity_for_memory(500_000, free).read_ahead_pages,
+            0
+        );
+    }
+    assert_eq!(
+        policy::capacity_for_memory(500_000, 500_000).read_ahead_pages,
+        4
+    );
+}
+#[test]
+fn cancellation_never_releases_inflight_until_exact_completion_and_refuses_stale_data() {
+    let mut a = ahead();
+    a.schedule(100, 4);
+    let old = a.begin().unwrap();
+    assert!(a.cancel_all());
+    assert!(a.inflight);
+    assert!(a.begin().is_none());
+    a.schedule(300, 2);
+    assert!(a.begin().is_none());
+    assert!(!a.complete(old, true));
+    assert!(!a.inflight);
+    assert!(a.pending);
+    let fresh = a.begin().unwrap();
+    assert_eq!(fresh.page, 300);
+    assert!(a.complete(fresh, true));
+    a.schedule(400, 2);
+    let request = a.begin().unwrap();
+    assert!(!a.demand(400));
+    assert!(a.inflight);
+    assert!(a.demand(900));
+    assert!(!a.complete(request, true));
+    a.resident_pages = 2;
+    unsafe {
+        policy::r4os_rust_fs_cache_readahead(
+            &mut a,
+            5,
+            0,
+            0,
+            core::ptr::null(),
+            false,
+            core::ptr::null_mut(),
+        );
+    }
+    assert_eq!(a.resident_pages, 1);
+}

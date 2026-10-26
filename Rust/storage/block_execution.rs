@@ -225,33 +225,7 @@ pub unsafe extern "C" fn r4os_rust_block_enqueue(
         }
         let index = unsafe { select(v, 0, 0) };
         if index != usize::MAX {
-            let id = stat(v, 1, 0, 1);
-            let request = block_state::Execution {
-                slot_index: index,
-                id,
-                kind: a.kind,
-                lba: a.lba,
-                sectors: a.sectors,
-                buffer: a.buffer,
-                const_buffer: a.data,
-                buffer_len: a.len,
-                buffer_ownership: a.ownership,
-                start_tick: 0,
-                mode: 0,
-                backend_handle: 0,
-                observation: a.observation,
-            };
-            unsafe {
-                block_state::r4os_rust_block_slot_enqueue(
-                    slot(v, index),
-                    &request,
-                    id,
-                    timer::tick_count(),
-                );
-            }
-            stat(v, 1, 4, 1);
-            let used = unsafe { select(v, 3, 0) };
-            stat(v, 5, 18, used as u64);
+            let id = unsafe { enqueue_slot(v, index, a) };
             unsafe {
                 out.write(id);
             }
@@ -291,9 +265,109 @@ pub unsafe extern "C" fn r4os_rust_block_enqueue(
         return false;
     }
 }
+
+// One optional speculative ID per device. The queue still owns the request;
+// this copied priority tag survives until its real waiter consumes completion.
+static PREFETCH_IDS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+unsafe fn enqueue_slot(v: View, index: usize, a: block_io::Input) -> u64 {
+    let id = stat(v, 1, 0, 1);
+    let request = block_state::Execution {
+        slot_index: index,
+        id,
+        kind: a.kind,
+        lba: a.lba,
+        sectors: a.sectors,
+        buffer: a.buffer,
+        const_buffer: a.data,
+        buffer_len: a.len,
+        buffer_ownership: a.ownership,
+        start_tick: 0,
+        mode: 0,
+        backend_handle: 0,
+        observation: a.observation,
+    };
+    unsafe {
+        block_state::r4os_rust_block_slot_enqueue(
+            slot(v, index),
+            &request,
+            id,
+            timer::tick_count(),
+        );
+    }
+    stat(v, 1, 4, 1);
+    let used = unsafe { select(v, 3, 0) };
+    stat(v, 5, 18, used as u64);
+    id
+}
+unsafe fn controller_has_demand(lane: u8) -> bool {
+    // All copied device/slot addresses stay under the existing short owner.
+    // No device mutex, registry pointer or callback survives this scan.
+    let _guard = Guard::acquire(1);
+    for index in 0..block_registry::max_devices() {
+        let mut slot = MaybeUninit::uninit();
+        if !unsafe {
+            block_registry::r4os_rust_block_registry_slot(index, 0, 0, true, slot.as_mut_ptr())
+        } {
+            continue;
+        }
+        let slot = unsafe { slot.assume_init() };
+        if slot.retiring || slot.lane != lane {
+            continue;
+        }
+        let view = unsafe { view(slot.device) };
+        let low = PREFETCH_IDS[usize::from(view.index)].load(Ordering::Relaxed);
+        if unsafe { block_requests::has_demand(view.slots, low) } {
+            return true;
+        }
+    }
+    false
+}
+pub(crate) unsafe fn enqueue_prefetch(device: *mut c_void, a: block_io::Input) -> Option<u64> {
+    let v = unsafe { view(device) };
+    let _lock = unsafe { lock(device, v) };
+    if unsafe { v.state.resetting.read() }
+        || unsafe { select(v, 3, 0) } != 0
+        || PREFETCH_IDS[usize::from(v.index)].load(Ordering::Relaxed) != 0
+        || unsafe { controller_has_demand(v.lane) }
+    {
+        return None;
+    }
+    let index = unsafe { select(v, 0, 0) };
+    if index == usize::MAX {
+        return None;
+    }
+    let id = unsafe { enqueue_slot(v, index, a) };
+    PREFETCH_IDS[usize::from(v.index)].store(id, Ordering::Release);
+    Some(id)
+}
+pub(crate) unsafe fn finish_prefetch(device: *mut c_void, id: u64) {
+    let v = unsafe { view(device) };
+    assert!(
+        PREFETCH_IDS[usize::from(v.index)]
+            .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    );
+}
 unsafe fn begin(device: *mut c_void, v: View, mode: u8) -> Option<block_state::Execution> {
     let _lock = unsafe { lock(device, v) };
-    let index = unsafe { select(v, 1, 0) };
+    let low = PREFETCH_IDS[usize::from(v.index)].load(Ordering::Acquire);
+    let demand = if low == 0 {
+        usize::MAX
+    } else {
+        unsafe { block_requests::select_demand(v.slots, low) }
+    };
+    let index = if demand != usize::MAX {
+        demand
+    } else {
+        unsafe { select(v, 1, 0) }
+    };
+    if index != usize::MAX
+        && low != 0
+        && unsafe { (*slot(v, index)).id } == low
+        && unsafe { controller_has_demand(v.lane) }
+    {
+        return None;
+    }
     if index == usize::MAX {
         return None;
     }

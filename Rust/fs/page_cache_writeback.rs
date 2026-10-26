@@ -501,6 +501,10 @@ pub(super) unsafe fn write_oldest(guard: bool, reason: Reason) -> bool {
 }
 pub(super) unsafe fn reclaim_locked(guard: bool, target: u32, dirty: bool) -> Reclaim {
     unsafe {
+        for device in 0..c::DEVICES {
+            super::page_cache_prefetch::cancel_pending(device);
+        }
+
         let mut out = Reclaim {
             requested_frames: target,
             ..Reclaim::default()

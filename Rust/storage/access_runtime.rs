@@ -136,3 +136,97 @@ pub unsafe extern "C" fn r4os_rust_storage_access_runtime(
 const _: () = {
     assert!(core::mem::size_of::<Reference>() == 16);
 };
+
+/// A copied exact mounted backing identity; no table reference or I/O.
+#[derive(Clone, Copy)]
+pub(crate) struct CacheMount {
+    pub reference: Reference,
+    pub region: crate::storage::access_state::Region,
+}
+impl CacheMount {
+    pub(crate) fn same(self, other: Self) -> bool {
+        self.reference == other.reference
+            && self.region.device == other.region.device
+            && self.region.first == other.region.first
+            && self.region.count == other.region.count
+    }
+}
+pub(crate) fn cache_mount(device: Reference, first: u64, count: u64) -> Option<CacheMount> {
+    let region = crate::storage::access_state::Region {
+        device,
+        first,
+        count,
+    };
+    let _guard = Guard::acquire(1);
+    let s = unsafe { &*STATE.0.get() };
+    s.mounts.iter().enumerate().find_map(|(i, m)| {
+        (m.active && m.region.contains(region)).then_some(CacheMount {
+            reference: Reference {
+                slot: i as u32,
+                generation: m.generation,
+            },
+            region: m.region,
+        })
+    })
+}
+pub(crate) fn cache_mount_current(bound: CacheMount) -> bool {
+    let _guard = Guard::acquire(1);
+    let s = unsafe { &*STATE.0.get() };
+    s.mounts
+        .get(bound.reference.slot as usize)
+        .is_some_and(|m| {
+            m.active
+                && m.generation == bound.reference.generation
+                && m.region.device == bound.region.device
+                && m.region.first == bound.region.first
+                && m.region.count == bound.region.count
+        })
+}
+/// The caller retains its native task admission until this use is returned.
+pub(crate) struct CacheReadUse {
+    id: u64,
+    owner: Owner,
+}
+pub(crate) fn cache_read_use(bound: CacheMount) -> Option<CacheReadUse> {
+    let mut owner = Owner::default();
+    if !unsafe { r4os_rust_storage_access_current(&mut owner) } {
+        return None;
+    }
+    let _guard = Guard::acquire(1);
+    let s = unsafe { &mut *STATE.0.get() };
+    let m = s.mounts.get(bound.reference.slot as usize)?;
+    if !m.active
+        || m.generation != bound.reference.generation
+        || m.region.device != bound.region.device
+        || m.region.first != bound.region.first
+        || m.region.count != bound.region.count
+    {
+        return None;
+    }
+    let id = s
+        .apply(
+            10,
+            Input {
+                reference: bound.reference,
+                owner,
+                kind: 0,
+                ..Input::default()
+            },
+        )
+        .ok()?;
+    Some(CacheReadUse { id, owner })
+}
+impl Drop for CacheReadUse {
+    fn drop(&mut self) {
+        let _guard = Guard::acquire(1);
+        let result = unsafe { &mut *STATE.0.get() }.apply(
+            12,
+            Input {
+                id: self.id,
+                owner: self.owner,
+                ..Input::default()
+            },
+        );
+        assert!(result.is_ok(), "exact prefetch mounted use");
+    }
+}

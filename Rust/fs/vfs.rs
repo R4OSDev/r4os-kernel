@@ -205,6 +205,7 @@ pub unsafe extern "C" fn r4os_rust_vfs_mount(
             true
         }
         5 => {
+            let exact = unsafe { reference.read() };
             let result = {
                 let _guard = Guard::acquire(1);
                 let reference = unsafe { reference.read() };
@@ -240,6 +241,9 @@ pub unsafe extern "C" fn r4os_rust_vfs_mount(
                     true
                 }
             };
+            if result {
+                super::page_cache_prefetch::cancel_mount(exact);
+            }
             crate::program::gui_activity::notify(crate::contract::gui_activity_shared_directory);
             result
         }

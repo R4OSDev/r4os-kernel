@@ -1,4 +1,4 @@
-//! Original bounded cache capacity, FIFO/LRU index and disabled read-ahead
+//! Original bounded cache capacity, FIFO/LRU index and bounded read-ahead
 //! model. Caller holds the existing cache owner; no hardware or waits here.
 use core::{
     cell::UnsafeCell,
@@ -37,12 +37,11 @@ pub fn capacity_for_memory(reference_free_frames: u64, current_free_frames: u64)
     } else {
         (ram_pages, 0)
     };
-    let unconstrained_window = (active_pages / 32).clamp(1, 16);
-    let read_ahead_pages = match pressure_level {
-        3 => 0,
-        2 => 1,
-        1 => unconstrained_window.min(4),
-        _ => unconstrained_window,
+    let unconstrained_window = (active_pages / 64).clamp(1, 4);
+    let read_ahead_pages = if pressure_level == 0 {
+        unconstrained_window
+    } else {
+        0
     };
     Capacity {
         ram_pages,
@@ -82,7 +81,7 @@ pub struct Sequential {
     pub window_pages: u16,
 }
 impl Sequential {
-    fn observe(&mut self, first: u64, end: u64, max_window: u16) -> SequentialDecision {
+    pub(super) fn observe(&mut self, first: u64, end: u64, max_window: u16) -> SequentialDecision {
         if end <= first {
             return SequentialDecision {
                 next_page: 0,
@@ -112,7 +111,7 @@ impl Sequential {
             random_reset,
         }
     }
-    fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         self.have_last = false;
         self.last_end_page = 0;
         self.window_pages = 0;
@@ -188,7 +187,7 @@ impl ReadAhead {
             self.generation = 1;
         }
     }
-    fn schedule(&mut self, page: u64, pages: u16) -> bool {
+    pub(super) fn schedule(&mut self, page: u64, pages: u16) -> bool {
         if pages == 0 {
             return false;
         }
@@ -207,7 +206,7 @@ impl ReadAhead {
         self.pending_pages = pages;
         cancelled
     }
-    fn demand(&mut self, page: u64) -> bool {
+    pub(super) fn demand(&mut self, page: u64) -> bool {
         let mut cancelled = false;
         if self.pending {
             self.pending = false;
@@ -220,7 +219,7 @@ impl ReadAhead {
         }
         cancelled
     }
-    fn cancel_all(&mut self) -> bool {
+    pub(super) fn cancel_all(&mut self) -> bool {
         let cancelled = self.pending || self.inflight;
         self.pending = false;
         self.pending_pages = 0;
@@ -230,7 +229,7 @@ impl ReadAhead {
         self.sequential.reset();
         cancelled
     }
-    fn begin(&mut self) -> Option<ReadAheadRequest> {
+    pub(super) fn begin(&mut self) -> Option<ReadAheadRequest> {
         if !self.pending || self.inflight {
             return None;
         }
@@ -245,7 +244,7 @@ impl ReadAhead {
             generation: self.generation,
         })
     }
-    fn complete(&mut self, request: ReadAheadRequest, success: bool) -> bool {
+    pub(super) fn complete(&mut self, request: ReadAheadRequest, success: bool) -> bool {
         let current = self.inflight
             && self.inflight_page == request.page
             && self.inflight_pages == request.pages
@@ -777,7 +776,7 @@ pub unsafe extern "C" fn r4os_rust_fs_cache_sequential(
 /// Initialized state is exclusive under the original cache caller owner.
 /// Complete input and begin output, when used, are aligned resident records
 /// disjoint from state. Other operations do not use these optional pointers.
-/// The disabled read-ahead model performs no I/O or wait and admits no worker.
+/// This metadata helper performs no I/O or wait; the cache worker owns I/O.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_fs_cache_readahead(
     state: *mut ReadAhead,

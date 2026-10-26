@@ -25,6 +25,7 @@ pub(super) unsafe fn write_sector(
             STATS.write_errors.fetch_add(1, Relaxed);
             return false;
         };
+        super::page_cache_prefetch::cancel(device);
         let bit = c::bit(lba);
         let page = c::page(lba);
         let mut busy = 0usize;
@@ -134,6 +135,7 @@ pub(super) unsafe fn write_direct(
             STATS.write_errors.fetch_add(1, Relaxed);
             return false;
         };
+        super::page_cache_prefetch::cancel(device);
         let staging = Staging {
             data: heap::r4os_rust_heap_alloc(bytes, 16),
             len: bytes,

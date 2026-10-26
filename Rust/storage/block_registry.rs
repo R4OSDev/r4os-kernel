@@ -642,6 +642,7 @@ const _: () = {
 // Immutable cache capability snapshot, protected by the existing registry owner.
 #[derive(Clone, Copy)]
 pub(crate) struct CacheView {
+    pub reference: Reference,
     pub sector_bytes: u32,
     pub sectors: u64,
     pub max_sectors: u16,
@@ -655,6 +656,7 @@ pub(crate) fn cache_view(index: usize) -> Option<CacheView> {
     }
     let info = r.slots[index].info;
     Some(CacheView {
+        reference: r.slots[index].reference,
         sector_bytes: info.sector_bytes,
         sectors: info.sectors,
         max_sectors: info.max_sectors,

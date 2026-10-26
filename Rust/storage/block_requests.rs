@@ -229,3 +229,27 @@ const _: () = {
     assert!(core::mem::size_of::<Snapshot>() == 32);
     assert!(core::mem::size_of::<ResultRecord>() == 3);
 };
+
+/// Caller retains queue admission; the short storage owner excludes IRQ
+/// metadata. Normal requests keep FIFO order, ahead of the one speculative ID.
+pub(crate) unsafe fn select_demand(slots: *const Slot, speculative: u64) -> usize {
+    let _owner = Guard::acquire(1);
+    let mut best = usize::MAX;
+    for i in 0..16 {
+        let p = unsafe { &*slots.add(i) };
+        if p.state != 1 || p.id == speculative {
+            continue;
+        }
+        if best == usize::MAX || p.id < unsafe { (*slots.add(best)).id } {
+            best = i;
+        }
+    }
+    best
+}
+pub(crate) unsafe fn has_demand(slots: *const Slot, speculative: u64) -> bool {
+    let _owner = Guard::acquire(1);
+    (0..16).any(|i| {
+        let p = unsafe { &*slots.add(i) };
+        matches!(p.state, 1 | 2) && p.id != speculative
+    })
+}

@@ -61,6 +61,7 @@ pub mod ntfs_volume_types;
 pub mod page_cache;
 pub mod page_cache_batch;
 pub mod page_cache_policy;
+pub mod page_cache_prefetch;
 pub mod page_cache_read;
 pub mod page_cache_state;
 pub mod page_cache_stats;

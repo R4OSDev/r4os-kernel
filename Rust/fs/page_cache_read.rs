@@ -145,7 +145,6 @@ pub(super) fn readable_mask(sectors: usize) -> u8 {
     }
 }
 pub(super) struct FillMode {
-    pub speculative: bool,
     pub streaming: bool,
 }
 
@@ -158,10 +157,7 @@ pub(super) unsafe fn fill_run(
     len: usize,
     mode: FillMode,
 ) -> bool {
-    let FillMode {
-        speculative,
-        streaming,
-    } = mode;
+    let FillMode { streaming } = mode;
     unsafe {
         let Some(info) = block_registry::cache_view(device) else {
             return false;
@@ -170,15 +166,12 @@ pub(super) unsafe fn fill_run(
             return false;
         }
         let sector_count = info.sectors;
-        let mut limit = ((len / PAGE).min(usize::from(policy::MAX_FILL_PAGES)) as u16)
+        let limit = ((len / PAGE).min(usize::from(policy::MAX_FILL_PAGES)) as u16)
             .min(run_limit(device, requested));
-        if speculative {
-            limit = limit.min(worker::fill_budget(device));
-        }
         if limit < 2 {
             // Capacity can contract after the caller planned its staging.
             // Preserve progress on its exact already admitted demand page.
-            if speculative || requested == 0 {
+            if requested == 0 {
                 return false;
             }
             let Some(i) = c::find(device, first) else {
@@ -202,16 +195,7 @@ pub(super) unsafe fn fill_run(
             };
             let mask = readable_mask(readable);
             let existing = c::find(device, page);
-            if speculative && existing.is_some() {
-                break;
-            }
-            let chosen = existing.or_else(|| {
-                if speculative {
-                    worker::create_readahead(device, page)
-                } else {
-                    c::create_class(device, page, streaming)
-                }
-            });
+            let chosen = existing.or_else(|| c::create_class(device, page, streaming));
             let Some(i) = chosen else { break };
             let e = c::entry(i);
             if (*e).io_busy || (*e).valid_mask & mask == mask {
@@ -221,9 +205,7 @@ pub(super) unsafe fn fill_run(
                 break;
             }
             (*e).io_busy = true;
-            if !speculative {
-                c::drop_readahead(i);
-            }
+            c::drop_readahead(i);
             indices[reserved].write(i as u16);
             masks[reserved].write((*e).valid_mask);
             reserved += 1;
@@ -348,7 +330,6 @@ pub(super) unsafe fn read_sector(device: usize, lba: u64, out: *mut u8, len: usi
         STATS.reads.fetch_add(1, Relaxed);
         let bit = c::bit(lba);
         let page = c::page(lba);
-        worker::demand_start(device, page);
         let mut missed = false;
         let mut busy = 0usize;
         loop {
@@ -418,6 +399,7 @@ pub(super) unsafe fn read_sector(device: usize, lba: u64, out: *mut u8, len: usi
                 ptr::copy_nonoverlapping(snapshot.as_ptr().cast::<u8>(), out, SECTOR);
                 return true;
             }
+            worker::demand_start(device, page);
             if !missed {
                 STATS.misses.fetch_add(1, Relaxed);
                 missed = true;
@@ -469,6 +451,7 @@ pub(super) unsafe fn read_sectors(
             len: 0,
         };
         let mut unavailable = false;
+        let mut stream_activity = false;
         let Some(mut held) = Held::acquire() else {
             STATS.read_errors.fetch_add(1, Relaxed);
             return false;
@@ -477,7 +460,6 @@ pub(super) unsafe fn read_sectors(
             STATS.read_errors.fetch_add(1, Relaxed);
             return false;
         };
-        worker::demand_start(device, c::page(lba));
         let mut done = 0u32;
         while done < count {
             let cur = lba + u64::from(done);
@@ -526,6 +508,8 @@ pub(super) unsafe fn read_sectors(
                     continue;
                 }
                 if !covers((*e).valid_mask, first, span) {
+                    worker::demand_start(device, page);
+                    stream_activity = true;
                     if !missed {
                         STATS.misses.fetch_add(span as u64, Relaxed);
                         missed = true;
@@ -550,10 +534,7 @@ pub(super) unsafe fn read_sectors(
                             run,
                             staging.data,
                             staging.len,
-                            FillMode {
-                                speculative: false,
-                                streaming,
-                            },
+                            FillMode { streaming },
                         )
                     } else {
                         fill(held.owned, i)
@@ -582,6 +563,7 @@ pub(super) unsafe fn read_sectors(
                     .fetch_add(bytes as u64, Relaxed);
                 STATS.read_publish_lock_drops.fetch_add(1, Relaxed);
                 (*e).last_use = c::next_clock();
+                stream_activity |= (*e).read_ahead;
                 worker::demand_hit(i, streaming);
                 if !missed {
                     STATS.hits.fetch_add(span as u64, Relaxed);
@@ -597,7 +579,9 @@ pub(super) unsafe fn read_sectors(
             }
             done += span as u32;
         }
-        worker::schedule_readahead(device, lba, count);
+        if stream_activity {
+            worker::schedule_readahead(device, lba, count);
+        }
         true
     }
 }

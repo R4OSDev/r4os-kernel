@@ -1,11 +1,10 @@
-//! Quarter-second dirty writeback and capacity trimming; speculative I/O is disabled.
+//! Bounded dirty writeback, clean trimming and low-priority sequential prefetch.
 use super::{page_cache_policy as policy, page_cache_state as c, page_cache_writeback as wb};
 use crate::{
     arch::pit::DEFAULT_HZ,
     memory::phys,
     platform::{clock_math, timer},
     sched::{scheduler, sync_objects, task},
-    storage::block_registry,
 };
 use c::{COUNT, DEVICES, FULL, Held, STATS};
 use core::{
@@ -85,6 +84,9 @@ unsafe extern "C" fn main() {
                     // One exact clear has returned both owners before switch.
                     scheduler::safe_reschedule();
                 }
+            }
+            if pages == 0 && !failed && trimmed == 0 {
+                super::page_cache_prefetch::step();
             }
             if (pages == 4 || trimmed == policy::TRIM_PAGES) && prompt_wake() {
                 c::sleep((DEFAULT_HZ as u64 / 100).max(1), b"pgcache-policy-yield");
@@ -264,16 +266,7 @@ pub(super) unsafe fn demand_hit(i: usize, streaming: bool) {
         if !(*e).read_ahead || (*e).device >= DEVICES {
             return;
         }
-        (*e).read_ahead = false;
-        policy::r4os_rust_fs_cache_readahead(
-            ahead((*e).device),
-            5,
-            0,
-            0,
-            ptr::null(),
-            false,
-            ptr::null_mut(),
-        );
+        c::drop_readahead(i);
         STATS.read_ahead_hits.fetch_add(1, Relaxed);
     }
 }
@@ -297,68 +290,36 @@ pub(super) unsafe fn fill_budget(dev: usize) -> u16 {
         let cap = c::capacity();
         let index = &*policy::global_index();
         let used = c::COUNT as u16 - index.free_count;
+        if cap.pressure_level != 0 {
+            return 0;
+        }
+        let spare = cap
+            .active_pages
+            .saturating_sub(used)
+            .saturating_sub(free_floor(&cap));
+        let cold = if cold_victim(dev).is_some() { 4 } else { 0 };
         resident_budget(&cap)
+            .min(4)
             .saturating_sub((*ahead(dev)).resident_pages)
-            .min(cap.active_pages.saturating_sub(used))
-            .min(index.free_count.saturating_sub(free_floor(&cap)))
+            .min(spare.saturating_add(cold))
     }
 }
 pub(super) unsafe fn schedule_readahead(dev: usize, lba: u64, count: u32) {
     unsafe {
-        if !c::SPECULATION || !(*c::state()).worker_started || dev >= DEVICES || count < 16 {
-            return;
-        }
-        let end = lba.wrapping_add(u64::from(count));
-        if end < lba || end == 0 {
-            return;
-        }
-        let last = c::page(end - 1);
-        let next = last.wrapping_add(8);
-        if next <= last {
-            return;
-        }
-        let Some(info) = block_registry::cache_view(dev) else {
-            return;
-        };
-        if info.sector_bytes != c::SECTOR as u32 {
-            return;
-        }
-        let cap = c::capacity();
-        if cap.read_ahead_pages == 0 || (info.sectors != 0 && next >= info.sectors) {
-            return;
-        }
-        let budget = resident_budget(&cap);
-        if budget == 0 || (*ahead(dev)).resident_pages >= budget {
-            STATS.read_ahead_budget_skips.fetch_add(1, Relaxed);
-            return;
-        }
-        STATS.read_ahead_requests.fetch_add(1, Relaxed);
-        if c::find(dev, next).is_some() {
-            STATS.read_ahead_budget_skips.fetch_add(1, Relaxed);
-            return;
-        }
-        if policy::r4os_rust_fs_cache_readahead(
-            ahead(dev),
-            0,
-            next / 8,
-            1,
-            ptr::null(),
-            false,
-            ptr::null_mut(),
-        ) {
-            STATS.read_ahead_cancellations.fetch_add(1, Relaxed);
-        }
-        STATS.read_ahead_pages_scheduled.fetch_add(1, Relaxed);
-        c::signal();
+        super::page_cache_prefetch::schedule(dev, lba, count);
     }
 }
 pub(super) unsafe fn create_readahead(dev: usize, page: u64) -> Option<usize> {
     unsafe {
         let cap = c::capacity();
-        if c::index(14, 0, 0, false) >= usize::from(cap.active_pages)
-            || (*policy::global_index()).free_count <= free_floor(&cap)
-        {
+        if cap.pressure_level != 0 {
             return None;
+        }
+        if c::index(14, 0, 0, false)
+            >= usize::from(cap.active_pages.saturating_sub(free_floor(&cap)))
+        {
+            let victim = cold_victim(dev)?;
+            c::clear(victim, false);
         }
         let i = c::optional(c::index(1, 0, 0, false))?;
         let e = c::entry(i);
@@ -382,7 +343,7 @@ pub(super) unsafe fn create_readahead(dev: usize, page: u64) -> Option<usize> {
             (*c::state()).payload_frames = (*c::state()).payload_frames.wrapping_add(1);
             STATS.payload_allocations.fetch_add(1, Relaxed);
         }
-        if c::payload(i).is_null() || c::index(2, i, dev, false) == 0 {
+        if c::payload(i).is_null() || !(*policy::global_index()).attach_class(i, dev, true) {
             c::release_payload(i, false);
             e.write(c::Entry::EMPTY);
             c::index(9, i, 0, false);
@@ -390,5 +351,20 @@ pub(super) unsafe fn create_readahead(dev: usize, page: u64) -> Option<usize> {
         }
         c::link(i);
         Some(i)
+    }
+}
+
+// At most8 heads, never a cache-wide scan and never evict a hot/dirty/busy page.
+pub(super) unsafe fn cold_victim(preferred: usize) -> Option<usize> {
+    unsafe {
+        let index = &*policy::global_index();
+        for n in 0..DEVICES {
+            let dev = (preferred + n) % DEVICES;
+            let i = index.devices[dev].clean_head;
+            if i != policy::NO_INDEX && index.links[usize::from(i)].cold {
+                return Some(usize::from(i));
+            }
+        }
+        None
     }
 }

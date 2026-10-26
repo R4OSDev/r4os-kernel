@@ -21,7 +21,7 @@ pub(super) const FULL: u8 = 0xff;
 pub(super) const LOCK_TICKS: u64 = 3600 * DEFAULT_HZ as u64;
 pub(super) const BUSY_TICKS: usize = 5 * DEFAULT_HZ as usize;
 pub(super) const MAX_DIRTY_AGE: u64 = 2 * DEFAULT_HZ as u64;
-pub(super) const SPECULATION: bool = false;
+pub(super) const SPECULATION: bool = true;
 #[derive(Clone, Copy)]
 pub(super) struct Entry {
     pub valid: bool,
@@ -87,6 +87,7 @@ pub(super) struct State {
     pub payload_frames: u32,
     pub event: Event,
     pub lock: Mutex,
+    pub prefetch_device: usize,
     pub worker_started: bool,
     pub worker_id: u32,
     pub failure_until: [u64; DEVICES],
@@ -114,6 +115,7 @@ static CACHE: Resident = Resident(UnsafeCell::new(State {
     payload_frames: 0,
     event: Event::AUTO,
     lock: Mutex::EMPTY,
+    prefetch_device: 0,
     worker_started: false,
     worker_id: 0,
     failure_until: [0; DEVICES],
@@ -408,6 +410,7 @@ pub(super) unsafe fn drop_readahead(i: usize) {
         (*e).read_ahead = false;
         let device = (*e).device;
         if device < DEVICES {
+            super::page_cache_prefetch::forget(device, i);
             let a = ptr::addr_of_mut!((*state()).readahead)
                 .cast::<policy::ReadAhead>()
                 .add(device);
@@ -672,6 +675,7 @@ pub(super) unsafe fn create_class(device: usize, page: u64, cold: bool) -> Optio
 // storage; never construct/move the entire >100-KB cache on a 64-KB task stack.
 pub(super) unsafe fn reset() {
     unsafe {
+        super::page_cache_prefetch::reset();
         for i in 0..COUNT {
             release_payload(i, false);
             entry(i).write(Entry::EMPTY);
@@ -682,7 +686,7 @@ pub(super) unsafe fn reset() {
         }
         STATS.clear();
         STATS.enabled.store(true, Relaxed);
-        STATS.policy_version.store(3, Relaxed);
+        STATS.policy_version.store(4, Relaxed);
         STATS.policy_device_capacity.store(DEVICES as u32, Relaxed);
         STATS.policy_dirty_high_pages.store(64, Relaxed);
         STATS.policy_dirty_low_pages.store(32, Relaxed);

@@ -767,3 +767,59 @@ pub(crate) unsafe fn read_observed(
         ) == 0
     }
 }
+
+/// One confirmed, bounded, resident speculative request through the original
+/// device pin/queue/direct-buffer/physical-drain owner. Busy admission skips
+/// without errors or fallback I/O. Normal queued/active controller work wins.
+pub(crate) unsafe fn read_prefetch_exact(
+    reference: Reference,
+    lba: u64,
+    sectors: u16,
+    out: *mut u8,
+    len: usize,
+) -> Option<bool> {
+    let _unwind = Admission::acquire(true)?;
+    if !block_workers::r4os_rust_block_workers_ready() {
+        return None;
+    }
+    let pin = Pin::exact(reference)?;
+    let view = pin.view();
+    if view.sector_size != 512
+        || view.max_sectors < sectors
+        || sectors == 0
+        || sectors > 32
+        || validate(view, lba, sectors, len) != 0
+    {
+        return None;
+    }
+    let bytes = usize::from(sectors) * 512;
+    let owner = ownership(true, true);
+    let id = unsafe {
+        crate::storage::block_execution::enqueue_prefetch(
+            pin.device(),
+            Input {
+                kind: 1,
+                lba,
+                sectors,
+                buffer: out,
+                data: ptr::null(),
+                len: bytes,
+                ownership: owner,
+                observation: ptr::null(),
+            },
+        )
+    }?;
+    buffers(view, owner, bytes);
+    unsafe {
+        crate::storage::block_execution::r4os_rust_block_schedule(pin.device(), true);
+    }
+    let result = unsafe { wait(pin.device(), view, id) };
+    assert!(
+        !result.buffer_detached,
+        "resident prefetch buffer physically drained"
+    );
+    unsafe {
+        crate::storage::block_execution::finish_prefetch(pin.device(), id);
+    }
+    Some(result.ok)
+}
