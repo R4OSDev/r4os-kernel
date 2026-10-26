@@ -33,6 +33,21 @@ pub(crate) unsafe fn begin_wait_at(
     crate::arch::runtime::restore_runtime(flags);
 }
 
+/// # Safety
+/// Exact resident task under uninterrupted Runtime admission. `now` is the
+/// resolved cutoff of this bounded wake decision, never carried across a
+/// wait, owner release, migration or clock-source transition by the caller.
+pub(crate) unsafe fn finish_wait_at(
+    task: *mut Task,
+    now: u64,
+    result: task_types::WaitResult,
+) -> u64 {
+    let flags = crate::arch::runtime::save_runtime();
+    let ticks = unsafe { task_registry::finish_wait(task, now, result) };
+    crate::arch::runtime::restore_runtime(flags);
+    ticks
+}
+
 /// Enroll one owned, pinned, non-running diagnostic task through the real
 /// deadline owner. Caller supplies an absolute future tick under runtime admission.
 pub(crate) unsafe fn diagnostic_timeout(task: *mut Task, tick: u64, reason: &'static [u8]) {

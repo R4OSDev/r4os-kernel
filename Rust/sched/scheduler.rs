@@ -977,11 +977,17 @@ fn balance_ready(transfer: super::task::balance::Transfer, now: impl FnMut() -> 
     moved.cast()
 }
 fn refill_ready() {
+    refill_ready_at(None);
+}
+// A refill is bounded resident scheduler work under one Runtime owner. Read
+// the clock lazily once if a candidate needs it, or use this IRQ's resolved
+// time. The local snapshot is discarded before any physical task switch.
+fn refill_ready_at(mut now: Option<u64>) {
     let target = percpu::current_index();
     if ready_count() != 0 || !enabled() {
         return;
     }
-    refill_from_sources(target, tick);
+    refill_from_sources(target, || *now.get_or_insert_with(tick));
 }
 fn balance_checkpoint(now: u64) {
     let index = slot(percpu::current_index());
@@ -1123,6 +1129,11 @@ pub(crate) fn notify_ready(task: Task) {
     notify_destination(target, item.dispatch_rank);
 }
 fn wake_task(task: Task, result: u32) -> bool {
+    wake_task_at(task, result, None)
+}
+// Only wake_expired supplies a snapshot: its bounded batch already classifies
+// all due deadlines against exactly that cutoff under uninterrupted Runtime.
+fn wake_task_at(task: Task, result: u32, now: Option<u64>) -> bool {
     let flags = runtime::save_runtime();
     preempt_disable();
     // An offered guard is already Ready (or in the fast-wake park return),
@@ -1145,7 +1156,13 @@ fn wake_task(task: Task, result: u32) -> bool {
         runtime::restore_runtime(flags);
         return false;
     }
-    let waited = mutate(15, task, u64::from(result), 0);
+    let waited = unsafe {
+        super::task::finish_wait_at(
+            task.cast(),
+            now.unwrap_or_else(tick),
+            super::sync_types::wait_result(result),
+        )
+    };
     record_wait(waited);
     change(|s| {
         s.wake_count = s.wake_count.wrapping_add(1);
@@ -1318,7 +1335,7 @@ fn wake_expired(now: u64) -> bool {
         if view(candidate).wake_tick > now {
             break;
         }
-        wake_task(candidate, 2);
+        wake_task_at(candidate, 2, Some(now));
     }
     let candidate = task_query(9, 0);
     if !candidate.is_null() && view(candidate).wake_tick <= now {
@@ -1390,7 +1407,7 @@ fn timer_preemption(now: u64, preemptible: bool) -> bool {
         return false;
     }
     if view(running).cpu_idle {
-        refill_ready();
+        refill_ready_at(Some(now));
     } else {
         // Use the already published functional IRQ time. Nonempty destinations
         // receive at most one bounded donor attempt per CPU and quantum; urgent
