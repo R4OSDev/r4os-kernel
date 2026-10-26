@@ -1,4 +1,5 @@
-//! Borrow only the backend of one exact admitted synchronous data read.
+//! Borrow only the backend of one exact admitted data read or prepared
+//! metadata snapshot; shared namespace/mounted identity stays admitted.
 //! Its task-local Guard, mounted use and shared admission remain resident.
 use super::{Guard, access, acquire_gate, gate_op, gate_ptr};
 use crate::{arch::runtime::RuntimeGuard, sched::sync_locks, storage::access_state::Reference};

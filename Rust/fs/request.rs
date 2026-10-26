@@ -624,7 +624,7 @@ pub unsafe extern "C" fn r4os_rust_fs_request_begin(
             }
         }
         parallel_payload =
-            mode == access::READ && !nested_backend && matches!(kind, 2 | 3 | 19 | 20);
+            mode == access::READ && !nested_backend && matches!(kind, 1 | 2 | 3 | 19 | 20);
         // Returning a payload backend must not turn a nested cross-drive
         // request into a blocking acquisition. Two outer readers could
         // otherwise wait behind each other's pending writers.

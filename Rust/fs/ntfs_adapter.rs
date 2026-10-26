@@ -4,11 +4,10 @@ use super::{
     ntfs_adapter_types::*,
     ntfs_format_types::{Buffer, View},
     ntfs_volume_append as append, ntfs_volume_atomic as atomic, ntfs_volume_canonical as canonical,
-    ntfs_volume_clusters as clusters, ntfs_volume_directories as dirs,
-    ntfs_volume_directory as directory, ntfs_volume_entry as core_entry,
-    ntfs_volume_files as files, ntfs_volume_hardlinks as links, ntfs_volume_lookup as lookup,
-    ntfs_volume_names as diagnostic, ntfs_volume_records as records, ntfs_volume_rename as rename,
-    ntfs_volume_sparse as sparse, ntfs_volume_types as t,
+    ntfs_volume_directories as dirs, ntfs_volume_directory as directory,
+    ntfs_volume_entry as core_entry, ntfs_volume_files as files, ntfs_volume_hardlinks as links,
+    ntfs_volume_lookup as lookup, ntfs_volume_names as diagnostic, ntfs_volume_records as records,
+    ntfs_volume_rename as rename, ntfs_volume_sparse as sparse, ntfs_volume_types as t,
     vfs_types::{Location, Result as Output},
 };
 use core::{
@@ -572,7 +571,12 @@ pub unsafe extern "C" fn r4os_rust_ntfs_adapter(
             31 => status(s::build_write(a.volume).map_or(t::WriteStatus::Io, |v| {
                 rename::rename(v, a.number, a.name, a.second, a.other)
             })),
-            32 => clusters::free_count(s::build(a.volume)).map_or(Output::default(), |x| Output {
+            32 => super::ntfs_metadata_read::free_count(
+                s::build(a.volume),
+                a.read_guard,
+                a.read_reference,
+            )
+            .map_or(Output::default(), |x| Output {
                 value: x.min(u64::from(u32::MAX)),
                 present: true,
                 status: 0,

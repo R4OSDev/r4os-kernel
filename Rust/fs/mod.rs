@@ -26,6 +26,7 @@ pub mod ntfs_format_names;
 pub mod ntfs_format_records;
 pub mod ntfs_format_runs;
 pub mod ntfs_format_types;
+pub mod ntfs_metadata_read;
 pub mod ntfs_read_buffers;
 pub mod ntfs_volume_append;
 pub mod ntfs_volume_atomic;

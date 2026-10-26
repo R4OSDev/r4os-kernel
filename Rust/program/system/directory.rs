@@ -91,6 +91,7 @@ unsafe fn drive_info(index: u32, out: *mut c::DriveInfo, include_free: bool) -> 
                     fs::op::FREE,
                     fs::Args {
                         volume,
+                        read_guard: ptr::addr_of_mut!(request.guard),
                         ..Default::default()
                     },
                     ptr::null_mut(),
