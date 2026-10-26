@@ -1966,24 +1966,28 @@ unsafe fn scheduler_log(event: u8, task: Task, a: u64, b: u64) {
                 core::ptr::addr_of!((*t).unwind_guard_count).read()
             }));
             l::puts(b" objects=");
-            let held = unsafe { core::ptr::addr_of!((*t).held_locks).read() };
-            let mut wrote = false;
-            for h in held {
-                if !h.active {
-                    continue;
+            if crate::build_config::config::ENABLE_METRICS {
+                let held = unsafe { core::ptr::addr_of!((*t).held_locks).read() };
+                let mut wrote = false;
+                for h in held {
+                    if !h.active {
+                        continue;
+                    }
+                    if wrote {
+                        l::puts(b",");
+                    }
+                    l::puts(unsafe { core::slice::from_raw_parts(h.name.pointer, h.name.len) });
+                    l::puts(b"=");
+                    l::hex(h.object_id, 16);
+                    l::puts(b"@");
+                    l::dec(u64::from(h.rank));
+                    wrote = true;
                 }
-                if wrote {
-                    l::puts(b",");
+                if !wrote {
+                    l::puts(b"none");
                 }
-                l::puts(unsafe { core::slice::from_raw_parts(h.name.pointer, h.name.len) });
-                l::puts(b"=");
-                l::hex(h.object_id, 16);
-                l::puts(b"@");
-                l::dec(u64::from(h.rank));
-                wrote = true;
-            }
-            if !wrote {
-                l::puts(b"none");
+            } else {
+                l::puts(b"unavailable(metrics=false)");
             }
             l::puts(b"\r\n");
         }

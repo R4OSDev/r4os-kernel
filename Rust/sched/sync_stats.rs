@@ -1,51 +1,31 @@
-//! Native instrumentation: twelve observational wait counters are atomic.
+//! Native instrumentation: observational wait counters are CPU-sharded atomics.
 //! They never publish queue/task state. Lock tracking retains the runtime owner.
 use super::sync_types::{LockSummary, WaitSummary};
 use super::task::task_types::WaitResult;
-use crate::{arch::runtime, sched::scheduler};
-use core::{
-    cell::UnsafeCell,
-    sync::atomic::{AtomicU64, Ordering},
+pub(super) use super::wait_counters::Metric as WaitMetric;
+use crate::{
+    arch::{percpu, runtime, smp_policy::MAX_CPUS},
+    sched::scheduler,
 };
-
-#[repr(usize)]
-#[derive(Clone, Copy)]
-pub(super) enum WaitMetric {
-    QueueWaits = 0,
-    WakeOne = 1,
-    WakeAll = 2,
-    Timeouts = 3,
-    Cancellations = 4,
-    Drops = 5,
-    TotalWaitTicks = 6,
-    MaxWaitTicks = 7,
-    LastWaitTicks = 8,
-    DirectedWakes = 9,
-    DirectedScans = 10,
-    DirectedFifoBypasses = 11,
-}
-static WAIT: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+use core::cell::UnsafeCell;
+static WAIT: super::wait_counters::Counters<MAX_CPUS> = super::wait_counters::Counters::new();
 
 // Relaxed is deliberate: these exact event counters do not protect resources
 // or act as completion/publication flags. The functional runtime admission,
 // enrollment, wake, ownership and lifetime barriers remain unchanged.
 #[inline]
 pub(super) fn wait_add(metric: WaitMetric, amount: u64) {
-    WAIT[metric as usize].fetch_add(amount, Ordering::Relaxed);
+    WAIT.add(percpu::current_index() as usize, metric, amount);
 }
 pub(super) fn wait_latency(elapsed: u64, result: WaitResult) {
-    wait_add(WaitMetric::TotalWaitTicks, elapsed);
-    WAIT[WaitMetric::LastWaitTicks as usize].store(elapsed, Ordering::Relaxed);
-    WAIT[WaitMetric::MaxWaitTicks as usize].fetch_max(elapsed, Ordering::Relaxed);
+    let cpu = percpu::current_index() as usize;
+    WAIT.latency(cpu, elapsed);
     if result == WaitResult::Timeout {
-        wait_add(WaitMetric::Timeouts, 1);
+        WAIT.add(cpu, WaitMetric::Timeouts, 1);
     }
     if result == WaitResult::Cancelled {
-        wait_add(WaitMetric::Cancellations, 1);
+        WAIT.add(cpu, WaitMetric::Cancellations, 1);
     }
-}
-fn wait_value(metric: WaitMetric) -> u64 {
-    WAIT[metric as usize].load(Ordering::Relaxed)
 }
 
 struct Storage(UnsafeCell<LockSummary>);
@@ -89,6 +69,8 @@ pub(super) fn lock_change(f: impl FnOnce(&mut LockSummary)) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_sync_wait_summary(out: *mut WaitSummary) {
     let flags = runtime::save_runtime();
+    let values = WAIT.snapshot();
+    let wait_value = |metric: WaitMetric| values[metric as usize];
     let value = WaitSummary {
         queue_waits: wait_value(WaitMetric::QueueWaits),
         wake_one: wait_value(WaitMetric::WakeOne),
@@ -115,7 +97,8 @@ pub unsafe extern "C" fn r4os_rust_sync_lock_summary(out: *mut LockSummary) {
     let mut value = unsafe { *STATS.0.get() };
     let task = scheduler::current();
     if !task.is_null() {
-        value.current_depth = unsafe { super::sync_locks::held_depth(task.cast()) };
+        value.current_depth =
+            unsafe { (*super::task::task_registry::core(task.cast())).held_lock_count };
     }
     unsafe { out.write(value) };
     runtime::restore_runtime(flags);

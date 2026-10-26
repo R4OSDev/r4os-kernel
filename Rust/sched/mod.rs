@@ -4,6 +4,7 @@ pub mod scheduler_types;
 pub mod task;
 pub mod task_context;
 pub mod task_index;
+mod wait_counters;
 pub mod wait_node;
 
 #[path = "../kernel/deadman.rs"]

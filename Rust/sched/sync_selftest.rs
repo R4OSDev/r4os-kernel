@@ -154,6 +154,9 @@ pub(crate) fn stop() {
 
 fn recursive_mutex() -> bool {
     unsafe {
+        let task = scheduler::current().cast();
+        let core = super::task::task_registry::core(task);
+        let initial_depth = (*core).held_lock_count;
         if !sync_locks::r4os_rust_sync_mutex(mutex(), 1, 50) {
             return false;
         }
@@ -162,10 +165,28 @@ fn recursive_mutex() -> bool {
         let exact = (*mutex()).owner == id
             && (*mutex()).owner_generation == generation
             && (*mutex()).depth == 2;
+        let mut summary = core::mem::MaybeUninit::uninit();
+        super::sync_stats::r4os_rust_sync_lock_summary(summary.as_mut_ptr());
+        let summary = summary.assume_init();
+        let depth_exact = summary.current_depth == initial_depth + 1
+            && (*core).held_lock_count == initial_depth + 1;
+        let detail_exact = if crate::build_config::config::ENABLE_METRICS {
+            (*core)
+                .held_locks
+                .iter()
+                .any(|record| record.active && record.object_id == mutex().addr() as u64)
+        } else {
+            (*core).held_locks.iter().all(|record| !record.active)
+                && summary.held_slots_used == 0
+                && summary.max_depth == 0
+                && summary.tracking_drops == 0
+        };
         let first = !recursive || sync_locks::r4os_rust_sync_mutex(mutex(), 2, 0);
         let last = sync_locks::r4os_rust_sync_mutex(mutex(), 2, 0);
         recursive
             && exact
+            && depth_exact
+            && detail_exact
             && first
             && last
             && (*mutex()).owner == 0
@@ -173,6 +194,7 @@ fn recursive_mutex() -> bool {
             && (*mutex()).depth == 0
             && (*mutex()).queue.core.count == 0
             && (*mutex()).donation_rank == 255
+            && (*core).held_lock_count == initial_depth
     }
 }
 
@@ -247,7 +269,13 @@ pub(crate) fn cases() -> bool {
         crate::boot::log_route::dec(elapsed);
         puts(b" event_iters=");
         crate::boot::log_route::dec(u64::from(EVENT_ITERS));
-        puts(b" if_preserve=on/off\r\n");
+        puts(b" if_preserve=on/off lock_detail=");
+        puts(if crate::build_config::config::ENABLE_METRICS {
+            b"on"
+        } else {
+            b"off"
+        });
+        puts(b" functional_depth=preserved\r\n");
         true
     }
 }

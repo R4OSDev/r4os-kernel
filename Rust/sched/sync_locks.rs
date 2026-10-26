@@ -53,7 +53,7 @@ pub(super) fn note_sleep() {
     }
     runtime::restore_runtime(flags);
 }
-pub(super) unsafe fn held_depth(t: *mut Task) -> u32 {
+unsafe fn held_depth(t: *mut Task) -> u32 {
     unsafe {
         (*registry::core(t))
             .held_locks
@@ -77,6 +77,9 @@ unsafe fn record_order(t: *mut Task, id: u64, rank: u16) {
 }
 unsafe fn record_acquire(t: *mut Task, id: u64, name: Text, rank: u16, mode: u8) {
     note(|s| s.acquires = s.acquires.wrapping_add(1));
+    if !config::ENABLE_METRICS {
+        return;
+    }
     unsafe {
         let c = registry::core(t);
         let mut free = None;
@@ -110,6 +113,9 @@ unsafe fn record_acquire(t: *mut Task, id: u64, name: Text, rank: u16, mode: u8)
     }
 }
 unsafe fn record_release(t: *mut Task, id: u64) {
+    if !config::ENABLE_METRICS {
+        return;
+    }
     unsafe {
         let c = registry::core(t);
         for h in &mut (*c).held_locks {
