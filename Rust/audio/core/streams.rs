@@ -107,20 +107,12 @@ pub(crate) unsafe fn write_stream_for_owner(
         if requested_frames == 0 {
             return INVALID;
         }
-        let mut fitting_frames =
-            (((*p).ring.len - (*p).available) / pcm::TARGET_FRAME_BYTES) as u64 * (*p).rate as u64
-                / pcm::TARGET_RATE as u64;
-        if fitting_frames == 0 {
-            let result = pump_available_locked(true);
-            if result < 0 {
-                return result;
-            }
-            fitting_frames = (((*p).ring.len - (*p).available) / pcm::TARGET_FRAME_BYTES) as u64
-                * (*p).rate as u64
-                / pcm::TARGET_RATE as u64;
-        }
+        let fitting_frames = (((*p).ring.len - (*p).available) / pcm::TARGET_FRAME_BYTES) as u64
+            * (*p).rate as u64
+            / pcm::TARGET_RATE as u64;
         let accepted_frames = requested_frames.min(fitting_frames.try_into().unwrap());
         if accepted_frames == 0 {
+            schedule_progress(&MIX_DUE, 0);
             return BUSY;
         }
         let accepted_bytes = accepted_frames * frame_bytes;
@@ -183,9 +175,8 @@ pub(crate) unsafe fn write_stream_for_owner(
         if accepted_bytes < requested_bytes {
             g!(stream_write_truncations) = g!(stream_write_truncations).wrapping_add(1);
         }
-        if pump_available_locked(false) == BUSY {
-            schedule_progress(&MIX_DUE, 2);
-        }
+        // Acceptance never dispatches the backend on this RPC caller.
+        schedule_progress(&MIX_DUE, 0);
         accepted_bytes.try_into().unwrap()
     }
 }
@@ -218,7 +209,7 @@ pub(crate) unsafe fn close_stream_for_owner(owner: Owner, id: u32) -> i32 {
         if finish < 0 {
             return finish;
         }
-        let pump = pump_available_locked(true);
+        let pump = pump_draining_stream_locked(p);
         if pump < 0 {
             return pump;
         }
@@ -281,7 +272,10 @@ pub(crate) unsafe fn close_streams_for_owner(owner: Owner) -> bool {
         if matching == 0 {
             return true;
         }
-        if owner_queued && active_output_present() && pump_available_locked(true) < 0 {
+        if owner_queued
+            && active_output_present()
+            && pump_goal_locked(true, PumpGoal::Streams(reserved)) < 0
+        {
             return false;
         }
         if stop_closing_streams_locked(matching) < 0 {
@@ -439,7 +433,7 @@ pub(super) unsafe fn finish_stream_pcm_locked(p: *mut Stream) -> i32 {
             if !(*p).resampler.previous_valid {
                 return 0;
             }
-            let pumped = pump_available_locked(true);
+            let pumped = pump_draining_stream_locked(p);
             if pumped < 0 {
                 return pumped;
             }
@@ -448,14 +442,42 @@ pub(super) unsafe fn finish_stream_pcm_locked(p: *mut Stream) -> i32 {
     }
 }
 
-pub(super) unsafe fn pump_available_locked(force: bool) -> i32 {
+#[derive(Clone, Copy)]
+enum PumpGoal {
+    All,
+    Streams([bool; MAX_STREAMS]),
+}
+
+unsafe fn goal_drained(goal: PumpGoal) -> bool {
+    unsafe {
+        match goal {
+            PumpGoal::All => false,
+            PumpGoal::Streams(mask) => !(0..MAX_STREAMS)
+                .any(|i| mask[i] && (*stream(i)).available >= pcm::TARGET_FRAME_BYTES),
+        }
+    }
+}
+
+// Closing owns a pinned transaction on these exact stream slots. Other
+// producers may continue; their remaining PCM cannot prolong this close.
+unsafe fn pump_draining_stream_locked(p: *mut Stream) -> i32 {
+    unsafe {
+        let mut mask = [false; MAX_STREAMS];
+        for (i, selected) in mask.iter_mut().enumerate() {
+            *selected = ptr::eq(p, stream(i));
+        }
+        pump_goal_locked(true, PumpGoal::Streams(mask))
+    }
+}
+
+unsafe fn pump_goal_locked(force: bool, goal: PumpGoal) -> i32 {
     unsafe {
         unlock();
         let Some(output) = OutputGuard::acquire(false) else {
             relock();
             return BUSY;
         };
-        let result = pump_available_output_owned(force);
+        let result = pump_output_owned(force, goal);
         drop(output);
         relock();
         result
@@ -463,11 +485,18 @@ pub(super) unsafe fn pump_available_locked(force: bool) -> i32 {
 }
 
 pub(super) unsafe fn pump_available_output_owned(force: bool) -> i32 {
+    unsafe { pump_output_owned(force, PumpGoal::All) }
+}
+
+unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
     unsafe {
         relock();
         let _lock = StreamLock;
         let max_passes = MAX_STREAMS * (RING_BYTES / MIX_QUANTUM_BYTES + 2);
         for _ in 0..max_passes {
+            if goal_drained(goal) {
+                return 0;
+            }
             let mut selected = [false; MAX_STREAMS];
             let mut open_count = 0;
             let mut ready_count = 0;
@@ -576,7 +605,7 @@ pub(super) unsafe fn pump_available_output_owned(force: bool) -> i32 {
                 (*p).deferred_once = false;
             }
         }
-        BUSY
+        if goal_drained(goal) { 0 } else { BUSY }
     }
 }
 

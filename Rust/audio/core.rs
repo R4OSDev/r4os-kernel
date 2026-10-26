@@ -596,11 +596,11 @@ pub(crate) use outputs::{
 };
 use progress::schedule_progress;
 pub(crate) use progress::start_progress_worker;
+use streams::stop_pcm_if_no_streams;
 pub(crate) use streams::{
     close_stream, close_stream_for_owner, close_streams_for_owner, open_stream,
     open_stream_for_owner, set_volume, set_volume_for_owner, write_stream, write_stream_for_owner,
 };
-use streams::{pump_available_locked, stop_pcm_if_no_streams};
 pub(crate) use synths::{
     apply_configured_sid_model, configure_sid_model, midi_close, midi_open_synth, midi_send,
     opl3_render_block, opl3_reset, opl3_stop, opl3_write_register,
