@@ -188,6 +188,21 @@ unsafe fn next(a: Args, out: *mut Entry) -> u64 {
         st as u64
     }
 }
+/// Typed bounded enumeration; only value projections cross the backend owner.
+pub(crate) unsafe fn directory_batch(
+    volume: Mounted,
+    node: u64,
+    cursor: *mut u64,
+    capacity: usize,
+    mut emit: impl FnMut(Entry),
+) -> (usize, u8) {
+    let (count, status) = unsafe {
+        directory::batch(s::build(volume), node, cursor.cast(), capacity, |entry| {
+            emit(s::project(entry))
+        })
+    };
+    (count, status as u8)
+}
 #[inline(never)]
 unsafe fn list_root(a: Args) -> bool {
     unsafe {

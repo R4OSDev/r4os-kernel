@@ -160,6 +160,53 @@ pub unsafe extern "C" fn r4os_rust_fs_directory_changes(
     }
 }
 
+/// Capture both namespace watches at one publication sequence. The caller
+/// retains its original request while resolving these nodes.
+pub(crate) fn begin_scan(mount: Reference, node: u64, parent: u64) -> (Cursor, Cursor) {
+    let _guard = Guard::acquire(1);
+    let history = unsafe { &*HISTORY.0.get() };
+    (history.begin(mount, node), history.begin(mount, parent))
+}
+/// Validate the exact mounted generation and both watches in one RAM-only
+/// transaction. Global sequence changes still reach the caller even when the
+/// mutation belongs to another directory and neither watch reports a hit.
+pub(crate) fn poll_scan(cursor: &mut Cursor, parent: &mut Cursor) -> i32 {
+    if cursor.version != 1
+        || cursor.size != 40
+        || cursor.reserved != 0
+        || cursor.mount_generation == 0
+        || parent.version != 1
+        || parent.size != 40
+        || parent.reserved != 0
+        || parent.mount_slot != cursor.mount_slot
+        || parent.mount_generation != cursor.mount_generation
+        || parent.sequence != cursor.sequence
+    {
+        return -1;
+    }
+    let _guard = Guard::acquire(1);
+    let input = Input {
+        reference: Reference {
+            slot: cursor.mount_slot,
+            generation: cursor.mount_generation,
+        },
+        ..Input::default()
+    };
+    let mut scalar = 0;
+    let mut snapshot = MaybeUninit::<Mount>::uninit();
+    if unsafe {
+        r4os_rust_storage_access_runtime(8, true, &input, &mut scalar, snapshot.as_mut_ptr().cast())
+    } != 0
+    {
+        return -3;
+    }
+    let history = unsafe { &*HISTORY.0.get() };
+    // Always consume both at the same sequence, including a first-watch hit.
+    let changed = unsafe { history.poll(cursor) };
+    let parent_changed = unsafe { history.poll(parent) };
+    i32::from(changed || parent_changed)
+}
+
 const _: () = {
     assert!(core::mem::size_of::<Entry>() == 24);
     assert!(core::mem::offset_of!(History, entries) == 8);

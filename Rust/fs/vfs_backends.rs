@@ -454,3 +454,42 @@ pub(crate) unsafe fn forget(is_ntfs: bool, index: usize, first: u64, count: u64)
         }
     }
 }
+
+/// Existing native filesystem owners keep one mounted request for this visit.
+/// All callbacks copy caller-local values; no provider pointer escapes.
+#[inline(never)]
+pub(crate) unsafe fn directory_batch(
+    volume: Volume,
+    node: u64,
+    cursor: *mut u64,
+    out: &mut [Entry],
+) -> (usize, u8) {
+    let mut written = 0;
+    match volume.kind {
+        0 => {
+            let Some(node) = u32::try_from(node).ok() else {
+                return (0, 3);
+            };
+            let (count, status) = unsafe {
+                super::fat_directory::batch(
+                    fat_volume(volume),
+                    node,
+                    cursor.cast(),
+                    out.len(),
+                    |entry| {
+                        out[written] = from_fat(entry);
+                        written += 1;
+                    },
+                )
+            };
+            (count, status as u8)
+        }
+        1 => unsafe {
+            ntfs_adapter::directory_batch(mounted(volume), node, cursor, out.len(), |entry| {
+                out[written] = from_ntfs(entry);
+                written += 1;
+            })
+        },
+        _ => (0, 3),
+    }
+}

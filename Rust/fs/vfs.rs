@@ -714,6 +714,34 @@ pub(crate) fn mounted_volume(letter: u8) -> Option<Volume> {
         None
     }
 }
+/// Copy the exact current mounted instance under the same RAM owner as its
+/// generation validation. No table borrow or mount lease survives this call.
+pub(crate) fn mounted_volume_by_reference(reference: Reference) -> Option<Volume> {
+    let _guard = Guard::acquire(1);
+    unsafe {
+        let mut snapshot = MaybeUninit::<Mount>::uninit();
+        access(
+            8,
+            true,
+            Input {
+                reference,
+                ..Input::default()
+            },
+            snapshot.as_mut_ptr().cast(),
+        )?;
+        for index in 0..27 {
+            let slot = (*MOUNTS.0.get())[index];
+            if slot.present
+                && slot.volume.has_ref
+                && slot.volume.reference.slot == reference.slot
+                && slot.volume.reference.generation == reference.generation
+            {
+                return Some(slot.volume);
+            }
+        }
+    }
+    None
+}
 pub(crate) fn resolve_path(volume: Volume, path: &[u8]) -> Option<u64> {
     let result = unsafe {
         run(

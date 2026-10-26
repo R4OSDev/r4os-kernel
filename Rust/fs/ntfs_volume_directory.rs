@@ -11,12 +11,25 @@ pub(super) unsafe fn next(
     c: *mut DirectoryCursor,
     out: *mut Entry,
 ) -> DirectoryNext {
+    unsafe { batch(v, dir, c, 1, |entry| out.write(entry)).1 }
+}
+/// One prepared MFT/index-allocation view and one total work budget per visit.
+/// The existing mounted request excludes competing volume metadata access;
+/// no root/index pointer or allocation scratch escapes this stack frame.
+#[inline(never)]
+pub(super) unsafe fn batch(
+    v: Volume,
+    dir: u64,
+    c: *mut DirectoryCursor,
+    capacity: usize,
+    mut emit: impl FnMut(Entry),
+) -> (usize, DirectoryNext) {
     unsafe {
         if (*c).state > 2 || (*c).depth > 8 {
-            return DirectoryNext::Io;
+            return (0, DirectoryNext::Io);
         }
         if (*c).state == 2 {
-            return DirectoryNext::NotFound;
+            return (0, DirectoryNext::NotFound);
         }
         if (*c).state == 0 {
             c.write(DirectoryCursor {
@@ -26,35 +39,61 @@ pub(super) unsafe fn next(
             })
         }
         if (*c).depth == 0 {
-            return DirectoryNext::Io;
+            return (0, DirectoryNext::Io);
         }
         let Some(h) = r::load(v, dir, v.record()) else {
-            return DirectoryNext::Io;
+            return (0, DirectoryNext::Io);
         };
         let record = v.record();
         let Some(attr) = r::find(v, record, h, 0x90, View::of(&idx::I30)) else {
-            return DirectoryNext::Io;
+            return (0, DirectoryNext::Io);
         };
         let Some(mut root) = fmt::index_root(attr.value.get()) else {
-            return DirectoryNext::Io;
+            return (0, DirectoryNext::Io);
         };
         let mut alloc = AttrScratch::EMPTY;
         if root.header.flags & 1 != 0 {
             if r::collect(v, dir, 0xa0, View::of(&idx::I30), &mut alloc) != Lookup::Found {
-                return DirectoryNext::Io;
+                return (0, DirectoryNext::Io);
             }
             let Some(h) = r::load(v, dir, v.record()) else {
-                return DirectoryNext::Io;
+                return (0, DirectoryNext::Io);
             };
             let Some(attr) = r::find(v, record, h, 0x90, View::of(&idx::I30)) else {
-                return DirectoryNext::Io;
+                return (0, DirectoryNext::Io);
             };
             let Some(reloaded) = fmt::index_root(attr.value.get()) else {
-                return DirectoryNext::Io;
+                return (0, DirectoryNext::Io);
             };
             root = reloaded
         }
-        for _ in 0..256 {
+        let mut remaining = crate::contract::directory_batch_work_steps as usize;
+        let mut count = 0;
+        while count < capacity {
+            let mut entry = Entry::EMPTY;
+            let status = advance(v, dir, c, &mut entry, &root, &alloc, &mut remaining);
+            if status != DirectoryNext::Found {
+                return (count, status);
+            }
+            emit(entry);
+            count += 1;
+        }
+        (count, DirectoryNext::Found)
+    }
+}
+unsafe fn advance(
+    v: Volume,
+    dir: u64,
+    c: *mut DirectoryCursor,
+    out: *mut Entry,
+    root: &IndexRoot,
+    alloc: &AttrScratch,
+    remaining: &mut usize,
+) -> DirectoryNext {
+    unsafe {
+        while *remaining != 0 {
+            *remaining -= 1;
+
             let level = (*c).depth as usize - 1;
             let frame = core::ptr::addr_of_mut!((*c).frames)
                 .cast::<DirectoryFrame>()
@@ -64,7 +103,7 @@ pub(super) unsafe fn next(
             }
             let mut entries = root.entries;
             if level != 0 {
-                if !idx::cached(v, dir, r::attr_runs(&alloc), (*frame).vcn) {
+                if !idx::cached(v, dir, r::attr_runs(alloc), (*frame).vcn) {
                     return DirectoryNext::Io;
                 }
                 let Some(b) = fmt::index_block(r::view(idx::block(v))) else {
@@ -130,6 +169,7 @@ pub(super) unsafe fn next(
         DirectoryNext::Again
     }
 }
+
 pub struct Sink {
     pub out: Option<Buffer>,
     pub cursor: usize,

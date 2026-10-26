@@ -504,12 +504,57 @@ impl Drop for CursorLfn {
         }
     }
 }
+struct SectorScratch {
+    lba: u32,
+    valid: bool,
+    bytes: [u8; SECTOR],
+}
 #[inline(never)]
 pub(super) unsafe fn next(
     v: Volume,
     start: u32,
     cursor: *mut DirectoryCursor,
     out: *mut Entry,
+) -> Next {
+    unsafe { batch(v, start, cursor, 1, |entry| out.write(entry)).1 }
+}
+/// Request-local sector reuse; every skipped LFN/deleted record still spends
+/// the same shared256-step budget, including transitions between results.
+#[inline(never)]
+pub(super) unsafe fn batch(
+    v: Volume,
+    start: u32,
+    cursor: *mut DirectoryCursor,
+    capacity: usize,
+    mut emit: impl FnMut(Entry),
+) -> (usize, Next) {
+    let mut scratch = SectorScratch {
+        lba: 0,
+        valid: false,
+        bytes: [0; SECTOR],
+    };
+    let mut remaining = crate::contract::directory_batch_work_steps as usize;
+    let mut count = 0;
+    while count < capacity {
+        let mut entry = Entry::EMPTY;
+        let status =
+            unsafe { next_prepared(v, start, cursor, &mut entry, &mut scratch, &mut remaining) };
+        if status != Next::Found {
+            return (count, status);
+        }
+        emit(entry);
+        count += 1;
+    }
+    (count, Next::Found)
+}
+#[inline(never)]
+unsafe fn next_prepared(
+    v: Volume,
+    start: u32,
+    cursor: *mut DirectoryCursor,
+    out: *mut Entry,
+    scratch: &mut SectorScratch,
+    remaining: &mut usize,
 ) -> Next {
     unsafe {
         let c = cursor;
@@ -546,9 +591,7 @@ pub(super) unsafe fn next(
                 checksum: (*c).lfn_checksum,
             },
         };
-        let mut examined = 0;
-        let mut data = [0; SECTOR];
-        while examined < 256 {
+        while *remaining != 0 {
             if (*c).offset == bytes && bytes != 0 {
                 (*c).cluster = (*c).successor;
                 (*c).offset = 0;
@@ -578,15 +621,24 @@ pub(super) unsafe fn next(
                 STATS.dir_scans.fetch_add(1, Relaxed);
             }
             let lba = v.cluster_lba((*c).cluster) + (*c).offset / SECTOR as u32;
-            if !s::read(v.device_index, u64::from(lba), 1, Buffer::of(&mut data)) {
-                return Next::Io;
+            if !scratch.valid || scratch.lba != lba {
+                if !s::read(
+                    v.device_index,
+                    u64::from(lba),
+                    1,
+                    Buffer::of(&mut scratch.bytes),
+                ) {
+                    return Next::Io;
+                }
+                scratch.lba = lba;
+                scratch.valid = true;
             }
             let mut off = (*c).offset as usize % SECTOR;
-            while off < SECTOR && examined < 256 {
-                examined += 1;
+            while off < SECTOR && *remaining != 0 {
+                *remaining -= 1;
                 STATS.dir_entries_scanned.fetch_add(1, Relaxed);
                 (*c).offset += 32;
-                let raw = &data[off..off + 32];
+                let raw = &scratch.bytes[off..off + 32];
                 off += 32;
                 if raw[0] == 0 {
                     guard.lfn.reset();

@@ -416,3 +416,228 @@ pub unsafe extern "C" fn r4os_rust_sys_file_info(input: *const u8, out: *mut c::
         1
     }
 }
+
+fn scan_poll(
+    change: &mut c::DirectoryChangeCursor,
+    parent: &mut c::DirectoryChangeCursor,
+) -> Result<bool, i32> {
+    let before = change.sequence;
+    if changes::poll_scan(change, parent) != 0 {
+        return Err(-10);
+    }
+    Ok(change.sequence != before)
+}
+unsafe fn scan_node(volume: fs::Volume, relative: &[u8]) -> Result<(u64, u32, u64), i32> {
+    unsafe {
+        if path::root(relative) {
+            let node = fs::scalar(volume, 2);
+            return Ok((node, 0, node));
+        }
+        let mut parent = 0;
+        match fs::parent(volume, path::parent(relative), &mut parent) {
+            0 => {}
+            1 => return Err(-3),
+            _ => return Err(-9),
+        }
+        let mut entry = fs::Entry::EMPTY;
+        match fs::lookup(volume, parent, path::base(relative), false, &mut entry) {
+            // Preserve resolve_path refusal of NTFS reparse traversal.
+            0 if entry.is_dir() && entry.reparse => Err(-9),
+            0 if entry.is_dir() => Ok((entry.node, u32::from(entry.generation), parent)),
+            0 | 1 => Err(-3),
+            _ => Err(-9),
+        }
+    }
+}
+/// # Safety
+/// Exclusive aligned cursor and disjoint initialized output records for the
+/// supplied capacity. The initial path is NUL terminated. Continuation uses
+/// only captured inline values. No mounted request, backend pointer, heap
+/// allocation or kernel scan reference survives a return or caller unwind.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_directory_batch(
+    input: *const u8,
+    cursor: *mut c::DirectoryBatchCursor,
+    out: *mut c::DirectoryBatchEntry,
+    capacity: u32,
+) -> i32 {
+    unsafe {
+        if cursor.is_null()
+            || capacity > c::directory_batch_max_entries
+            || capacity != 0 && out.is_null()
+            || (*cursor).version != 1
+            || (*cursor).size != size_of::<c::DirectoryBatchCursor>() as u32
+        {
+            return -1;
+        }
+        let owner = some!(ctx::owner(), -1);
+        // The hot buffered-entry check copies only the two40-byte watches,
+        // not the2160-byte path/backend cursor. A changed global sequence
+        // falls through with the original caller state for path validation.
+        if capacity == 0 && (*cursor).change.mount_generation != 0 {
+            if (*cursor).owner_id != owner.id
+                || (*cursor).owner_generation != owner.generation
+                || (*cursor).owner_kind != u32::from(owner.kind)
+            {
+                return -10;
+            }
+            let mut change = (*cursor).change;
+            let mut parent = (*cursor).parent_change;
+            match scan_poll(&mut change, &mut parent) {
+                Err(code) => return code,
+                Ok(false) => {
+                    (*cursor).change = change;
+                    (*cursor).parent_change = parent;
+                    return 0;
+                }
+                Ok(true) => {}
+            }
+        }
+        let mut next = cursor.read();
+        let initial = next.change.mount_generation == 0;
+        let mut namespace_changed = false;
+        if initial {
+            if capacity == 0 || input.is_null() {
+                return -1;
+            }
+        } else {
+            if next.owner_id != owner.id
+                || next.owner_generation != owner.generation
+                || next.owner_kind != u32::from(owner.kind)
+            {
+                return -10;
+            }
+            let length = next.path_len as usize;
+            if !(3..next.path.len()).contains(&length)
+                || next.path[length] != 0
+                || !next.path[0].is_ascii_alphabetic()
+                || next.path[1] != b':'
+                || !path::separator(next.path[2])
+            {
+                return -1;
+            }
+            namespace_changed = match scan_poll(&mut next.change, &mut next.parent_change) {
+                Ok(changed) => changed,
+                Err(code) => return code,
+            };
+            // Buffered SDK records are revalidated before each publication.
+            // This common unchanged-namespace case is entirely RAM-only.
+            if capacity == 0 && !namespace_changed {
+                cursor.write(next);
+                return 0;
+            }
+        }
+        let mut buffers = PathBuffers::new();
+        let volume = if initial {
+            let target = some!(buffers.resolve(input), -1);
+            let volume = some!(ctx::volume(target), -3);
+            if !volume.has_ref {
+                return -3;
+            }
+            next = c::DirectoryBatchCursor {
+                owner_id: owner.id,
+                owner_kind: u32::from(owner.kind),
+                owner_generation: owner.generation,
+                ..Default::default()
+            };
+            if !path::drive_z(
+                (*target.drive_ref).letter,
+                target.path.slice(),
+                &mut next.path,
+            ) {
+                return -7;
+            }
+            next.path_len = some!(next.path.iter().position(|&b| b == 0), -7) as u32;
+            volume
+        } else {
+            some!(
+                crate::fs::vfs::mounted_volume_by_reference(
+                    crate::storage::access_state::Reference {
+                        slot: next.change.mount_slot,
+                        generation: next.change.mount_generation
+                    }
+                ),
+                -10
+            )
+        };
+        let letter = next.path[0];
+        let mut request = some!(fs::Request::volume(11, letter, volume), -9);
+        let relative = &next.path[2..next.path_len as usize];
+        if initial {
+            let (node, generation, parent) = match scan_node(volume, relative) {
+                Ok(bound) => bound,
+                Err(code) => return code,
+            };
+            next.node_generation = generation;
+            (next.change, next.parent_change) = changes::begin_scan(volume.reference, node, parent);
+        } else {
+            namespace_changed |= match scan_poll(&mut next.change, &mut next.parent_change) {
+                Ok(changed) => changed,
+                Err(code) => return code,
+            };
+            if namespace_changed {
+                // Only an intervening namespace publication needs path
+                // resolution again; ancestor moves are included. This is not
+                // performed for every entry of an unchanged scan.
+                let (node, generation, parent) = match scan_node(volume, relative) {
+                    Ok(bound) => bound,
+                    Err(-3) => return -10,
+                    Err(code) => return code,
+                };
+                if node != next.change.node
+                    || generation != next.node_generation
+                    || parent != next.parent_change.node
+                {
+                    return -10;
+                }
+            }
+        }
+        if capacity == 0 {
+            if scan_poll(&mut next.change, &mut next.parent_change).is_err() {
+                return -10;
+            }
+            cursor.write(next);
+            request.ok = true;
+            return 0;
+        }
+        let mut entries = [fs::Entry::EMPTY; c::directory_batch_max_entries as usize];
+        let (count, status) = crate::fs::vfs_backends::directory_batch(
+            volume,
+            next.change.node,
+            next.backend.as_mut_ptr(),
+            &mut entries[..capacity as usize],
+        );
+        if status == 3 {
+            return -9;
+        }
+        if scan_poll(&mut next.change, &mut next.parent_change).is_err() {
+            return -10;
+        }
+        // Validate every full path before committing the opaque continuation.
+        // A failed output has no authority and cannot silently consume data.
+        for (index, entry) in entries[..count].iter().enumerate() {
+            let mut joined = [0u8; 1024];
+            let path = some!(
+                path::join(relative, &entry.name[..entry.name_len], &mut joined),
+                -7
+            );
+            let mut record = c::DirectoryBatchEntry {
+                info: metadata(entry, letter, true),
+                ..Default::default()
+            };
+            if !path::drive_z(letter, path, &mut record.path) {
+                return -7;
+            }
+            out.add(index).write(record);
+        }
+        cursor.write(next);
+        request.ok = true;
+        if count != 0 {
+            count as i32
+        } else if status == 1 {
+            -5
+        } else {
+            0
+        }
+    }
+}
