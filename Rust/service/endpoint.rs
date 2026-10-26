@@ -35,6 +35,7 @@ unsafe fn queue_op(queue: *mut WaitQueue, operation: u8, result: u32) -> u64 {
     }
 }
 unsafe fn release_permit(ep: *mut Endpoint) {
+    crate::program::async_io::service_changed(unsafe { (*ep).handle });
     unsafe {
         sync_objects::r4os_rust_sync_semaphore(
             ptr::addr_of_mut!((*ep).slots_available),
@@ -110,6 +111,7 @@ pub(super) unsafe fn reset_metadata(ep: *mut Endpoint, count_reset: bool) {
     }
 }
 pub(super) unsafe fn wake_waiters(ep: *mut Endpoint, result: u32) {
+    crate::program::async_io::service_changed(unsafe { (*ep).handle });
     unsafe {
         for i in 0..DEPTH {
             let s = slot(ep, i);
@@ -284,7 +286,13 @@ unsafe fn clear_header(out: *mut c::ServiceMessageHeader) {
         });
     }
 }
-unsafe fn publish(ep: *mut Endpoint, client: u32, op: u16, data: Bytes) -> i32 {
+unsafe fn publish(
+    ep: *mut Endpoint,
+    client: u32,
+    op: u16,
+    data: Bytes,
+    deadline: Option<u64>,
+) -> i32 {
     unsafe {
         let Some(i) = free_slot(ep) else {
             release_permit(ep);
@@ -309,6 +317,15 @@ unsafe fn publish(ep: *mut Endpoint, client: u32, op: u16, data: Bytes) -> i32 {
                 .lifetime
                 .payload_copy_bytes
                 .wrapping_add(data.len as u64);
+        }
+        // Copying pageable client bytes can itself wait. Async admission is
+        // published only while its ORIGINAL submission deadline still holds.
+        if deadline.is_some_and(|end| timer::tick_count() >= end) {
+            reset_slot(s);
+            release_permit(ep);
+            (*ep).timeouts = (*ep).timeouts.wrapping_add(1);
+            (*ep).admission_timeouts = (*ep).admission_timeouts.wrapping_add(1);
+            return c::service_api_result_timeout;
         }
         assert!((*ep).queued_count < DEPTH);
         (*ep).queued_slots[(*ep).queued_count] = i;
@@ -336,7 +353,7 @@ pub(super) unsafe fn submit(handle: u32, client: u32, op: u16, data: Bytes) -> i
             (*ep).busy_rejections = (*ep).busy_rejections.wrapping_add(1);
             return c::service_api_result_busy;
         }
-        publish(ep, client, op, data)
+        publish(ep, client, op, data, None)
     }
 }
 pub(super) unsafe fn leave_unwind(unwind: *mut task_context::Unwind) {
@@ -356,6 +373,17 @@ unsafe fn publish_guarded(
     output: *mut task_context::Unwind,
     acquired: task_context::Unwind,
 ) -> i32 {
+    unsafe { publish_guarded_at(ep, client, op, data, output, acquired, None) }
+}
+unsafe fn publish_guarded_at(
+    ep: *mut Endpoint,
+    client: u32,
+    op: u16,
+    data: Bytes,
+    output: *mut task_context::Unwind,
+    acquired: task_context::Unwind,
+    deadline: Option<u64>,
+) -> i32 {
     unsafe {
         let mut owned = acquired;
         if !output.is_null() {
@@ -371,7 +399,7 @@ unsafe fn publish_guarded(
             }
             output.write(owned);
         }
-        let result = publish(ep, client, op, data);
+        let result = publish(ep, client, op, data, deadline);
         if result <= 0 {
             leave_unwind(&mut owned);
             if !output.is_null() {
@@ -381,6 +409,47 @@ unsafe fn publish_guarded(
             leave_unwind(&mut owned);
         }
         result
+    }
+}
+/// Productive Async admission never sleeps for a permit. Its absolute finite
+/// deadline is checked under the exact endpoint owner, again after payload copy.
+pub(crate) unsafe fn submit_async(
+    handle: u32,
+    client: u32,
+    op: u16,
+    data: Bytes,
+    deadline: Option<u64>,
+    output: *mut task_context::Unwind,
+) -> i32 {
+    unsafe {
+        if op == 0 {
+            return c::service_api_result_invalid;
+        }
+        if data.len > PAYLOAD {
+            return c::service_api_result_payload_too_large;
+        }
+        let Some(lease) = reg::lock_handle(handle, 5) else {
+            return c::service_api_result_bad_handle;
+        };
+        let ep = lease.endpoint;
+        if deadline.is_some_and(|end| timer::tick_count() >= end) {
+            (*ep).timeouts = (*ep).timeouts.wrapping_add(1);
+            (*ep).admission_timeouts = (*ep).admission_timeouts.wrapping_add(1);
+            return c::service_api_result_timeout;
+        }
+        if !try_permit(ep) {
+            (*ep).busy_rejections = (*ep).busy_rejections.wrapping_add(1);
+            return c::service_api_result_busy;
+        }
+        publish_guarded_at(
+            ep,
+            client,
+            op,
+            data,
+            output,
+            task_context::Unwind::EMPTY,
+            deadline,
+        )
     }
 }
 pub(super) unsafe fn submit_wait(
@@ -547,6 +616,7 @@ pub(super) unsafe fn reply(handle: u32, id: u32, status: i32, data: Bytes) -> i3
         (*s).response_len = data.len as u16;
         (*s).response_status = status;
         (*s).state = REQUEST_RESPONDED;
+        crate::program::async_io::service_changed((*ep).handle);
         (*ep).responses = (*ep).responses.wrapping_add(1);
         if queue_op(ptr::addr_of_mut!((*s).response_available), 0, 0) != 0 {
             (*ep).targeted_response_wakes = (*ep).targeted_response_wakes.wrapping_add(1);
@@ -564,15 +634,48 @@ pub(super) unsafe fn take_response(
     out: *mut u8,
     capacity: usize,
 ) -> i32 {
+    unsafe { take_response_inner(handle, id, header, out, capacity, false, None) }
+}
+/// Native Async continuation poll distinguishes a disappeared ID from a pending
+/// reply. The public historical nonblocking take keeps its existing result0.
+pub(crate) unsafe fn take_async_response(
+    handle: u32,
+    id: u32,
+    header: *mut c::ServiceMessageHeader,
+    out: *mut u8,
+    capacity: usize,
+    deadline: Option<u64>,
+) -> i32 {
+    unsafe { take_response_inner(handle, id, header, out, capacity, true, deadline) }
+}
+unsafe fn take_response_inner(
+    handle: u32,
+    id: u32,
+    header: *mut c::ServiceMessageHeader,
+    out: *mut u8,
+    capacity: usize,
+    require_id: bool,
+    deadline: Option<u64>,
+) -> i32 {
     unsafe {
         clear_header(header);
         let Some(lease) = reg::lock_handle(handle, 4) else {
             return c::service_api_result_bad_handle;
         };
         let ep = lease.endpoint;
-        let Some(i) = find_request(ep, id, Some(REQUEST_RESPONDED)) else {
-            return 0;
+        if deadline.is_some_and(|end| timer::tick_count() >= end) {
+            return c::service_api_result_timeout;
+        }
+        let Some(i) = find_request(ep, id, None) else {
+            return if require_id {
+                c::service_api_result_not_found
+            } else {
+                0
+            };
         };
+        if (*slot(ep, i)).state != REQUEST_RESPONDED {
+            return 0;
+        }
         let s = slot(ep, i);
         let len = usize::from((*s).response_len);
         fill_header(s, header, (*s).response_len, (*s).response_status);

@@ -2,6 +2,7 @@
 //! identities and cancellation/retirement anchors have one native owner. No
 //! request mutex spans a filesystem/service wait or dynamic Task retirement.
 mod dispatch;
+mod service;
 use super::{context, registry_state, registry_types::ProgramInstance, thread_retire, threads};
 use crate::{
     boot::foundation,
@@ -126,6 +127,9 @@ struct Request {
     service_response: usize,
     service_response_capacity: u32,
     service_timeout: u64,
+    service_deadline: u64,
+    service_epoch: u64,
+    service_interested: bool,
     service_request_id: u32,
 }
 impl Request {
@@ -172,6 +176,9 @@ impl Request {
         service_response: 0,
         service_response_capacity: 0,
         service_timeout: 0,
+        service_deadline: 0,
+        service_epoch: 0,
+        service_interested: false,
         service_request_id: 0,
     };
 }
@@ -301,6 +308,7 @@ unsafe fn unqueue(req: *mut Request) {
 unsafe fn clear_request(req: *mut Request) {
     unsafe {
         unqueue(req);
+        service::finished(req);
         req.write(Request::EMPTY);
     }
 }
@@ -513,28 +521,50 @@ unsafe fn wake_workers(service: bool) {
 unsafe fn take_request(worker: *mut Worker) -> *mut Request {
     unsafe {
         let lane = usize::from((*worker).service);
-        if !(*state()).lanes[lane].unreserved() {
-            return ptr::null_mut();
-        }
+        let queued = (*state()).lanes[lane].unreserved();
+        let now = if (*worker).service {
+            timer::tick_count()
+        } else {
+            0
+        };
         let start = (*state()).cursor[lane];
         for offset in 0..CAPACITY {
             let index = (start + offset) % CAPACITY;
             let req = ptr::addr_of_mut!((*state()).requests[index]);
             if !(*req).used
-                || (*req).state != 1
                 || (*req).cancel_requested
                 || ((*req).kind == Kind::Service) != (*worker).service
             {
                 continue;
             }
-            unqueue(req);
+            let epoch = if (*worker).service {
+                service::epoch((*req).service_handle)
+            } else {
+                0
+            };
+            let first = (*req).state == 1 && queued;
+            let resume = (*worker).service
+                && (*req).state == 2
+                && (*req).task_id == 0
+                && ((*req).service_epoch != epoch || service::expired(req, now));
+            if !first && !resume {
+                continue;
+            }
+            if first {
+                unqueue(req);
+                (*state()).processed = (*state()).processed.wrapping_add(1);
+            }
             (*req).task_id = (*worker).task_id;
             (*req).task_generation = (*worker).task_generation;
             (*req).last_worker_id = (*worker).task_id;
             (*req).state = 2;
+            // Snapshot BEFORE the bounded attempt: a concurrent endpoint change
+            // must remain visible after this worker releases the continuation.
+            if (*worker).service {
+                (*req).service_epoch = epoch;
+            }
             (*worker).request.store(req, Ordering::Release);
             (*state()).cursor[lane] = (index + 1) % CAPACITY;
-            (*state()).processed = (*state()).processed.wrapping_add(1);
             return req;
         }
         ptr::null_mut()
@@ -571,19 +601,56 @@ unsafe extern "C" fn worker_main() {
             let req = take_request(worker);
             if req.is_null() {
                 (*state()).lanes[lane].park(slot);
+                let timeout = if (*worker).service {
+                    service::wait_ticks()
+                } else {
+                    u64::MAX
+                };
                 drop(guard);
-                sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker).event), 2, u64::MAX);
+                sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker).event), 2, timeout);
                 continue;
             }
             drop(guard);
-            let result = perform(req);
-            let Some(guard) = lock() else {
+            let outcome = if (*worker).service {
+                service::step(req)
+            } else {
+                service::Step::Done(perform(req))
+            };
+            let Some(mut guard) = lock() else {
                 threads::exit_task()
             };
             if (*worker).retiring {
                 drop(guard);
                 threads::exit_task();
             }
+            if matches!(outcome, service::Step::Pending) && !(*req).cancel_requested {
+                (*worker).request.store(ptr::null_mut(), Ordering::Release);
+                (*req).task_id = 0;
+                (*req).task_generation = 0;
+                wake_workers(true);
+                drop(guard);
+                scheduler::safe_reschedule();
+                continue;
+            }
+            if (*worker).service && (*req).cancel_requested {
+                // Cancellation cannot publish a terminal completion while an
+                // endpoint still owns the exact submitted request. Never drop
+                // that identity before the actual endpoint cancellation ack.
+                drop(guard);
+                service::abort(req);
+                guard = match lock() {
+                    Some(g) => g,
+                    None => threads::exit_task(),
+                };
+                if (*worker).retiring {
+                    drop(guard);
+                    threads::exit_task();
+                }
+            }
+            let result = match outcome {
+                service::Step::Done(result) => result,
+                service::Step::Pending => CANCELLED,
+            };
             if (*req).cancel_requested {
                 (*req).result = CANCELLED;
                 (*req).status = CANCELLED;
@@ -595,6 +662,7 @@ unsafe extern "C" fn worker_main() {
                 (*req).processed_bytes = if result > 0 { result as u64 } else { 0 };
                 (*req).state = 3;
             }
+            service::finished(req);
             // Detach before completing: a woken caller can immediately close/recycle.
             (*worker).request.store(ptr::null_mut(), Ordering::Release);
             (*req).task_id = 0;
@@ -826,6 +894,12 @@ unsafe fn submit_service(
         let Some(guard) = lock() else {
             return BUSY;
         };
+        // Serialize publication against owner cancellation. A caller that
+        // waited for this mutex cannot publish after the reaper's completed
+        // cancellation pass merely because its earlier done snapshot was live.
+        if AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).done)).load(Ordering::Acquire) {
+            return NO_INSTANCE;
+        }
         let req = slot();
         if req.is_null() {
             return NO_SLOTS;
@@ -847,6 +921,9 @@ unsafe fn submit_service(
         (*req).service_response = response.addr();
         (*req).service_response_capacity = capacity;
         (*req).service_timeout = timeout;
+        (*req).service_deadline =
+            crate::platform::clock_math::finite_deadline((*req).submitted_tick, timeout);
+        service::interested(req);
         if !ensure_workers(true) {
             clear_request(req);
             return SPAWN_FAILED;
@@ -1325,6 +1402,7 @@ unsafe fn cancel_queued(req: *mut Request) {
         (*req).status = CANCELLED;
         (*req).result = CANCELLED;
         (*req).state = 4;
+        service::finished(req);
         (*req).completed_tick = timer::tick_count();
         sync_objects::r4os_rust_sync_completion(ptr::addr_of_mut!((*req).completion), 1, 0);
     }
@@ -1369,11 +1447,10 @@ pub(super) unsafe fn cancel(handle: Handle, caller: Option<(u32, u64)>) -> bool 
                     continue;
                 }
                 cancel_queued(req);
-                if (*req).task_id == 0 {
+                if (*req).task_id == 0 && !((*req).kind == Kind::Service && (*req).state == 2) {
                     continue;
                 }
                 pending = Some(claim(i, req));
-                (*req).service_request_id = 0;
                 break;
             }
             drop(guard);
@@ -1398,11 +1475,13 @@ pub(super) unsafe fn cancel(handle: Handle, caller: Option<(u32, u64)>) -> bool 
             if !req.is_null() {
                 (*req).task_id = 0;
                 (*req).task_generation = 0;
+                (*req).service_request_id = 0;
                 if matches!((*req).state, 1 | 2) {
                     (*req).status = CANCELLED;
                     (*req).result = CANCELLED;
                     (*req).processed_bytes = 0;
                     (*req).state = 4;
+                    service::finished(req);
                     (*req).completed_tick = timer::tick_count();
                     sync_objects::r4os_rust_sync_completion(
                         ptr::addr_of_mut!((*req).completion),
@@ -1428,7 +1507,11 @@ pub(super) unsafe fn purge(handle: Handle, caller: Option<(u32, u64)>) -> bool {
                 if !owned(req, handle, caller) {
                     continue;
                 }
-                if !(*req).cancel_requested || (*req).task_id != 0 || (*req).task_generation != 0 {
+                if !(*req).cancel_requested
+                    || (*req).task_id != 0
+                    || (*req).task_generation != 0
+                    || ((*req).kind == Kind::Service && matches!((*req).state, 1 | 2))
+                {
                     return false;
                 }
                 queue(req, 3);
@@ -1446,6 +1529,12 @@ pub(super) unsafe fn purge(handle: Handle, caller: Option<(u32, u64)>) -> bool {
                 let req = ptr::addr_of_mut!((*state()).requests[i]);
                 if !owned(req, handle, None) {
                     continue;
+                }
+                // A detached Service continuation owns client pointers even
+                // without a worker Task. Only cancel's real endpoint/drain
+                // acknowledgment can make it purgeable.
+                if (*req).kind == Kind::Service && matches!((*req).state, 1 | 2) {
+                    return false;
                 }
                 (*req).cancel_requested = true;
                 unqueue(req);
@@ -1678,7 +1767,7 @@ unsafe fn perform(req: *mut Request) -> i32 {
             Kind::None => INVALID,
             Kind::Info => file_info(path),
             Kind::Lock => file_lock(req),
-            Kind::Service => perform_service(req),
+            Kind::Service => unreachable!("service continuation has a bounded native owner"),
             kind => {
                 // Admission happens outside async/FS locks. Pageable client
                 // buffers remain resident through the actual backend return,
@@ -1767,143 +1856,10 @@ unsafe fn clear_service(req: *mut Request, id: u32) {
         (*req).service_request_id = 0;
     }
 }
-struct ServiceIdentity(*mut Request, u32);
-impl Drop for ServiceIdentity {
-    fn drop(&mut self) {
-        unsafe { clear_service(self.0, self.1) }
-    }
-}
-#[allow(clippy::too_many_arguments)]
-unsafe fn service_core(
-    req: *mut Request,
-    handle: u32,
-    op: u16,
-    request: *const u8,
-    len: u32,
-    header: *mut Header,
-    response: *mut u8,
-    capacity: u32,
-    timeout: u64,
-) -> i32 {
-    unsafe {
-        if header.is_null() {
-            return c::service_api_result_invalid;
-        }
-        header.write(Header {
-            magic: 0,
-            version: 0,
-            ..Header::default()
-        });
-        if len as usize > c::service_api_max_payload {
-            return c::service_api_result_payload_too_large;
-        }
-        if capacity as usize > c::service_api_max_payload
-            || (len != 0 && request.is_null())
-            || response.is_null()
-        {
-            return c::service_api_result_invalid;
-        }
-        let instance = context::current();
-        if instance.is_null() {
-            return c::service_api_result_invalid;
-        }
-        let forever = timeout == u64::MAX;
-        let start = timer::tick_count();
-        let deadline = if forever {
-            0
-        } else {
-            timer::r4os_rust_timer_control(6, start, timeout)
-        };
-        let mut token = task_context::Unwind::EMPTY;
-        let raw = program_async_service_submit(
-            handle,
-            (*instance).id,
-            op,
-            request,
-            len,
-            timeout,
-            &mut token,
-        );
-        if raw <= 0 {
-            return raw;
-        }
-        let id = raw as u32;
-        if !publish_service(req, id) {
-            program_async_service_control(false, handle, id, 0);
-            task_context::leave(token);
-            return CANCELLED;
-        }
-        if !task_context::leave(token) {
-            program_async_service_control(false, handle, id, 0);
-            clear_service(req, id);
-            return BUSY;
-        }
-        let _identity = ServiceIdentity(req, id);
-        loop {
-            let result = program_async_service_take(handle, id, header, response, capacity);
-            if result < 0 {
-                return result;
-            }
-            if result > 0 || (*header).magic == c::service_api_magic {
-                return result;
-            }
-            let now = timer::tick_count();
-            if !forever && now >= deadline {
-                break;
-            }
-            let remaining = if forever { u64::MAX } else { deadline - now };
-            let waited = program_async_service_control(true, handle, id, remaining);
-            if waited == c::service_api_result_timeout {
-                break;
-            }
-            if waited < 0 {
-                program_async_service_control(false, handle, id, 0);
-                return waited;
-            }
-        }
-        program_async_service_control(false, handle, id, 0);
-        c::service_api_result_timeout
-    }
-}
-unsafe fn perform_service(req: *mut Request) -> i32 {
-    unsafe {
-        let empty_request = 0u8;
-        let mut empty_response = 0u8;
-        let request = if (*req).service_request_len == 0 {
-            ptr::addr_of!(empty_request)
-        } else {
-            ptr::with_exposed_provenance((*req).service_request)
-        };
-        let response = if (*req).service_response_capacity == 0 {
-            ptr::addr_of_mut!(empty_response)
-        } else {
-            ptr::with_exposed_provenance_mut((*req).service_response)
-        };
-        let timeout = if (*req).service_timeout == u64::MAX {
-            u64::MAX
-        } else {
-            timer::r4os_rust_timer_control(6, (*req).submitted_tick, (*req).service_timeout)
-                .saturating_sub(timer::tick_count())
-        };
-        if (*req).service_timeout != 0 && timeout == 0 {
-            return c::service_api_result_timeout;
-        }
-        let result = service_core(
-            req,
-            (*req).service_handle,
-            (*req).service_op,
-            request,
-            (*req).service_request_len,
-            ptr::with_exposed_provenance_mut((*req).service_response_header),
-            response,
-            (*req).service_response_capacity,
-            timeout,
-        );
-        if result > 0 {
-            (*req).processed_bytes = result as u64;
-        }
-        result
-    }
+/// Endpoint notifications never acquire the Async mutex. The four resident
+/// AUTO Events plus a generation bridge physical wait and continuation release.
+pub(crate) fn service_changed(handle: u32) {
+    service::changed(handle);
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1990,11 +1946,11 @@ unsafe fn program_async_service_submit(
     op: u16,
     data: *const u8,
     len: u32,
-    timeout: u64,
+    deadline: Option<u64>,
     token: *mut task_context::Unwind,
 ) -> i32 {
     unsafe {
-        crate::service::ffi::r4os_rust_services_request(
+        crate::service::endpoint::submit_async(
             handle,
             client,
             op,
@@ -2002,8 +1958,7 @@ unsafe fn program_async_service_submit(
                 data: if len == 0 { b"".as_ptr() } else { data },
                 len: len as usize,
             },
-            timeout,
-            true,
+            deadline,
             token,
         )
     }
@@ -2015,9 +1970,17 @@ unsafe fn program_async_service_take(
     header: *mut Header,
     data: *mut u8,
     len: u32,
+    deadline: Option<u64>,
 ) -> i32 {
     unsafe {
-        crate::service::ffi::r4os_rust_services_recv(handle, id, false, header, data, len as usize)
+        crate::service::endpoint::take_async_response(
+            handle,
+            id,
+            header,
+            data,
+            len as usize,
+            deadline,
+        )
     }
 }
 
