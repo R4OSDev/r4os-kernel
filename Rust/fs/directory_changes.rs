@@ -139,10 +139,13 @@ pub unsafe extern "C" fn r4os_rust_fs_directory_changes(
             };
             let mut scalar = 0;
             let mut snapshot = MaybeUninit::<Mount>::uninit();
+            // Mount validation and the history snapshot are one RAM-only
+            // metadata transaction. Unmount/remount cannot slip between them.
+            let _guard = Guard::acquire(1);
             let status = unsafe {
                 r4os_rust_storage_access_runtime(
                     8,
-                    false,
+                    true,
                     &input,
                     &mut scalar,
                     snapshot.as_mut_ptr().cast(),
@@ -151,7 +154,6 @@ pub unsafe extern "C" fn r4os_rust_fs_directory_changes(
             if status != 0 {
                 return -3;
             }
-            let _guard = Guard::acquire(1);
             i32::from(unsafe { (&*HISTORY.0.get()).poll(&mut *cursor) })
         }
         _ => unreachable!(),

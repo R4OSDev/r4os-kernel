@@ -43,6 +43,21 @@ pub(super) fn metadata(entry: &fs::Entry, letter: u8, truncate: bool) -> c::File
 /// snapshot/request; no mutable drive-table borrow spans backend I/O.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_sys_drive_info(index: u32, out: *mut c::DriveInfo) -> i32 {
+    unsafe { drive_info(index, out, true) }
+}
+
+/// # Safety
+/// Same exclusive output and exact mounted request lifetime as drive_info.
+/// Scalar geometry never invokes FREE; its free fields remain unknown.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_drive_info_geometry(
+    index: u32,
+    out: *mut c::DriveInfo,
+) -> i32 {
+    unsafe { drive_info(index, out, false) }
+}
+
+unsafe fn drive_info(index: u32, out: *mut c::DriveInfo, include_free: bool) -> i32 {
     unsafe {
         if index >= 26 {
             return -1;
@@ -71,17 +86,20 @@ pub unsafe extern "C" fn r4os_rust_sys_drive_info(index: u32, out: *mut c::Drive
             (*out).cluster_bytes = u32::try_from(cluster).expect("Cluster bytes");
             (*out).total_clusters = u32::try_from(total).expect("Cluster count");
             (*out).bytes = total * cluster;
-            let free = fs::run(
-                fs::op::FREE,
-                fs::Args {
-                    volume,
-                    ..Default::default()
-                },
-                ptr::null_mut(),
-            );
-            if free.present {
-                (*out).free_clusters = u32::try_from(free.value).expect("Free clusters");
-                (*out).free_bytes = free.value * cluster;
+            if include_free {
+                let free = fs::run(
+                    fs::op::FREE,
+                    fs::Args {
+                        volume,
+                        ..Default::default()
+                    },
+                    ptr::null_mut(),
+                );
+                if free.present {
+                    (*out).free_clusters = u32::try_from(free.value).expect("Free clusters");
+                    (*out).free_bytes = free.value * cluster;
+                    (*out).reserved |= c::drive_info_flag_free_valid;
+                }
             }
             request.ok = true;
         }
