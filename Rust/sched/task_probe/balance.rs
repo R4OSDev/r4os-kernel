@@ -1,5 +1,6 @@
 //! One missing live fairness boundary: already-started tasks wake on an
 //! uneven queue, migrate with FPU/unwind state, and retire exactly once.
+mod cooldown;
 mod occupied;
 mod placement;
 mod single;
@@ -313,5 +314,5 @@ fn many() -> bool {
     valid && clean
 }
 pub(super) fn run() -> bool {
-    many() && single::run() && placement::run() && occupied::run()
+    many() && single::run() && placement::run() && occupied::run() && cooldown::run()
 }

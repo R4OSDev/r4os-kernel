@@ -4,6 +4,7 @@ pub(crate) mod balance;
 pub(crate) mod cpu_drain;
 pub(crate) mod diagnostic;
 mod home;
+mod migration;
 pub(crate) mod task_api;
 pub(crate) mod task_lifecycle;
 pub(crate) mod task_registry;

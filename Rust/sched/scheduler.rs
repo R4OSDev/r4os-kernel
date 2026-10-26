@@ -982,12 +982,13 @@ fn refill_ready() {
 // A refill is bounded resident scheduler work under one Runtime owner. Read
 // the clock lazily once if a candidate needs it, or use this IRQ's resolved
 // time. The local snapshot is discarded before any physical task switch.
-fn refill_ready_at(mut now: Option<u64>) {
+fn refill_ready_at(now: Option<u64>) {
     let target = percpu::current_index();
     if ready_count() != 0 || !enabled() {
         return;
     }
-    refill_from_sources(target, || *now.get_or_insert_with(tick));
+    // pull_prepared already memoizes its lazy supplier once per attempt.
+    refill_from_sources(target, || now.unwrap_or_else(tick));
 }
 fn balance_checkpoint(now: u64) {
     let index = slot(percpu::current_index());

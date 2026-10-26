@@ -1,3 +1,4 @@
+mod migration_policy;
 pub(crate) mod placement;
 pub mod scheduler;
 pub mod scheduler_types;

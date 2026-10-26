@@ -56,6 +56,7 @@ unsafe fn eligible(
     candidate: *mut Task,
     current: *mut Task,
     source: u32,
+    target: Option<u32>,
     now: impl FnOnce() -> u64,
     cooldown: u64,
 ) -> bool {
@@ -68,8 +69,19 @@ unsafe fn eligible(
             && relocatable(candidate)
             && (*c).ready_linked
             && u32::from((*c).home_cpu) == source
-            && ((*c).last_migration_tick == 0
-                || now().saturating_sub((*c).last_migration_tick) >= cooldown)
+            && ((*c).last_migration_tick == 0 || {
+                let stamp = now();
+                !super::migration::cooling(candidate, stamp, cooldown)
+                    || match target {
+                        Some(target) => {
+                            super::migration::can_move(candidate, source, target, stamp, cooldown)
+                        }
+                        // A singleton shortcut may reject a structurally bound
+                        // task or exhausted budget, but cannot hide a possible
+                        // exception before the bounded target search runs.
+                        None => super::migration::available(candidate, stamp, cooldown),
+                    }
+            })
     }
 }
 /// # Safety
@@ -86,7 +98,7 @@ pub(crate) unsafe fn singleton_blocked(
 ) -> bool {
     unsafe {
         let from = registry::queue(source);
-        (*from).count == 1 && !eligible((*from).head, current, source, now, cooldown)
+        (*from).count == 1 && !eligible((*from).head, current, source, None, now, cooldown)
     }
 }
 
@@ -227,6 +239,7 @@ pub(crate) unsafe fn pull_prepared(
                     candidate,
                     current,
                     source,
+                    Some(target),
                     || *time.get_or_insert_with(&mut now),
                     cooldown,
                 )
@@ -259,8 +272,8 @@ pub(crate) unsafe fn pull_prepared(
             registry::unlink_ready(selected);
             (*c).home_cpu = target as u8;
             (*c).home_cpu_bound = true;
-            (*c).last_migration_tick = stamp.max(1);
-            (*c).last_migration_periodic = false;
+            let exception = super::migration::cooling(selected, stamp, cooldown);
+            super::migration::record(selected, stamp, exception);
             // Saved frames, exact owners, ready_order/time and budgets stay.
             registry::append_ready(selected);
             registry::bump_epoch();

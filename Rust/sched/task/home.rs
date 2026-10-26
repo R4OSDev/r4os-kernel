@@ -33,18 +33,20 @@ pub(super) unsafe fn select(task: *mut Task) {
         if old_current == task {
             return;
         }
-        let mask = super::thread_placement::allowed(task);
+        let mut mask = super::thread_placement::allowed(task);
         let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
         let preferred = (*c).placement_applied.preferred;
         let efficient = (*c).role == Role::Batch;
         let previous = ((*c).home_cpu_bound && old < registry::MAX_CPUS as u32).then_some(old);
         let now = (*c).ready_since_tick;
-        if previous.is_some()
+        let cooling = previous.is_some()
             && mask & (1 << old) != 0
-            && (*c).last_migration_tick != 0
-            && now.saturating_sub((*c).last_migration_tick) < scheduler::PLACEMENT_COOLDOWN
-        {
-            return;
+            && super::migration::cooling(task, now, scheduler::PLACEMENT_COOLDOWN);
+        if cooling {
+            mask = super::migration::targets(task, old, now, scheduler::PLACEMENT_COOLDOWN);
+            if mask == 0 {
+                return;
+            }
         }
         let memory = numa::preference(mask, (*c).memory_anchor);
         let context = placement::Context {
@@ -112,8 +114,7 @@ pub(super) unsafe fn select(task: *mut Task) {
             context,
         ) {
             if previous.is_some() && target != old {
-                (*c).last_migration_tick = now.max(1);
-                (*c).last_migration_periodic = false;
+                super::migration::record(task, now, cooling);
             }
             (*c).home_cpu = target as u8;
             (*c).home_cpu_bound = true;
