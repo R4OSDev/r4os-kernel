@@ -22,6 +22,7 @@ use core::{
     mem::{MaybeUninit, size_of},
     ptr,
 };
+use scheduler::audio_work::{Hint, Identity, MAILBOX};
 pub type Summary = a::DriverWorkSummary;
 pub type CompletionStatus = a::DriverCompletionStatus;
 pub type Performance = a::ProgramDriverWorkPerformanceInfo;
@@ -243,9 +244,8 @@ struct Item {
     handle: u32,
     generation: u32,
     flags: u32,
-    // Retained declared device identity; the original single deadline lane
-    // serializes callbacks without reading this key after request admission.
-    _serial_key: u64,
+    // Declared device identity also accompanies the exact scheduling ticket.
+    serial_key: u64,
     deadline_tick: u64,
     budget_ticks: u64,
     handler: Option<Handler>,
@@ -277,7 +277,7 @@ impl Item {
         handle: 0,
         generation: 0,
         flags: 0,
-        _serial_key: 0,
+        serial_key: 0,
         deadline_tick: 0,
         budget_ticks: 0,
         handler: None,
@@ -307,6 +307,8 @@ struct State {
     worker_task_id: u32,
     deadline_worker_started: bool,
     deadline_worker_task_id: u32,
+    deadline_worker_generation: u64,
+    deadline_hint_dirty: bool,
     items: [Item; CAP],
     deadlines: [u64; CAP],
     book: q::Bookkeeping,
@@ -338,6 +340,8 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
     worker_task_id: 0,
     deadline_worker_started: false,
     deadline_worker_task_id: 0,
+    deadline_worker_generation: 0,
+    deadline_hint_dirty: false,
     items: [const { Item::EMPTY }; CAP],
     deadlines: [0; CAP],
     book: BOOK_EMPTY,
@@ -433,6 +437,12 @@ impl Critical {
             } else {
                 add(s, id, |m| &mut m.critical_timing_unavailable, 1)
             }
+        }
+        if s.deadline_hint_dirty {
+            s.deadline_hint_dirty = false;
+            // Publish while this same owner still serializes every writer.
+            // Scheduler reads atomics at existing Runtime boundaries only.
+            unsafe { MAILBOX.publish(deadline_hint(s)) };
         }
         drop(self.lock);
     }
@@ -647,7 +657,35 @@ fn publish(slot: usize, handle: u32) {
     critical.leave(owner);
     scheduler::safe_reschedule();
 }
-fn create_worker(deadline: bool) -> u32 {
+fn deadline_hint(s: &State) -> Hint {
+    let worker = Identity {
+        id: s.deadline_worker_task_id,
+        generation: s.deadline_worker_generation,
+    };
+    // A running callback retains its own ticket/budget even if an earlier
+    // queued deadline arrives. It cannot execute before that callback ends.
+    let active = (0..CAP).find(|&slot| {
+        query(s, 4, slot) == RUNNING as usize && query(s, 5, slot) == DEADLINE as usize
+    });
+    let Some(slot) = active.or_else(|| q::deadline_candidate(&s.book, &s.deadlines)) else {
+        return Hint {
+            worker,
+            ..Hint::EMPTY
+        };
+    };
+    let item = &s.items[slot];
+    Hint {
+        worker,
+        ticket: item.handle,
+        owner: item.owner,
+        serial_key: item.serial_key,
+        deadline: item.deadline_tick,
+        budget: item.budget_ticks,
+        running: active.is_some(),
+        started: item.started_tick,
+    }
+}
+fn create_worker(deadline: bool) -> Identity {
     let mut failure = CreateFailure::None;
     let name: &[u8] = if deadline { b"r4d-audio" } else { b"r4d-work" };
     let entry = if deadline {
@@ -675,9 +713,14 @@ fn create_worker(deadline: bool) -> u32 {
         )
     };
     if task.is_null() {
-        0
+        Identity::default()
     } else {
-        unsafe { (*registry::core(task)).id }
+        unsafe {
+            Identity {
+                id: (*registry::core(task)).id,
+                generation: (*registry::core(task)).generation,
+            }
+        }
     }
 }
 #[unsafe(no_mangle)]
@@ -696,7 +739,8 @@ pub extern "C" fn r4os_rust_driver_work_init() -> bool {
         (*raw()).summary.queue_capacity = CAP as u32;
     }
     if !unsafe { (*raw()).worker_started } {
-        let id = create_worker(false);
+        let worker = create_worker(false);
+        let id = worker.id;
         if id == 0 {
             unsafe { (*raw()).summary.worker_started = 0 };
             return false;
@@ -708,13 +752,15 @@ pub extern "C" fn r4os_rust_driver_work_init() -> bool {
         }
     }
     if !unsafe { (*raw()).deadline_worker_started } {
-        let id = create_worker(true);
+        let worker = create_worker(true);
+        let id = worker.id;
         if id == 0 {
             unsafe { (*raw()).summary.worker_started = 0 };
             return false;
         }
         unsafe {
             (*raw()).deadline_worker_task_id = id;
+            (*raw()).deadline_worker_generation = worker.generation;
             (*raw()).deadline_worker_started = true;
         }
     }
@@ -780,7 +826,7 @@ unsafe fn submit(r: Submit, out: *mut u32) -> i32 {
         handle,
         generation,
         flags: r.flags | u32::from(r.actual_irq),
-        _serial_key: r.serial_key,
+        serial_key: r.serial_key,
         deadline_tick: r.deadline_tick,
         budget_ticks: r.budget_ticks,
         handler: Some(r.handler),
@@ -790,6 +836,7 @@ unsafe fn submit(r: Submit, out: *mut u32) -> i32 {
         ..Item::EMPTY
     };
     s.deadlines[slot] = r.deadline_tick;
+    s.deadline_hint_dirty |= r.source == DEADLINE;
     ledger(s, r.owner, 0, r.source);
     unsafe { *out = handle };
     s.last_submitted_owner = r.owner;
@@ -918,6 +965,7 @@ pub extern "C" fn r4os_rust_driver_work_cancel(handle: u32) -> i32 {
         return -2;
     }
     s.items[slot].result = CANCELLED_RESULT;
+    s.deadline_hint_dirty |= source == DEADLINE;
     s.items[slot].completed_tick = timer::tick_count();
     s.items[slot].completed_at = capture();
     s.items[slot].completion_published = false;
@@ -1173,6 +1221,7 @@ fn take(deadline: bool) -> Option<usize> {
         return None;
     }
     let selected = unsafe { selection.assume_init() };
+    s.deadline_hint_dirty |= selected.source == DEADLINE;
     let slot = selected.slot;
     let id = s.items[slot].owner;
     s.items[slot].started_tick = timer::tick_count();
@@ -1243,6 +1292,7 @@ fn finish(slot: usize, result: i32) {
         return;
     }
     s.items[slot].result = result;
+    s.deadline_hint_dirty |= source == DEADLINE;
     s.items[slot].completed_tick = tick;
     s.items[slot].completed_at = now;
     s.items[slot].completion_published = false;

@@ -447,17 +447,14 @@ pub unsafe extern "C" fn r4os_rust_work_queue_select(
     let selection = if !deadline_lane {
         b.normal()
     } else {
-        if b.deadline_head == NONE || len < CAPACITY {
+        if len < CAPACITY {
             return false;
         }
-        let mut best = b.deadline_head as usize;
-        let mut cursor = b.queue_next[best];
-        while cursor != NONE {
-            if unsafe { deadlines.add(cursor as usize).read() < deadlines.add(best).read() } {
-                best = cursor as usize;
-            }
-            cursor = b.queue_next[cursor as usize];
-        }
+        let Some(best) =
+            deadline_candidate(b, unsafe { core::slice::from_raw_parts(deadlines, len) })
+        else {
+            return false;
+        };
         let s = Selection {
             slot: best,
             source: DEADLINE,
@@ -475,6 +472,21 @@ pub unsafe extern "C" fn r4os_rust_work_queue_select(
     }
 }
 
+/// Same stable EDF head for selection and Scheduler's copied pending hint.
+pub(crate) fn deadline_candidate(b: &Bookkeeping, deadlines: &[u64]) -> Option<usize> {
+    if b.deadline_head == NONE || deadlines.len() < CAPACITY {
+        return None;
+    }
+    let mut best = b.deadline_head as usize;
+    let mut cursor = b.queue_next[best];
+    while cursor != NONE {
+        if deadlines[cursor as usize] < deadlines[best] {
+            best = cursor as usize;
+        }
+        cursor = b.queue_next[cursor as usize];
+    }
+    Some(best)
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_work_release_decision(
     state: u8,

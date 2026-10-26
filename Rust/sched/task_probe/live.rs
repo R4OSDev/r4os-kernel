@@ -49,6 +49,7 @@ pub(crate) unsafe fn case(bit: u32) -> Option<bool> {
                     && scheduler::reschedule_probe::run()
                     && super::balance::run()
                     && kernel_check::park::run()
+                    && scheduler::audio_probe::run()
             }
             4 => {
                 roles::inversion()

@@ -1,5 +1,7 @@
 //! One scheduler state owner; runtime admission is mandatory after SMP start.
 //! Early safe-point counters use separate atomics; no State borrow spans a switch.
+pub(crate) mod audio_probe;
+pub(crate) mod audio_work;
 pub(crate) mod rank_probe;
 pub(crate) mod reschedule_probe;
 pub(crate) mod selection;
@@ -66,6 +68,7 @@ impl CpuState {
     };
 }
 struct State {
+    audio: audio_work::Policy,
     cpu: [CpuState; MAX_CPUS],
     balance_at: [u64; MAX_CPUS],
     placement_outgoing: [Task; MAX_CPUS],
@@ -130,6 +133,7 @@ struct State {
 }
 impl State {
     const EMPTY: Self = Self {
+        audio: audio_work::Policy::EMPTY,
         cpu: [CpuState::EMPTY; MAX_CPUS],
         balance_at: [0; MAX_CPUS],
         placement_outgoing: [ptr::null_mut(); MAX_CPUS],
@@ -390,7 +394,83 @@ fn since(now: u64, then: u64) -> u64 {
     }
 }
 fn urgent(running: Task) -> bool {
+    let audio = audio_candidate(tick());
+    if !audio.task.is_null() && view(running).dispatch_rank != 0 {
+        if audio.task == running {
+            if audio.giveback && ready_count() != 0 {
+                return true;
+            }
+            if audio.protected {
+                // Input and rank-zero lock donation still precede audio.
+                return !task_query(5, u64::from(percpu::current_index())).is_null();
+            }
+        } else if audio.eligible && view(audio.task).state == 1 {
+            return true;
+        }
+    }
     query(7, running, u64::from(percpu::current_index())) != 0
+}
+#[derive(Clone, Copy)]
+struct AudioCandidate {
+    task: Task,
+    eligible: bool,
+    protected: bool,
+    giveback: bool,
+}
+impl AudioCandidate {
+    const EMPTY: Self = Self {
+        task: ptr::null_mut(),
+        eligible: false,
+        protected: false,
+        giveback: false,
+    };
+}
+// Caller already retains Runtime. A producer never enters Runtime at its IRQ
+// publication; a busy/changed mailbox simply declines this promotion attempt.
+fn audio_candidate(now: u64) -> AudioCandidate {
+    if percpu::current_index() != 0 {
+        return AudioCandidate::EMPTY;
+    }
+    let mut policy = read(|s| s.audio);
+    match audio_work::MAILBOX.read_after(policy.seen) {
+        audio_work::Update::Busy => return AudioCandidate::EMPTY,
+        audio_work::Update::Changed(sequence, hint) => {
+            policy.adopt(sequence, hint);
+            change(|s| s.audio = policy);
+        }
+        audio_work::Update::Unchanged => {}
+    }
+    let eligible = policy.eligible(now);
+    let protected = policy.protected(now);
+    let giveback = policy.giveback(now);
+    if !eligible && !protected && !giveback {
+        return AudioCandidate::EMPTY;
+    }
+    let task =
+        unsafe { super::task::audio_worker(policy.hint.worker.id, policy.hint.worker.generation) };
+    if task.is_null() || !audio_work::MAILBOX.still_current(policy.seen) {
+        return AudioCandidate::EMPTY;
+    }
+    AudioCandidate {
+        task,
+        eligible,
+        protected,
+        giveback,
+    }
+}
+fn audio_preemption(running: Task, now: u64) -> bool {
+    let audio = audio_candidate(now);
+    let due = !audio.task.is_null()
+        && view(running).dispatch_rank != 0
+        && if audio.task == running {
+            audio.giveback && ready_count() != 0
+        } else {
+            audio.eligible && view(audio.task).state == 1
+        };
+    if due {
+        set_pending(true);
+    }
+    due
 }
 fn ready_count() -> u64 {
     query(3, ptr::null_mut(), u64::from(percpu::current_index()))
@@ -624,21 +704,55 @@ fn next_ready(force_priority: bool) -> Task {
     // Attempt statistics retain their old meaning, but never drive policy.
     change(|s| s.priority_selects = s.priority_selects.wrapping_add(1));
     let cpu = u64::from(percpu::current_index());
+    let now = tick();
+    let audio = audio_candidate(now);
+    let audio_ready = !audio.task.is_null() && audio.eligible && view(audio.task).state == 1;
+    // Current is not yet requeued. Its expired reservation therefore owes
+    // the already Ready FIFO head a real opportunity, even after rank picks.
+    let giveback = !audio.task.is_null()
+        && audio.task == local().current
+        && audio.giveback
+        && view(audio.task).dispatch_rank != 0
+        && task_query(5, cpu).is_null();
     // Copy the local policy; no mutable Scheduler borrow spans Task queries.
     // Runtime retains the exact destination and Ready heads throughout.
-    let pick = local().fairness.choose(force_priority, |order| {
-        change(|s| s.ready_candidate_visit_count = s.ready_candidate_visit_count.wrapping_add(1));
-        let task = match order {
-            Order::Fifo => task_query(4, cpu),
-            Order::Rank(rank) => task_query(5, cpu | (u64::from(rank) << 32)),
-        };
-        (!task.is_null()).then_some(task)
-    });
+    let pick = if giveback {
+        let head = task_query(4, cpu);
+        selection::Pick {
+            task: (!head.is_null()).then_some(head),
+            fairness: Fairness::EMPTY,
+            fifo: true,
+        }
+    } else {
+        local()
+            .fairness
+            .choose(force_priority || audio_ready, |order| {
+                change(|s| {
+                    s.ready_candidate_visit_count = s.ready_candidate_visit_count.wrapping_add(1)
+                });
+                let task = match order {
+                    Order::Fifo => task_query(4, cpu),
+                    Order::Rank(1) if audio_ready => audio.task,
+                    Order::Rank(rank) => task_query(5, cpu | (u64::from(rank) << 32)),
+                };
+                (!task.is_null()).then_some(task)
+            })
+    };
     let Some(next) = pick.task else {
         return ptr::null_mut();
     };
-    if !force_priority {
+    if giveback || !force_priority && !audio_ready {
         local_change(|s| s.fairness = pick.fairness);
+    }
+    if percpu::current_index() == 0 {
+        change(|s| {
+            s.audio.selected(
+                next == audio.task,
+                now,
+                (2 * pit::DEFAULT_HZ as u64 / 1000).max(1),
+                (10 * pit::DEFAULT_HZ as u64 / 1000).max(1),
+            )
+        });
     }
     if pick.fifo {
         change(|s| s.priority_rr_picks = s.priority_rr_picks.wrapping_add(1));
@@ -1216,6 +1330,9 @@ fn defer_critical(task: Task, ticks: u64, preemptible: bool) -> bool {
     false
 }
 pub fn preempt_pending(preemptible: bool) -> bool {
+    if enabled() && !local().current.is_null() {
+        audio_preemption(local().current, tick());
+    }
     if !local().pending || !enabled() {
         return false;
     }
@@ -1274,7 +1391,8 @@ pub(crate) fn safe_reschedule() -> bool {
         runtime::restore_runtime(flags);
         return false;
     }
-    let priority = placement || local().pending && urgent(running);
+    let priority =
+        audio_preemption(running, tick()) || placement || local().pending && urgent(running);
     if !priority {
         set_pending(false);
     }
@@ -1425,7 +1543,7 @@ fn timer_preemption(now: u64, preemptible: bool) -> bool {
         });
         return false;
     }
-    let priority = local().pending && urgent(running);
+    let priority = audio_preemption(running, now) || local().pending && urgent(running);
     if local().pending && !priority {
         set_pending(false);
     }

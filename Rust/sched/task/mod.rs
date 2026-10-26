@@ -120,6 +120,28 @@ pub(crate) unsafe fn scheduler_view(task: *mut c_void) -> TaskView {
         }
     }
 }
+/// Exact BSP completion identity under the caller's uninterrupted Runtime.
+/// Returned descriptor is borrowed only until that admission ends.
+pub(crate) unsafe fn audio_worker(id: u32, generation: u64) -> *mut c_void {
+    unsafe {
+        let task = task_registry::find_identity(id, generation);
+        if task.is_null() {
+            return ptr::null_mut();
+        }
+        let c = task_registry::core(task);
+        if (*c).smp_eligible
+            || (*c).role != task_types::Role::ShortCompletion
+            || !match (*c).state {
+                task_types::State::Ready => (*c).ready_linked && (*c).home_cpu == 0,
+                task_types::State::Running => (*c).running_cpu == 0,
+                _ => false,
+            }
+        {
+            return ptr::null_mut();
+        }
+        task.cast()
+    }
+}
 pub(crate) unsafe fn scheduler_query(operation: u8, target: *mut c_void, value: u64) -> u64 {
     unsafe {
         let control = task_api::r4os_rust_task_control;
