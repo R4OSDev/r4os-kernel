@@ -220,6 +220,17 @@ impl Default for PerformanceSummary {
 pub type WritePcmCtxFn = unsafe extern "C" fn(*mut c_void, *const u8, u32, u32, u16, u16) -> i32;
 pub type StopPcmCtxFn = unsafe extern "C" fn(*mut c_void) -> i32;
 pub type StatusCtxFn = unsafe extern "C" fn(*mut c_void, *mut BackendStatus) -> i32;
+pub type TrackedWriteCtxFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const u8,
+    u32,
+    u32,
+    u16,
+    u16,
+    *mut a::AudioBackendWriteReceipt,
+) -> i32;
+pub type PlaybackCtxFn = unsafe extern "C" fn(*mut c_void, *mut a::AudioBackendPlayback) -> i32;
+pub type FlowCtxFn = unsafe extern "C" fn(*mut c_void, *const a::AudioBackendFlow) -> i32;
 pub type SynthMidiSendCtxFn = unsafe extern "C" fn(*mut c_void, u8, u8, u8, u8) -> i32;
 pub type SynthRenderCtxFn = unsafe extern "C" fn(*mut c_void) -> i32;
 pub type SynthRenderPcmCtxFn =
@@ -298,6 +309,10 @@ pub struct Stream {
     pub total_written: u64,
     pub transaction: bool,
     pub read_reserved: bool,
+    pub progress: super::playback::Source<64>,
+    pub low_water_frames: u32,
+    pub high_water_frames: u32,
+    pub progress_eligible: bool,
 }
 impl Stream {
     pub const EMPTY: Self = Self {
@@ -326,6 +341,10 @@ impl Stream {
         total_written: 0,
         transaction: false,
         read_reserved: false,
+        progress: super::playback::Source::EMPTY,
+        low_water_frames: 960,
+        high_water_frames: 1920,
+        progress_eligible: true,
     };
 }
 #[derive(Clone, Copy)]
@@ -352,6 +371,10 @@ pub struct AudioBackend {
     pub config: BackendRegistration,
     pub idle: Option<StopPcmCtxFn>,
     pub outputs: Option<a::AudioOutputExtension>,
+    pub generation: u64,
+    pub tracked_write: Option<TrackedWriteCtxFn>,
+    pub playback: Option<PlaybackCtxFn>,
+    pub flow: Option<FlowCtxFn>,
 }
 impl AudioBackend {
     pub const EMPTY: Self = Self {
@@ -375,6 +398,10 @@ impl AudioBackend {
         },
         idle: None,
         outputs: None,
+        generation: 0,
+        tracked_write: None,
+        playback: None,
+        flow: None,
     };
 }
 pub struct SynthEngine {

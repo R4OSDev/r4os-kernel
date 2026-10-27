@@ -114,6 +114,30 @@ pub(super) unsafe fn output_record(slot: usize, index: u32, out: *mut a::AudioOu
     }
 }
 
+pub(crate) unsafe fn register_external_audio_playback(
+    name: &[u8],
+    tracked: TrackedWriteCtxFn,
+    playback: PlaybackCtxFn,
+    flow: FlowCtxFn,
+) -> bool {
+    unsafe {
+        let Some(_output) = OutputGuard::acquire(true) else {
+            return false;
+        };
+        let Some(slot) = find_backend(name) else {
+            return false;
+        };
+        let p = backend(slot);
+        if (*p).closing {
+            return false;
+        }
+        (*p).tracked_write = Some(tracked);
+        (*p).playback = Some(playback);
+        (*p).flow = Some(flow);
+        true
+    }
+}
+
 pub(crate) unsafe fn audio_output_info(index: u32, out: *mut a::AudioOutputInfo) -> i32 {
     unsafe {
         let Some(_output) = OutputGuard::acquire(true) else {
@@ -419,7 +443,13 @@ pub(super) unsafe fn register_audio_backend_internal(
         if (*p).closing {
             return false;
         }
+        let generation = g!(next_backend_generation);
+        let Some(next) = generation.checked_add(1) else {
+            return false;
+        };
+        g!(next_backend_generation) = next;
         p.write(AudioBackend::EMPTY);
+        (*p).generation = generation;
         (*p).registered = true;
         (*p).config = config;
         (*p).name_len = if name.len() < MAX_NAME {

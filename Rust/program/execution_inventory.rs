@@ -298,13 +298,18 @@ pub unsafe extern "C" fn r4os_rust_program_execution_tasks(
             restart(page);
             return 0;
         }
-        let _guard = Guard::acquire(0);
-        if task_epoch() != (*cursor).task_epoch
-            || (*threads::state()).epoch != (*cursor).thread_epoch
-        {
+        let expected_task = (*cursor).task_epoch;
+        let expected_thread = (*cursor).thread_epoch;
+        let guard = Guard::acquire(0);
+        if task_epoch() != expected_task || (*threads::state()).epoch != expected_thread {
+            drop(guard);
             restart(page);
             return 0;
         }
+        // Only copied native values remain after the final epoch check.
+        // Caller VM buffers may fault on first touch; owner admission must
+        // end before rows, cursor or page are published to those buffers.
+        drop(guard);
         for index in 0..returned {
             out.add(index).write(items.add(index).read());
         }
@@ -411,11 +416,14 @@ pub unsafe extern "C" fn r4os_rust_program_execution_threads(
         let mut staged = MaybeUninit::<[ThreadRow; MAX]>::uninit();
         let items = staged.as_mut_ptr().cast::<ThreadRow>();
         let requested = capacity as usize;
+        let expected_thread = (*cursor).thread_epoch;
+        let after_generation = (*cursor).thread_after_generation;
         let mut returned = 0usize;
         let mut eligible = 0u32;
         let mut total = 0u32;
         let guard = Guard::acquire(0);
-        if (*threads::state()).epoch != (*cursor).thread_epoch {
+        if (*threads::state()).epoch != expected_thread {
+            drop(guard);
             restart(page);
             return 0;
         }
@@ -427,7 +435,7 @@ pub unsafe extern "C" fn r4os_rust_program_execution_threads(
                 continue;
             }
             total = total.saturating_add(1);
-            if (*candidate).generation <= (*cursor).thread_after_generation {
+            if (*candidate).generation <= after_generation {
                 continue;
             }
             eligible = eligible.saturating_add(1);
@@ -459,11 +467,15 @@ pub unsafe extern "C" fn r4os_rust_program_execution_threads(
         }
         drop(guard);
         sort(items, returned);
-        let _guard = Guard::acquire(0);
-        if (*threads::state()).epoch != (*cursor).thread_epoch {
+        let guard = Guard::acquire(0);
+        if (*threads::state()).epoch != expected_thread {
+            drop(guard);
             restart(page);
             return 0;
         }
+        // Snapshot/lifetime admission protects only staging and validation.
+        // All public writes follow its release, including restart replies.
+        drop(guard);
         for index in 0..returned {
             out.add(index).write(items.add(index).read());
         }

@@ -2,7 +2,7 @@
 use super::{
     backend_contract::{self, EndMode},
     mixer::{self, Owner},
-    pcm,
+    pcm, playback,
     types::*,
 };
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
     fs::vfs_types::Bytes,
     loader::r4p,
     memory::heap,
-    platform::timer,
+    platform::{clocksource, timer},
     sched::{
         scheduler, sync_locks, sync_objects,
         sync_types::{Event, Mutex, Semaphore, Text, WaitQueue},
@@ -49,6 +49,12 @@ struct State {
     streams: [Stream; MAX_STREAMS],
     mix_scratch: [u8; MIX_QUANTUM_BYTES],
     next_stream_id: u32,
+    next_stream_generation: u64,
+    next_backend_generation: u64,
+    playback_ledger: playback::Ledger<MAX_STREAMS, 64>,
+    playback_position: playback::Position,
+    playback_valid: bool,
+    playback_observed_ns: u64,
     audio_backends: [AudioBackend; MAX_AUDIO_BACKENDS],
     active_audio_slot: Option<usize>,
     initial_output_pending: bool,
@@ -111,6 +117,20 @@ static STATE: Resident<State> = Resident(UnsafeCell::new(State {
     streams: [const { Stream::EMPTY }; MAX_STREAMS],
     mix_scratch: [0; MIX_QUANTUM_BYTES],
     next_stream_id: 1,
+    next_stream_generation: 1,
+    next_backend_generation: 1,
+    playback_ledger: playback::Ledger::EMPTY,
+    playback_position: playback::Position {
+        epoch: playback::Epoch {
+            backend: 0,
+            output: 0,
+            reset: 0,
+        },
+        consumed: 0,
+        dma: 0,
+    },
+    playback_valid: false,
+    playback_observed_ns: 0,
     audio_backends: [const { AudioBackend::EMPTY }; MAX_AUDIO_BACKENDS],
     active_audio_slot: None,
     initial_output_pending: false,
@@ -581,6 +601,7 @@ unsafe fn audio_log(text: *const u8, len: usize) {
 
 // Private operation modules share the sole state and original typed owners.
 mod outputs;
+mod playback_progress;
 mod progress;
 mod streams;
 mod synths;
@@ -591,15 +612,21 @@ use outputs::{
 pub(crate) use outputs::{
     audio_backend_active, audio_backend_family_status, audio_backend_has_output,
     audio_backend_registered, audio_output_info, audio_select_output,
-    register_external_audio_backend_z, register_external_audio_outputs, register_mixer_backend_z,
-    set_audio_backend_closing, unregister_audio_backend_by_name, unregister_audio_backend_z,
+    register_external_audio_backend_z, register_external_audio_outputs,
+    register_external_audio_playback, register_mixer_backend_z, set_audio_backend_closing,
+    unregister_audio_backend_by_name, unregister_audio_backend_z,
 };
+use playback_progress::{
+    refresh_playback_owned, snapshot_stream_progress, write_mixed_tracked_owned,
+};
+pub(crate) use playback_progress::{set_stream_expectation_for_owner, stream_progress_for_owner};
 use progress::schedule_progress;
 pub(crate) use progress::start_progress_worker;
 use streams::stop_pcm_if_no_streams;
 pub(crate) use streams::{
-    close_stream, close_stream_for_owner, close_streams_for_owner, open_stream,
-    open_stream_for_owner, set_volume, set_volume_for_owner, write_stream, write_stream_for_owner,
+    close_stream, close_stream_for_owner, close_stream_progress_for_owner, close_streams_for_owner,
+    open_stream, open_stream_for_owner, set_volume, set_volume_for_owner, write_stream,
+    write_stream_for_owner,
 };
 pub(crate) use synths::{
     apply_configured_sid_model, configure_sid_model, midi_close, midi_open_synth, midi_send,

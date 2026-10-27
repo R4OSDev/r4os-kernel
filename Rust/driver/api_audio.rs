@@ -44,10 +44,20 @@ struct Idle {
     base: Outputs,
     idle: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
 }
+#[repr(C)]
+struct Playback {
+    base: Idle,
+    write_tracked: Option<crate::audio::types::TrackedWriteCtxFn>,
+    playback: Option<crate::audio::types::PlaybackCtxFn>,
+    flow: Option<crate::audio::types::FlowCtxFn>,
+}
 const _: () = {
     assert!(size_of::<a::AudioBackend>() == 72);
     assert!(offset_of!(Outputs, outputs) == 72 && size_of::<Outputs>() == 96);
     assert!(offset_of!(Idle, idle) == 96 && size_of::<Idle>() == 104);
+    assert!(offset_of!(Playback, write_tracked) == 104);
+    assert!(offset_of!(Playback, playback) == 112 && offset_of!(Playback, flow) == 120);
+    assert!(size_of::<Playback>() == 128);
 };
 struct Callback(admission::CallbackToken);
 impl Callback {
@@ -76,7 +86,9 @@ unsafe fn text<'a>(name: *const u8) -> &'a [u8] {
     unsafe { core::slice::from_raw_parts(name, n) }
 }
 fn has_outputs(version: u32) -> bool {
-    version == a::audio_backend_outputs_version || version == a::audio_backend_idle_version
+    version == a::audio_backend_outputs_version
+        || version == a::audio_backend_idle_version
+        || version == a::audio_backend_playback_version
 }
 unsafe fn valid(d: *const a::AudioBackend) -> bool {
     let version = unsafe { (*d).version };
@@ -89,8 +101,17 @@ unsafe fn valid(d: *const a::AudioBackend) -> bool {
         puts(b"[R4D][ERROR] audio backend descriptor too small\r\n");
         return false;
     }
-    if has_outputs(version) && size < 96 || version == a::audio_backend_idle_version && size < 104 {
+    if has_outputs(version) && size < 96
+        || version == a::audio_backend_idle_version && size < 104
+        || version == a::audio_backend_playback_version && size < 128
+    {
         return false;
+    }
+    if version == a::audio_backend_playback_version {
+        let p = unsafe { &*d.cast::<Playback>() };
+        if p.write_tracked.is_none() || p.playback.is_none() || p.flow.is_none() {
+            return false;
+        }
     }
     let value = unsafe { ptr::read(d) };
     if value.write_pcm.is_none() {
@@ -170,11 +191,28 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_register(
                     select: output_select,
                     active: output_active,
                 },
-                if version == a::audio_backend_idle_version {
+                if version == a::audio_backend_idle_version
+                    || version == a::audio_backend_playback_version
+                {
                     Some(idle)
                 } else {
                     None
                 },
+            )
+        }
+    {
+        if unsafe { audio::unregister_audio_backend_z(name) } == 0 {
+            unsafe { ptr::write(context.cast(), Record::EMPTY) };
+        }
+        return -3;
+    }
+    if version == a::audio_backend_playback_version
+        && !unsafe {
+            audio::register_external_audio_playback(
+                &record.name[..record.name_len],
+                tracked_write,
+                playback,
+                flow,
             )
         }
     {
@@ -298,7 +336,10 @@ unsafe extern "C" fn idle(raw: *mut c_void) -> i32 {
         return -1;
     };
     let d = unsafe { ptr::read(r.descriptor) };
-    if d.version != a::audio_backend_idle_version || d.size < 104 {
+    if (d.version != a::audio_backend_idle_version
+        && d.version != a::audio_backend_playback_version)
+        || d.size < 104
+    {
         return -1;
     }
     let Some(idle) = (unsafe { (*r.descriptor.cast::<Idle>()).idle }) else {
@@ -330,6 +371,57 @@ unsafe extern "C" fn status(raw: *mut c_void, out: *mut a::AudioBackendStatus) -
         return -1;
     };
     unsafe { status(d.context, out) }
+}
+
+unsafe fn playback_record(raw: *mut c_void) -> Option<(Record, a::AudioBackend)> {
+    let r = unsafe { record(raw) }?;
+    let d = unsafe { ptr::read(r.descriptor) };
+    (d.version == a::audio_backend_playback_version && d.size >= size_of::<Playback>() as u32)
+        .then_some((r, d))
+}
+unsafe extern "C" fn tracked_write(
+    raw: *mut c_void,
+    data: *const u8,
+    len: u32,
+    rate: u32,
+    channels: u16,
+    format: u16,
+    out: *mut a::AudioBackendWriteReceipt,
+) -> i32 {
+    let Some((r, d)) = (unsafe { playback_record(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let Some(callback) = (unsafe { (*r.descriptor.cast::<Playback>()).write_tracked }) else {
+        return -1;
+    };
+    unsafe { callback(d.context, data, len, rate, channels, format, out) }
+}
+unsafe extern "C" fn playback(raw: *mut c_void, out: *mut a::AudioBackendPlayback) -> i32 {
+    let Some((r, d)) = (unsafe { playback_record(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let Some(callback) = (unsafe { (*r.descriptor.cast::<Playback>()).playback }) else {
+        return -1;
+    };
+    unsafe { callback(d.context, out) }
+}
+unsafe extern "C" fn flow(raw: *mut c_void, input: *const a::AudioBackendFlow) -> i32 {
+    let Some((r, d)) = (unsafe { playback_record(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let Some(callback) = (unsafe { (*r.descriptor.cast::<Playback>()).flow }) else {
+        return -1;
+    };
+    unsafe { callback(d.context, input) }
 }
 unsafe fn output_record(raw: u64) -> Option<(Record, a::AudioBackend, a::AudioOutputExtension)> {
     let r = unsafe { record(raw as *mut c_void) }?;

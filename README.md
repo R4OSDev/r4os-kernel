@@ -5,6 +5,24 @@ routines. It boots through Limine in long mode. External R4M0 applications,
 libraries, drivers and protocols, and the separate Recovery kernel retain
 their existing languages and public interfaces.
 
+Kernel412 adds generation-bound audio playback attribution under the existing
+stream/output owners. `Rust/audio/playback.rs` stores bounded scalar source
+intervals; `Rust/audio/core/playback_progress.rs` maps backend/DMA/consumed and
+unconfirmed progress, source age/deadlines and final Close snapshots. R4AUDIO3
+extends its unchanged200-byte prefix to224 bytes. No extra worker thread or
+global scheduler admission is added. Contract, ownership and hardware evidence
+are documented in the workspace `Docs/Audio/PlaybackProgress.txt`.
+
+Task/thread inventory pages stage native values and preserve their final
+epoch checks under the original owner, then release that owner before writing
+caller rows, cursor or page replies. Demand-committed caller memory can fault
+on first write and requires ordinary pager admission. Native410 reproduced a
+hang with a fresh resident-zero caller buffer. Current412 passes the original
+KVM4 kernel/subsystem gates and real task/thread demand-fault cases; native16
+also passes those fresh buffers and both old failing concurrent TASKS+SLEEP
+and TASKS+DESKTOP pairs with complete replies and subsequent SSH liveness.
+The bounded regression is part of Spectra79 CHECK VM /INVENTORY and default VM.
+
 In the R4OS workspace, build with:
 
     ./Repositories/Kernel/Build.sh

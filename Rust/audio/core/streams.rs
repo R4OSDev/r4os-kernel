@@ -27,6 +27,11 @@ pub(crate) unsafe fn open_stream_for_owner(
         let Some(slot) = free_stream_slot() else {
             return a::service_api_result_full;
         };
+        let generation = g!(next_stream_generation);
+        let Some(next_generation) = generation.checked_add(1) else {
+            return a::service_api_result_full;
+        };
+        g!(next_stream_generation) = next_generation;
         let p = stream(slot);
         let ring = if (*p).ring.len == RING_BYTES {
             (*p).ring
@@ -53,6 +58,7 @@ pub(crate) unsafe fn open_stream_for_owner(
             channels,
             format,
             ring,
+            progress: playback::Source::new(generation),
             ..Stream::EMPTY
         });
         boot(b"[AUDIO] stream open id=");
@@ -107,9 +113,20 @@ pub(crate) unsafe fn write_stream_for_owner(
         if requested_frames == 0 {
             return INVALID;
         }
-        let fitting_frames = (((*p).ring.len - (*p).available) / pcm::TARGET_FRAME_BYTES) as u64
-            * (*p).rate as u64
-            / pcm::TARGET_RATE as u64;
+        let accepted_ns = clocksource::now_nanoseconds().unwrap_or(0);
+        if !(*p).progress.can_accept(accepted_ns) {
+            schedule_progress(&MIX_DUE, 0);
+            return BUSY;
+        }
+        let mut canonical_free = ((*p).ring.len - (*p).available) / pcm::TARGET_FRAME_BYTES;
+        if (*p).progress.continuous {
+            canonical_free = canonical_free.min(
+                u64::from((*p).high_water_frames)
+                    .saturating_sub((*p).progress.accepted.saturating_sub((*p).progress.retired))
+                    as usize,
+            );
+        }
+        let fitting_frames = canonical_free as u64 * (*p).rate as u64 / pcm::TARGET_RATE as u64;
         let accepted_frames = requested_frames.min(fitting_frames.try_into().unwrap());
         if accepted_frames == 0 {
             schedule_progress(&MIX_DUE, 0);
@@ -117,7 +134,7 @@ pub(crate) unsafe fn write_stream_for_owner(
         }
         let accepted_bytes = accepted_frames * frame_bytes;
         let input = slice::from_raw_parts(data, accepted_bytes);
-        let capacity = (*p).ring.len - (*p).available;
+        let capacity = canonical_free * pcm::TARGET_FRAME_BYTES;
         let mut resampler = (*p).resampler;
         let rate = (*p).rate;
         let channels = (*p).channels;
@@ -154,6 +171,14 @@ pub(crate) unsafe fn write_stream_for_owner(
         if !resampler.chunk_done {
             return BUSY;
         }
+        if !output.is_empty()
+            && !(*p)
+                .progress
+                .accept((output.len() / pcm::TARGET_FRAME_BYTES) as u64, accepted_ns)
+        {
+            return BUSY;
+        }
+        (*p).progress_eligible = true;
         let was_empty = (*p).available == 0;
         assert_eq!(
             mixer::ring_write(
@@ -186,6 +211,30 @@ pub(crate) unsafe fn close_stream(id: u32) -> i32 {
 }
 
 pub(crate) unsafe fn close_stream_for_owner(owner: Owner, id: u32) -> i32 {
+    unsafe { close_stream_inner(owner, id, 0, ptr::null_mut()) }
+}
+
+pub(crate) unsafe fn close_stream_progress_for_owner(
+    owner: Owner,
+    id: u32,
+    generation: u64,
+    out: *mut a::AudioStreamProgress,
+) -> i32 {
+    if generation == 0 || out.is_null() {
+        return INVALID;
+    }
+    unsafe {
+        out.write(a::AudioStreamProgress::default());
+        close_stream_inner(owner, id, generation, out)
+    }
+}
+
+unsafe fn close_stream_inner(
+    owner: Owner,
+    id: u32,
+    generation: u64,
+    out: *mut a::AudioStreamProgress,
+) -> i32 {
     unsafe {
         if !owner.valid() {
             return INVALID;
@@ -196,6 +245,9 @@ pub(crate) unsafe fn close_stream_for_owner(owner: Owner, id: u32) -> i32 {
         let Some(p) = stream_by_owner(owner, id) else {
             return a::service_api_result_not_found;
         };
+        if generation != 0 && generation != (*p).progress.generation {
+            return a::service_api_result_not_found;
+        }
         if (*p).transaction || (*p).read_reserved {
             return BUSY;
         }
@@ -205,6 +257,7 @@ pub(crate) unsafe fn close_stream_for_owner(owner: Owner, id: u32) -> i32 {
         }
         (*p).transaction = true;
         let _transaction = Transaction { stream: p, token };
+        (*p).progress.expectation(false, 0);
         let finish = finish_stream_pcm_locked(p);
         if finish < 0 {
             return finish;
@@ -213,9 +266,20 @@ pub(crate) unsafe fn close_stream_for_owner(owner: Owner, id: u32) -> i32 {
         if pump < 0 {
             return pump;
         }
-        let stopped = stop_closing_streams_locked(1);
+        let (stopped, fresh) = stop_closing_and_observe_locked(1, !out.is_null());
         if stopped < 0 {
             return stopped;
+        }
+        if !out.is_null() {
+            // A shared output may still carry this closed source. Its last
+            // known prefix is retained; no future callback can update a
+            // freed/reused stream, so the remaining tail is unconfirmed.
+            if (*p).progress.retired < (*p).progress.submitted {
+                let through = (*p).progress.submitted;
+                (*p).progress.retire(generation, through, false);
+            }
+            snapshot_stream_progress(p, out, fresh);
+            (*out).flags |= a::audio_progress_closed;
         }
         if !release_stream(p) {
             return BUSY;
@@ -384,23 +448,31 @@ pub(super) unsafe fn release_stream(p: *mut Stream) -> bool {
 }
 
 pub(super) unsafe fn stop_closing_streams_locked(closing_count: u32) -> i32 {
+    unsafe { stop_closing_and_observe_locked(closing_count, false).0 }
+}
+
+unsafe fn stop_closing_and_observe_locked(closing_count: u32, observe: bool) -> (i32, bool) {
     unsafe {
         if open_stream_count() != closing_count || g!(sid_acquired) || g!(midi_acquired) {
-            return 0;
+            return (0, false);
         }
         unlock();
         let Some(_output) = OutputGuard::acquire(false) else {
             relock();
-            return BUSY;
+            return (BUSY, false);
         };
         relock();
         if open_stream_count() != closing_count || g!(sid_acquired) || g!(midi_acquired) {
-            return 0;
+            return (0, false);
         }
         unlock();
         let result = idle_active_pcm_owned();
+        // Capture the final cursor under the same output permit as Drain.
+        // Dropping and reacquiring it could turn an already successful Close
+        // into BUSY, or let a new output displace the exact final epoch.
+        let fresh = result == 0 && observe && refresh_playback_owned();
         relock();
-        result
+        (result, fresh)
     }
 }
 
@@ -411,6 +483,10 @@ pub(super) unsafe fn finish_stream_pcm_locked(p: *mut Stream) -> i32 {
                 return BUSY;
             }
             let free_bytes = (*p).ring.len - (*p).available;
+            let accepted_ns = clocksource::now_nanoseconds().unwrap_or(0);
+            if !(*p).progress.can_accept(accepted_ns) {
+                return BUSY;
+            }
             let mut scratch = [0; MIX_QUANTUM_BYTES];
             let mut resampler = (*p).resampler;
             unlock();
@@ -420,6 +496,13 @@ pub(super) unsafe fn finish_stream_pcm_locked(p: *mut Stream) -> i32 {
                 ptr::null_mut(),
             );
             relock();
+            if produced != 0
+                && !(*p)
+                    .progress
+                    .accept((produced / pcm::TARGET_FRAME_BYTES) as u64, accepted_ns)
+            {
+                return BUSY;
+            }
             (*p).resampler = resampler;
             if mixer::ring_write(
                 (*p).ring.bytes_mut(),
@@ -490,6 +573,11 @@ pub(super) unsafe fn pump_available_output_owned(force: bool) -> i32 {
 
 unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
     unsafe {
+        refresh_playback_owned();
+        let flow = playback_progress::apply_flow_owned();
+        if flow < 0 {
+            return flow;
+        }
         relock();
         let _lock = StreamLock;
         let max_passes = MAX_STREAMS * (RING_BYTES / MIX_QUANTUM_BYTES + 2);
@@ -540,7 +628,12 @@ unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
             if chunk_bytes == 0 {
                 return 0;
             }
+            if g!(playback_ledger).full() {
+                schedule_progress(&BACKEND_DUE, 2);
+                return BUSY;
+            }
             let mut sources = [mixer::Source::EMPTY; MAX_STREAMS];
+            let mut contribution = playback::Span::<MAX_STREAMS>::EMPTY;
             let mut source_count = 0;
             for (i, value) in selected.iter().enumerate() {
                 if !*value {
@@ -548,6 +641,13 @@ unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
                 }
                 let p = stream(i);
                 (*p).read_reserved = true;
+                contribution.sources[source_count] = playback::Contribution {
+                    key: playback::SourceKey {
+                        slot: i,
+                        generation: (*p).progress.generation,
+                    },
+                    first: (*p).progress.submitted,
+                };
                 sources[source_count] = mixer::Source {
                     ring: (*p).ring.pointer,
                     len: (*p).ring.len,
@@ -564,13 +664,8 @@ unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
                 ptr::null_mut(),
             );
             let start = timer::tick_count();
-            let result = write_active_pcm_owned(
-                slice::from_raw_parts(scratch, chunk_bytes),
-                pcm::TARGET_RATE,
-                pcm::TARGET_CHANNELS,
-                pcm::FORMAT_S16LE,
-            )
-            .unwrap_or(NO_ENDPOINT);
+            let (result, backend_generation, receipt) =
+                write_mixed_tracked_owned(slice::from_raw_parts(scratch, chunk_bytes));
             relock();
             for (i, value) in selected.iter().enumerate() {
                 if *value {
@@ -591,6 +686,37 @@ unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
                 return result;
             }
             g!(total_backend_ok) = g!(total_backend_ok).wrapping_add(1);
+            contribution.count = source_count;
+            contribution.frames = (chunk_bytes / pcm::TARGET_FRAME_BYTES) as u64;
+            contribution.first = receipt.first_frame;
+            contribution.epoch = playback::Epoch {
+                backend: backend_generation,
+                output: receipt.output_generation,
+                reset: receipt.reset_generation,
+            };
+            for c in &contribution.sources[..source_count] {
+                let p = stream(c.key.slot);
+                assert_eq!((*p).progress.submit(contribution.frames), Some(c.first));
+            }
+            let valid_receipt = receipt.version == 1
+                && receipt.size == size_of::<a::AudioBackendWriteReceipt>() as u32
+                && receipt.flags & a::audio_playback_valid != 0
+                && receipt.frames == contribution.frames
+                && receipt.reserved == 0
+                && receipt.flags == a::audio_playback_valid
+                && backend_generation != 0
+                && receipt.output_generation != 0
+                && receipt.reset_generation != 0
+                && receipt.first_frame.checked_add(receipt.frames).is_some();
+            contribution.tracking_valid = valid_receipt;
+            if !valid_receipt {
+                contribution.first = 0;
+                contribution.epoch = playback::Epoch::default();
+            }
+            // An unavailable receipt retains its FIFO position; retiring it
+            // immediately would skip older still-valid mixed PCM.
+            assert!(g!(playback_ledger).push(contribution));
+            schedule_progress(&BACKEND_DUE, 2);
             for (i, value) in selected.iter().enumerate() {
                 if !*value {
                     continue;

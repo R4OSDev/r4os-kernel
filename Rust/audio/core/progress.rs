@@ -113,6 +113,7 @@ pub(super) unsafe fn service_backend_progress() {
             schedule_progress(&BACKEND_DUE, 2);
             return;
         };
+        refresh_playback_owned();
         let Some(slot) = g!(active_audio_slot) else {
             return;
         };

@@ -1049,6 +1049,15 @@ fn configure_audio() {
     let value = c::R4XStartR4Audio {
         audio_open_stream: crate::program::domain_api::r4os_rust_program_domain_audio_open_stream
             as *const () as usize,
+        audio_stream_progress:
+            crate::program::domain_api::r4os_rust_program_domain_audio_stream_progress as *const ()
+                as usize,
+        audio_set_stream_expectation:
+            crate::program::domain_api::r4os_rust_program_domain_audio_set_stream_expectation
+                as *const () as usize,
+        audio_close_stream_progress:
+            crate::program::domain_api::r4os_rust_program_domain_audio_close_stream_progress
+                as *const () as usize,
         audio_write: crate::program::domain_api::r4os_rust_program_domain_audio_write as *const ()
             as usize,
         audio_close: crate::program::domain_api::r4os_rust_program_domain_audio_close as *const ()
@@ -1087,7 +1096,7 @@ fn configure_audio() {
     AUDIO.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Audio>() == 200);
+    assert!(mem::size_of::<c::R4XStartR4Audio>() == 224);
     assert!(mem::offset_of!(c::R4XStartR4Audio, magic) == 0);
     assert!(mem::offset_of!(c::R4XStartR4Audio, abi_version) == 4);
     assert!(mem::offset_of!(c::R4XStartR4Audio, size) == 8);
@@ -1115,6 +1124,9 @@ const _: () = {
     assert!(mem::offset_of!(c::R4XStartR4Audio, reserved1) == 176);
     assert!(mem::offset_of!(c::R4XStartR4Audio, audio_output_info) == 184);
     assert!(mem::offset_of!(c::R4XStartR4Audio, audio_select_output) == 192);
+    assert!(mem::offset_of!(c::R4XStartR4Audio, audio_stream_progress) == 200);
+    assert!(mem::offset_of!(c::R4XStartR4Audio, audio_set_stream_expectation) == 208);
+    assert!(mem::offset_of!(c::R4XStartR4Audio, audio_close_stream_progress) == 216);
 };
 static DEV: Table<c::R4XStartR4Dev> = Table::new();
 fn configure_dev() {

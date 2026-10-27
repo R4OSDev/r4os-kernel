@@ -31,6 +31,76 @@ pub unsafe extern "C" fn r4os_rust_program_domain_audio_output_info(
 ) -> i32 {
     unsafe { program_domain_audio_output_info(index, out) }
 }
+
+/// # Safety
+/// `out` is a writable canonical record for the admitted program invocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_program_domain_audio_stream_progress(
+    id: u32,
+    generation: u64,
+    out: *mut c::AudioStreamProgress,
+) -> i32 {
+    let Some(owner) = (unsafe { context::handle() }) else {
+        return c::service_api_result_invalid;
+    };
+    unsafe {
+        crate::audio::core::stream_progress_for_owner(
+            crate::audio::mixer::Owner {
+                instance_id: owner.instance_id,
+                generation: owner.generation,
+            },
+            id,
+            generation,
+            out,
+        )
+    }
+}
+
+/// # Safety
+/// `input` is a readable canonical record for the admitted program invocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_program_domain_audio_set_stream_expectation(
+    id: u32,
+    input: *const c::AudioStreamExpectation,
+) -> i32 {
+    let Some(owner) = (unsafe { context::handle() }) else {
+        return c::service_api_result_invalid;
+    };
+    unsafe {
+        crate::audio::core::set_stream_expectation_for_owner(
+            crate::audio::mixer::Owner {
+                instance_id: owner.instance_id,
+                generation: owner.generation,
+            },
+            id,
+            input,
+        )
+    }
+}
+
+/// # Safety
+/// `out` is writable until the exact stream's drain and retirement return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_program_domain_audio_close_stream_progress(
+    id: u32,
+    generation: u64,
+    out: *mut c::AudioStreamProgress,
+) -> i32 {
+    let Some(owner) = (unsafe { context::handle() }) else {
+        return c::service_api_result_invalid;
+    };
+    unsafe {
+        crate::audio::core::close_stream_progress_for_owner(
+            crate::audio::mixer::Owner {
+                instance_id: owner.instance_id,
+                generation: owner.generation,
+            },
+            id,
+            generation,
+            out,
+        )
+    }
+}
 /// # Safety
 /// Original resident canonical input/output buffers and exact program execution
 /// lifetime; the existing lower owner retains its admission/ACK contract.
