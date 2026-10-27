@@ -3,6 +3,15 @@
 use super::streams::stream_by_owner;
 use super::*;
 
+// Promises are stream metadata, independent of a foreign backend callback.
+// Publication is under StreamLock. The output owner snapshots the revision
+// with desired_flow and rechecks it under that same lock before reserving PCM.
+static FLOW_REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn flow_revision() -> u64 {
+    FLOW_REVISION.load(Ordering::Acquire)
+}
+
 fn now_ns() -> u64 {
     clocksource::now_nanoseconds().unwrap_or(0)
 }
@@ -149,22 +158,27 @@ unsafe fn desired_flow() -> a::AudioBackendFlow {
     }
 }
 
-pub(super) unsafe fn apply_flow_owned() -> i32 {
+pub(super) unsafe fn apply_flow_owned() -> Result<u64, i32> {
     unsafe {
         let Some(slot) = g!(active_audio_slot) else {
-            return NO_ENDPOINT;
+            return Err(NO_ENDPOINT);
         };
         let p = backend(slot);
         let Some(callback) = (*p).flow else {
-            return 0;
+            return Ok(flow_revision());
         };
-        let value = {
+        let (value, revision) = {
             let Some(_lock) = StreamLock::acquire() else {
-                return BUSY;
+                return Err(BUSY);
             };
-            desired_flow()
+            (desired_flow(), flow_revision())
         };
-        callback((*p).config.context, &value)
+        let result = callback((*p).config.context, &value);
+        if result < 0 {
+            Err(result)
+        } else {
+            Ok(revision)
+        }
     }
 }
 
@@ -191,9 +205,6 @@ pub(crate) unsafe fn set_stream_expectation_for_owner(
         {
             return INVALID;
         }
-        let Some(_output) = OutputGuard::acquire(false) else {
-            return BUSY;
-        };
         {
             let Some(_lock) = StreamLock::acquire() else {
                 return BUSY;
@@ -212,6 +223,7 @@ pub(crate) unsafe fn set_stream_expectation_for_owner(
             (*p).progress
                 .expectation(value.flags != 0, value.source_due_ns);
             (*p).progress_eligible = true;
+            FLOW_REVISION.fetch_add(1, Ordering::Release);
         }
         // The owner has committed the logical promise. The existing audio
         // worker applies device flow before its next PCM write; a busy

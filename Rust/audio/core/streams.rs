@@ -574,14 +574,29 @@ pub(super) unsafe fn pump_available_output_owned(force: bool) -> i32 {
 unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
     unsafe {
         refresh_playback_owned();
-        let flow = playback_progress::apply_flow_owned();
-        if flow < 0 {
-            return flow;
-        }
+        let mut flow_revision = match playback_progress::apply_flow_owned() {
+            Ok(revision) => revision,
+            Err(result) => return result,
+        };
         relock();
         let _lock = StreamLock;
         let max_passes = MAX_STREAMS * (RING_BYTES / MIX_QUANTUM_BYTES + 2);
         for _ in 0..max_passes {
+            if flow_revision != playback_progress::flow_revision() {
+                // A promise may commit while the output owner is inside a
+                // foreign callback. Do not reserve PCM accepted after that
+                // promise until its exact newer flow has actually returned.
+                // The StreamLock prevents a publication between this check
+                // and reservation; an appended tail cannot enter this chunk.
+                unlock();
+                let applied = playback_progress::apply_flow_owned();
+                relock();
+                flow_revision = match applied {
+                    Ok(revision) => revision,
+                    Err(result) => return result,
+                };
+                continue;
+            }
             if goal_drained(goal) {
                 return 0;
             }

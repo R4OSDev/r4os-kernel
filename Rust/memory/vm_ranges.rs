@@ -66,6 +66,11 @@ pub struct Range {
     pub partial_uncommit_accounted: bool,
     pub commit_span_head: OptionalSlot,
     pub page_state_span_head: OptionalSlot,
+    // Subset of pager_io_count held by caller-owned file buffers. Several
+    // independent buffers may occupy one heap range; every pin still blocks
+    // reclaim, writeback, uncommit and range retirement through the total.
+    // This private counter occupies the former tail padding of the range.
+    pub file_buffer_io_count: u32,
 }
 impl Range {
     pub const EMPTY: Self = Self {
@@ -91,6 +96,7 @@ impl Range {
         guard_len: 0,
         block_id: 0,
         pager_io_count: 0,
+        file_buffer_io_count: 0,
         pager_in_count: 0,
         resident_commit_active: false,
         resident_commit_failed: false,
@@ -362,6 +368,7 @@ const _: () = {
     assert!(core::mem::size_of::<Range>() == 216);
     assert!(core::mem::offset_of!(Range, commit_span_head) == 202);
     assert!(core::mem::offset_of!(Range, page_state_span_head) == 206);
+    assert!(core::mem::offset_of!(Range, file_buffer_io_count) == 212);
 };
 
 // Canonical native range-window tag used by the unchanged private VM contract.

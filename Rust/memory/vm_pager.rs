@@ -513,7 +513,9 @@ fn wait_activity(mut observed: u64) -> bool {
 
 /// An executing file request retains its exact pageable buffer before taking
 /// any filesystem gate. The existing pager count excludes eviction and VM
-/// mutation; pre-faulting here prevents a filesystem/pager lock cycle.
+/// mutation; pre-faulting here prevents a filesystem/pager lock cycle. File
+/// buffers borrow caller-owned byte ranges, not the whole heap VMA. Concurrent
+/// buffer leases share the pin while a pager transfer remains exclusive.
 pub(crate) struct BufferLease {
     region_id: u32,
     unwind: task_context::Unwind,
@@ -526,7 +528,9 @@ impl Drop for BufferLease {
                 let index = lookup(self.region_id).expect("live file buffer range");
                 vm_ranges::update(index, |range| {
                     assert!(range.pager_io_count != 0);
+                    assert!(range.file_buffer_io_count != 0);
                     range.pager_io_count -= 1;
+                    range.file_buffer_io_count -= 1;
                 });
             }
             wake_activity();
@@ -589,7 +593,8 @@ pub(crate) fn file_buffer(
         if !covered(range, first, last - first + PAGE) {
             return Err(NOT_COMMITTED);
         }
-        if range.pager_io_count != 0 {
+        assert!(range.file_buffer_io_count <= range.pager_io_count);
+        if range.pager_io_count != range.file_buffer_io_count {
             waited = Some(range.id);
             held.release();
             if !wait_activity(observed) {
@@ -597,7 +602,13 @@ pub(crate) fn file_buffer(
             }
             continue;
         }
-        vm_ranges::update(index, |range| range.pager_io_count += 1);
+        if range.pager_io_count == u32::MAX {
+            return Err(BUSY);
+        }
+        vm_ranges::update(index, |range| {
+            range.pager_io_count += 1;
+            range.file_buffer_io_count += 1;
+        });
         lease.region_id = range.id;
         held.release();
         let mut page = first;

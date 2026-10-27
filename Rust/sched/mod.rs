@@ -22,3 +22,4 @@ pub mod sync_wait;
 pub mod task_probe;
 
 pub(crate) mod fpu_observation;
+pub(crate) mod worker_observation;

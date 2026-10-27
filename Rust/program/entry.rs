@@ -434,7 +434,20 @@ pub unsafe extern "C" fn r4os_rust_program_entry_worker() -> ! {
         (*thread).entry = entry;
         threads::mark(thread, true, 0);
         note_parallel(instance, true);
+        let observation = if (*instance).desktop_host
+            && (*thread).flags & crate::contract::thread_flag_compute_worker != 0
+        {
+            crate::sched::worker_observation::begin(
+                crate::sched::worker_observation::DESKTOP,
+                (*instance).id,
+                (*thread).instance_generation,
+                u64::from((*thread).id),
+            )
+        } else {
+            None
+        };
         let code = invoke(thread, entry, (*thread).arg, (*thread).stack.top);
+        crate::sched::worker_observation::finish(observation, code, true);
         stack::r4os_rust_program_stack_measure(ptr::addr_of_mut!((*thread).stack));
         if (*thread).stack.serial_telemetry {
             stack::r4os_rust_program_stack_log(

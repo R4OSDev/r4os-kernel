@@ -13,7 +13,7 @@ pub(crate) unsafe fn start_progress_worker() -> bool {
             state: 1,
             role: 1,
             needs_fpu: true,
-            smp_eligible: false,
+            smp_eligible: true,
             smp_r4x: false,
             owner_kind: 0,
             owner_context: ptr::null_mut(),
@@ -51,6 +51,10 @@ pub(super) unsafe extern "C" fn progress_worker() {
     loop {
         let now = timer::tick_count();
         if unsafe { run_progress_if_due(now) } {
+            // The output permit, stream mutex and foreign callback have all
+            // returned. Use the existing full-save admission, also on an AP;
+            // do not extend timer preemption into a backend or mixer borrow.
+            scheduler::safe_reschedule();
             continue;
         }
         let due = next_progress_tick();
@@ -123,8 +127,16 @@ pub(super) unsafe fn service_backend_progress() {
         }
         let config = (*p).config;
         if let Some(status) = config.status {
+            let observation = crate::sched::worker_observation::begin(
+                crate::sched::worker_observation::AUDIO,
+                slot as u32 + 1,
+                (*p).generation,
+                timer::tick_count(),
+            );
             let mut value = BackendStatus::default();
-            if status(config.context, &mut value) == BUSY {
+            let result = status(config.context, &mut value);
+            crate::sched::worker_observation::finish(observation, result, true);
+            if result == BUSY {
                 schedule_progress(&BACKEND_DUE, 2);
             }
         }

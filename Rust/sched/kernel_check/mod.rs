@@ -118,7 +118,14 @@ pub(crate) fn run(_admission: &Admission, selected: u32) -> c::ProgramKernelSche
         }
         return report;
     }
-    let end = timer::tick_count().saturating_add(20_000);
+    // WORKERS explicitly includes the real Desktop screenshot write/return.
+    // All established owner cases, including default all/127, retain 20_000.
+    let limit = if selected == c::kernel_scheduler_check_case_workers {
+        45_000
+    } else {
+        20_000
+    };
+    let end = timer::tick_count().saturating_add(limit);
     while !DONE.load(Ordering::Acquire) {
         if crate::program::process::should_close() {
             CANCEL.store(true, Ordering::Release);
@@ -160,7 +167,7 @@ unsafe extern "C" fn controller() {
     }
     let selected = unsafe { (*REPORT.0.get()).selected };
     let mut failed = false;
-    for bit in 0..7 {
+    for bit in 0..8 {
         let mask = 1 << bit;
         if selected & mask == 0 {
             continue;
@@ -175,6 +182,7 @@ unsafe extern "C" fn controller() {
         let result = match bit {
             0 => Some(sync_selftest::cases()),
             1 => Some(unwind::run()),
+            7 => crate::sched::worker_observation::run(),
             _ => unsafe { task_probe::live::case(bit) },
         };
         match result {

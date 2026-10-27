@@ -463,7 +463,7 @@ unsafe fn ensure_workers(service: bool) -> bool {
                     state: 3,
                     role: if service { 1 } else { 3 },
                     needs_fpu: true,
-                    smp_eligible: false,
+                    smp_eligible: true,
                     smp_r4x: false,
                     owner_kind: 0,
                     owner_context: ptr::null_mut(),
@@ -610,6 +610,16 @@ unsafe extern "C" fn worker_main() {
                 sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker).event), 2, timeout);
                 continue;
             }
+            let observation = crate::sched::worker_observation::begin(
+                if (*worker).service {
+                    crate::sched::worker_observation::SERVICE
+                } else {
+                    crate::sched::worker_observation::FILE
+                },
+                (*req).owner_id,
+                (*req).owner_generation,
+                u64::from((*req).id),
+            );
             drop(guard);
             let outcome = if (*worker).service {
                 service::step(req)
@@ -624,6 +634,7 @@ unsafe extern "C" fn worker_main() {
                 threads::exit_task();
             }
             if matches!(outcome, service::Step::Pending) && !(*req).cancel_requested {
+                crate::sched::worker_observation::finish(observation, 0, false);
                 (*worker).request.store(ptr::null_mut(), Ordering::Release);
                 (*req).task_id = 0;
                 (*req).task_generation = 0;
@@ -668,6 +679,9 @@ unsafe extern "C" fn worker_main() {
             (*req).task_id = 0;
             (*req).task_generation = 0;
             (*req).completed_tick = timer::tick_count();
+            // The actual terminal native result, before its existing waiter
+            // publication; this observer owns no request or cancellation duty.
+            crate::sched::worker_observation::finish(observation, result, true);
             sync_objects::r4os_rust_sync_completion(ptr::addr_of_mut!((*req).completion), 1, 0);
             drop(guard);
             scheduler::safe_reschedule();
