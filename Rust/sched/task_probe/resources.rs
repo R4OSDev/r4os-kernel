@@ -16,6 +16,7 @@ static WORK_HANDLES: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 pub(super) fn retained_work() -> bool {
     WORK_HANDLES.iter().any(|v| v.load(Ordering::Acquire) != 0)
         || crate::sched::scheduler::audio_probe::retained_work()
+        || super::continuations::retained()
 }
 unsafe extern "C" {
 
@@ -98,7 +99,7 @@ pub unsafe fn work_fpu() -> bool {
         if passed && fpu::callback(2) != 0 {
             return fail(b"fpu-caller-irq");
         }
-        passed
+        passed && super::continuations::run()
     }
 }
 fn hex(value: u64, digits: usize) {

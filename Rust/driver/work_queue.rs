@@ -2,6 +2,9 @@
 //! These fixed private C records are embedded in the existing Work owner.
 //! No reference survives a callback, wait, dispatch or backing release.
 use core::ptr;
+#[cfg(test)]
+#[path = "work_queue_host_tests.rs"]
+mod host_tests;
 const CAPACITY: usize = 16;
 const NONE: u8 = 255;
 const FREE: u8 = 0;
@@ -229,9 +232,9 @@ impl Bookkeeping {
         }
         *self.class_count(selection.source) -= 1;
     }
-    fn normal(&mut self) -> Option<Selection> {
+    fn normal(&mut self, task_ready: bool) -> Option<Selection> {
         let has_irq = self.irq_head != NONE;
-        let has_task = self.task_head != NONE;
+        let has_task = task_ready && self.task_head != NONE;
         if !has_irq && !has_task {
             return None;
         }
@@ -280,6 +283,18 @@ impl Bookkeeping {
         }
         self.completed_count += 1;
         self.append_final(slot);
+        self.high_water();
+        true
+    }
+    fn resume(&mut self, slot: usize) -> bool {
+        if slot >= CAPACITY || self.states[slot] != RUNNING || self.classes[slot] != TASK {
+            return false;
+        }
+        self.states[slot] = QUEUED;
+        self.running_count -= 1;
+        self.queued_count += 1;
+        self.task_queued_count += 1;
+        self.append_queue(slot, TASK);
         self.high_water();
         true
     }
@@ -360,9 +375,46 @@ pub unsafe extern "C" fn r4os_rust_work_owner_ledger(
             b.waiters_max = b.waiters_max.max(b.waiters);
         }
         6 => b.waiters = b.waiters.saturating_sub(1),
+        7 => {
+            assert_eq!(value, TASK);
+            assert!(b.running != 0);
+            b.running -= 1;
+            b.queued += 1;
+            b.task_queued += 1;
+        }
         _ => panic!("Invalid Work ledger operation"),
     }
     0
+}
+
+/// The Work owner is held. A continuation retains its slot, generation and
+/// completion; only normal task Work may return to the tail. No final ledger
+/// or completion publication is involved.
+pub(crate) fn resume(book: &mut Bookkeeping, slot: usize) -> bool {
+    book.resume(slot)
+}
+
+/// At most the fixed queue capacity is visited. Deferred task continuations
+/// cannot hide other eligible normal/IRQ work or busy-loop an idle worker.
+/// The readiness closure only reads resident metadata under the same owner.
+pub(crate) fn select_ready(
+    book: &mut Bookkeeping,
+    ready: impl Fn(usize) -> bool,
+) -> Option<Selection> {
+    let mut task_ready = false;
+    for _ in 0..book.task_queued_count {
+        let slot = book.task_head as usize;
+        if ready(slot) {
+            task_ready = true;
+            break;
+        }
+        // Rotate only ineligible task heads, without a Running transition or
+        // consuming a fairness opportunity. If every task is deferred, IRQ
+        // work remains eligible even after four consecutive IRQ selections.
+        book.remove_queue(slot);
+        book.append_queue(slot, TASK);
+    }
+    book.normal(task_ready)
 }
 
 /// # Safety
@@ -445,7 +497,7 @@ pub unsafe extern "C" fn r4os_rust_work_queue_select(
 ) -> bool {
     let b = unsafe { &mut *book };
     let selection = if !deadline_lane {
-        b.normal()
+        b.normal(true)
     } else {
         if len < CAPACITY {
             return false;

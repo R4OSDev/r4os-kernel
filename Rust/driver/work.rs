@@ -256,6 +256,9 @@ struct Item {
     completed_tick: u64,
     submitted_at: monotonic::Stamp,
     started_at: monotonic::Stamp,
+    slice_started_at: monotonic::Stamp,
+    has_started: bool,
+    resume_tick: u64,
     completed_at: monotonic::Stamp,
     completion_published: bool,
     release_claimed: bool,
@@ -288,6 +291,9 @@ impl Item {
         completed_tick: 0,
         submitted_at: STAMP_EMPTY,
         started_at: STAMP_EMPTY,
+        slice_started_at: STAMP_EMPTY,
+        has_started: false,
+        resume_tick: 0,
         completed_at: STAMP_EMPTY,
         completion_published: false,
         release_claimed: false,
@@ -878,6 +884,13 @@ pub unsafe extern "C" fn r4os_rust_driver_work_submit(
     out: *mut u32,
 ) -> i32 {
     let irq = from_irq();
+    if flags & !(a::driver_work_flag_from_irq | a::driver_work_flag_continuation) != 0
+        || flags & a::driver_work_flag_continuation != 0
+            && (owned || irq || flags & a::driver_work_flag_from_irq != 0)
+    {
+        unsafe { *out = 0 };
+        return -3;
+    }
     if owned {
         unsafe { *out = 0 };
         if owner == 0 || irq {
@@ -1068,22 +1081,30 @@ pub unsafe extern "C" fn r4os_rust_driver_work_wait(handle: u32, ticks: u64, out
 fn status(s: &State, slot: usize) -> CompletionStatus {
     let item = &s.items[slot];
     let state = query(s, 4, slot) as u8;
-    let queue_end = match state {
-        RUNNING | COMPLETED => item.started_tick,
-        CANCELLED => item.completed_tick,
-        FREE | QUEUED => 0,
-        _ => unreachable!(),
+    let queue_end = if item.has_started {
+        item.started_tick
+    } else {
+        match state {
+            RUNNING | COMPLETED => item.started_tick,
+            CANCELLED => item.completed_tick,
+            FREE | QUEUED => 0,
+            _ => unreachable!(),
+        }
     };
     let queue_ticks = if queue_end == 0 {
         0
     } else {
         elapsed(item.submitted_tick, queue_end)
     };
-    let run_ticks = match state {
-        COMPLETED => elapsed(item.started_tick, item.completed_tick),
-        RUNNING => elapsed(item.started_tick, timer::tick_count()),
-        FREE | QUEUED | CANCELLED => 0,
-        _ => unreachable!(),
+    let run_ticks = if !item.has_started {
+        0
+    } else {
+        match state {
+            COMPLETED | CANCELLED => elapsed(item.started_tick, item.completed_tick),
+            RUNNING | QUEUED => elapsed(item.started_tick, timer::tick_count()),
+            FREE => 0,
+            _ => unreachable!(),
+        }
     };
     CompletionStatus {
         handle: item.handle,
@@ -1203,14 +1224,26 @@ fn take(deadline: bool) -> Option<usize> {
     let c = Critical::enter();
     let s = unsafe { &mut *raw() };
     let mut selection = MaybeUninit::uninit();
-    let ready = unsafe {
-        q::r4os_rust_work_queue_select(
-            &mut s.book,
-            deadline,
-            s.deadlines.as_ptr(),
-            CAP,
-            selection.as_mut_ptr(),
-        )
+    let ready = if deadline {
+        unsafe {
+            q::r4os_rust_work_queue_select(
+                &mut s.book,
+                true,
+                s.deadlines.as_ptr(),
+                CAP,
+                selection.as_mut_ptr(),
+            )
+        }
+    } else {
+        let tick = timer::tick_count();
+        let items = &s.items;
+        if let Some(selected) = q::select_ready(&mut s.book, |slot| items[slot].resume_tick <= tick)
+        {
+            selection.write(selected);
+            true
+        } else {
+            false
+        }
     };
     if !ready {
         if !deadline {
@@ -1224,9 +1257,19 @@ fn take(deadline: bool) -> Option<usize> {
     s.deadline_hint_dirty |= selected.source == DEADLINE;
     let slot = selected.slot;
     let id = s.items[slot].owner;
-    s.items[slot].started_tick = timer::tick_count();
-    s.items[slot].started_at = capture();
     ledger(s, id, 1, selected.source);
+    s.items[slot].slice_started_at = capture();
+    if s.items[slot].has_started {
+        // A resumed turn is not a new Work ticket/start and cannot replenish
+        // its original lifetime. Owner running/queued state still follows
+        // every physical callback turn exactly.
+        sync_legacy(s);
+        c.leave(id);
+        return Some(slot);
+    }
+    s.items[slot].has_started = true;
+    s.items[slot].started_tick = timer::tick_count();
+    s.items[slot].started_at = s.items[slot].slice_started_at;
     s.last_started_owner = id;
     add(s, id, |m| &mut m.started, 1);
     if s.items[slot].flags & 1 != 0 {
@@ -1330,7 +1373,8 @@ fn finish(slot: usize, result: i32) {
         now,
     );
     if config::ENABLE_METRICS
-        && monotonic::elapsed(s.items[slot].started_at, now).is_some_and(|v| v >= LONG_CALLBACK_NS)
+        && monotonic::elapsed(s.items[slot].slice_started_at, now)
+            .is_some_and(|v| v >= LONG_CALLBACK_NS)
     {
         add(s, id, |m| &mut m.long_callbacks, 1)
     }
@@ -1352,6 +1396,58 @@ fn finish(slot: usize, result: i32) {
     c.leave(id);
     publish(slot, handle)
 }
+fn resume_result(slot: usize, result: i32) -> bool {
+    if result != a::driver_work_result_continue && result != a::driver_work_result_wait {
+        return false;
+    }
+    // The running slot cannot be freed by another task. Legacy callbacks keep
+    // their existing terminal result semantics, including these numeric codes.
+    if unsafe { (*raw()).items[slot].flags & a::driver_work_flag_continuation == 0 } {
+        return false;
+    }
+    let now = capture();
+    let c = Critical::enter();
+    let s = unsafe { &mut *raw() };
+    let id = s.items[slot].owner;
+    assert_eq!(query(s, 5, slot), TASK as usize);
+    assert!(q::resume(&mut s.book, slot));
+    ledger(s, id, 7, TASK);
+    s.items[slot].resume_tick = if result == a::driver_work_result_wait {
+        timer::tick_count().saturating_add(1)
+    } else {
+        0
+    };
+    if config::ENABLE_METRICS
+        && monotonic::elapsed(s.items[slot].slice_started_at, now)
+            .is_some_and(|v| v >= LONG_CALLBACK_NS)
+    {
+        add(s, id, |m| &mut m.long_callbacks, 1)
+    }
+    sync_legacy(s);
+    c.leave(id);
+    true
+}
+
+fn normal_wait_ticks() -> u64 {
+    let c = Critical::enter();
+    let s = unsafe { &mut *raw() };
+    if s.book.task_queued_count == 0 && s.book.irq_queued_count == 0 {
+        c.leave(0);
+        return u64::MAX;
+    }
+    let now = timer::tick_count();
+    let mut delay = u64::MAX;
+    // Only an empty eligible selection reaches this fixed resident scan.
+    // A producer's event still wakes the worker before a deferred tick.
+    for (slot, item) in s.items.iter().enumerate() {
+        if query(s, 4, slot) == QUEUED as usize && query(s, 5, slot) == TASK as usize {
+            delay = delay.min(item.resume_tick.saturating_sub(now));
+        }
+    }
+    c.leave(0);
+    delay
+}
+
 fn run(slot: usize, deadline: bool) {
     let handler = unsafe { (*raw()).items[slot].handler };
     let Some(handler) = handler else {
@@ -1375,13 +1471,22 @@ fn run(slot: usize, deadline: bool) {
     } else {
         unsafe { handler(context) }
     };
-    finish(slot, result);
+    let resumed = resume_result(slot, result);
+    if !resumed {
+        finish(slot, result);
+    }
     unsafe {
         if deadline {
             (*raw()).deadline_callback_owner = 0
         } else {
             (*raw()).normal_callback_owner = 0
         }
+    }
+    if resumed {
+        // The callback's stack, driver-local locks and optional admission have
+        // returned. Keep the exact completion pending and use the original
+        // guarded full-save scheduler checkpoint, never arbitrary IRQ RIPs.
+        scheduler::safe_reschedule();
     }
 }
 unsafe extern "C" fn normal_worker() {
@@ -1390,7 +1495,10 @@ unsafe extern "C" fn normal_worker() {
             run(slot, false);
             continue;
         }
-        unsafe { sync_objects::r4os_rust_sync_event(event_pointer(false), 2, u64::MAX) };
+        let delay = normal_wait_ticks();
+        if delay != 0 {
+            unsafe { sync_objects::r4os_rust_sync_event(event_pointer(false), 2, delay) };
+        }
     }
 }
 unsafe extern "C" fn deadline_worker() {

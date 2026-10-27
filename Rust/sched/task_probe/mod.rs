@@ -1,6 +1,7 @@
 //! Canonical native orchestration of the existing explicit TaskRegistry cases.
 //! Native owner operations retain their exact task and resource identities.
 mod balance;
+mod continuations;
 mod deadlines;
 mod fpu;
 mod fpu_contract;
