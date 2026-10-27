@@ -56,7 +56,14 @@ pub unsafe fn dispatch(frame: *const InterruptFrame) {
         }
         _ => {}
     }
-    event(6, u64::from(irq), rip);
+    // The table admission and exact FPU/task metadata belong to runtime.
+    // Foreign device MMIO belongs to the separately retained IRQ registration.
+    // IF stays clear, so this CPU cannot switch or nest a device callback.
+    if crate::driver::irq_router::has_handlers_owned(irq) {
+        runtime::restore_runtime(saved);
+        event(6, u64::from(irq), rip);
+        runtime::save_runtime();
+    }
     if !ioapic::r4os_rust_ioapic_control(0, 0, false) || irq < 16 {
         pic::r4os_rust_pic_control(4, irq);
     }

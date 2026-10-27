@@ -1686,7 +1686,8 @@ fn reschedule<const VECTOR_RECEIVED: bool>(preemptible: bool) {
     }
     runtime::restore_runtime(flags);
 }
-fn irq_enter() -> ExternalIrqFpuGuard {
+/// Caller owns runtime metadata admission and the exact local IRQ stack.
+pub(crate) fn irq_enter_owned() -> ExternalIrqFpuGuard {
     if fpu::active_bytes() == 0 {
         return ExternalIrqFpuGuard::EMPTY;
     }
@@ -1712,7 +1713,8 @@ fn irq_enter() -> ExternalIrqFpuGuard {
         armed: true,
     }
 }
-fn irq_leave(guard: ExternalIrqFpuGuard) {
+/// Caller reacquired runtime on the same physical IRQ/task stack.
+pub(crate) fn irq_leave_owned(guard: ExternalIrqFpuGuard) {
     if !guard.armed {
         return;
     }
@@ -1883,17 +1885,21 @@ pub extern "C" fn r4os_rust_scheduler_tick(now: u64, preemptible: bool, secondar
     on_tick(now, preemptible, secondary)
 }
 /// # Safety
-/// Caller holds local IRQ/owner admission and exclusive aligned C guard output.
+/// Caller holds local IRQ admission and exclusive aligned C guard output.
+/// Scheduler/task/FPU metadata is acquired here, including guard-only Work
+/// diagnostics which have no outer runtime owner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_scheduler_irq_enter(output: *mut ExternalIrqFpuGuard) {
-    unsafe { output.write(irq_enter()) }
+    let _runtime = runtime::RuntimeGuard::acquire();
+    unsafe { output.write(irq_enter_owned()) }
 }
 /// # Safety
 /// Input is the unchanged exact IRQ/task/generation token, consumed once under
 /// the existing IRQ contract. Handlers cannot yield or switch tasks.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_scheduler_irq_leave(input: *const ExternalIrqFpuGuard) {
-    irq_leave(unsafe { input.read() })
+    let _runtime = runtime::RuntimeGuard::acquire();
+    irq_leave_owned(unsafe { input.read() })
 }
 /// # Safety
 /// Caller owns exclusive fixed C output. Runtime serializes the diagnostic

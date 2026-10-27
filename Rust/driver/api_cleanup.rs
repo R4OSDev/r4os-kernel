@@ -295,6 +295,10 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_commit(token: *mut Token) -> b
         return false;
     }
     let mut count = Counts::default();
+    if !irq_router::retire_owner(owner) {
+        unsafe { r4os_rust_driver_cleanup_quarantine(token) };
+        return false;
+    }
     let mut result = MaybeUninit::uninit();
     unsafe {
         storage::r4os_rust_driver_storage_commit(
@@ -352,7 +356,12 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_commit(token: *mut Token) -> b
         return false;
     }
     count.msi = result.removed;
-    count.irq = irq_router::r4os_rust_irq_router_cleanup(owner);
+    let irq = irq_router::cleanup(owner);
+    if !irq.quiesced {
+        unsafe { (*token).active = false };
+        return false;
+    }
+    count.irq = irq.removed;
     let mut result = MaybeUninit::uninit();
     unsafe { work::r4os_rust_driver_work_cleanup(owner, result.as_mut_ptr()) };
     let result = unsafe { result.assume_init() };

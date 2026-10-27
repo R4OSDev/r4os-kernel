@@ -63,7 +63,7 @@ pub(crate) unsafe fn case(bit: u32) -> Option<bool> {
                 if !status.assume_init().avx_enabled {
                     return None;
                 }
-                resources::work_fpu()
+                resources::work_fpu() && super::irq_retirement::run()
             }
             _ => return None,
         })

@@ -64,6 +64,10 @@ fn tsc() -> u64 {
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
+/// CPU-local admission only; caller retains IF=0 while testing the depth.
+pub(crate) fn held() -> bool {
+    enabled() && unsafe { depth().read() } != 0
+}
 pub(crate) fn restore_local(saved: u64) {
     if saved & IF != 0 {
         sti();

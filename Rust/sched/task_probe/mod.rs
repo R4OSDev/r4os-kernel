@@ -8,6 +8,7 @@ mod fpu_contract;
 mod fpu_environment;
 mod fpu_opt;
 mod helpers;
+mod irq_retirement;
 pub(crate) mod live;
 mod owner_snapshots;
 mod resources;

@@ -20,6 +20,7 @@ pub mod driver_policy;
 pub(crate) mod entropy;
 pub(crate) mod entropy_policy;
 pub mod heap;
+mod irq_lifetime;
 pub mod irq_router;
 pub mod memory_owner;
 pub mod mmio_windows;

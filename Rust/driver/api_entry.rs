@@ -57,14 +57,22 @@ pub unsafe extern "C" fn r4os_rust_driver_irq_register(
     context: usize,
     flags: u32,
 ) -> i32 {
+    // Registration can require an MSI-X rollback/drain. It cannot begin from
+    // inside a handler which that rollback might itself have to join.
+    if irq_router::in_dispatch() {
+        return -1;
+    }
     let owner = admission::r4os_rust_driver_api_runtime_owner(false);
+    if owner == 0 {
+        return -1;
+    }
     let result =
         unsafe { irq_router::r4os_rust_irq_router_register(irq, handler, context, flags, owner) };
     if result != 0 {
         return result;
     }
     if flags & 4 != 0 && !msi::r4os_rust_driver_msi_unmask(owner, irq) {
-        unsafe { irq_router::r4os_rust_irq_router_unregister(irq, handler, context) };
+        unsafe { irq_router::withdraw_and_drain(irq, handler, context) };
         return -5;
     }
     0

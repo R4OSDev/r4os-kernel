@@ -1,5 +1,7 @@
-//! Original 32-vector/four-handler route owner. Runtime admission serializes
-//! tables; per-CPU dispatch identity stays local. No Rust reference spans R4D.
+//! Runtime admission serializes the 32-vector/four-handler table and exact
+//! generation/in-flight/retire metadata. A separate vector owner spans R4D,
+//! leaving unrelated scheduler/wait metadata available during device MMIO.
+use super::irq_lifetime::Lifetime;
 use crate::{
     arch::{ioapic, percpu, pic, runtime, smp_policy::MAX_CPUS},
     build_config::config,
@@ -9,15 +11,15 @@ use crate::{
 };
 use core::{
     cell::UnsafeCell,
-    mem::{self, MaybeUninit},
-    ptr,
+    mem, ptr,
+    sync::atomic::{AtomicBool, Ordering},
 };
 pub(crate) const MAX_IRQS: usize = 32;
 const MAX_HANDLERS: usize = 4;
 pub type Handler = unsafe extern "C" fn(u8, usize) -> u32;
 #[derive(Clone, Copy)]
 struct Entry {
-    active: bool,
+    lifetime: Lifetime,
     shared: bool,
     handler: Option<Handler>,
     context: usize,
@@ -25,7 +27,7 @@ struct Entry {
 }
 impl Entry {
     const EMPTY: Self = Self {
-        active: false,
+        lifetime: Lifetime::EMPTY,
         shared: false,
         handler: None,
         context: 0,
@@ -79,6 +81,7 @@ const EMPTY_STATS: contract::IrqStats = contract::IrqStats {
     last_owner: 0,
 };
 struct State {
+    next_generation: u64,
     entries: [[Entry; MAX_HANDLERS]; MAX_IRQS],
     stats: [contract::IrqStats; MAX_IRQS],
     timing: [Timing; MAX_IRQS],
@@ -92,6 +95,7 @@ const fn kernel_owned(irq: u8) -> bool {
 }
 const fn initial() -> State {
     let mut s = State {
+        next_generation: 0,
         entries: [[Entry::EMPTY; MAX_HANDLERS]; MAX_IRQS],
         stats: [EMPTY_STATS; MAX_IRQS],
         timing: [Timing::EMPTY; MAX_IRQS],
@@ -111,6 +115,7 @@ const fn initial() -> State {
 struct Shared(UnsafeCell<State>);
 unsafe impl Sync for Shared {}
 static STATE: Shared = Shared(UnsafeCell::new(initial()));
+static DISPATCH: [AtomicBool; MAX_IRQS] = [const { AtomicBool::new(false) }; MAX_IRQS];
 
 fn raw() -> *mut State {
     STATE.0.get()
@@ -156,7 +161,7 @@ unsafe fn timing(index: usize) -> *mut Timing {
 fn handlers(index: usize) -> u8 {
     let mut count = 0;
     for slot in 0..MAX_HANDLERS {
-        if unsafe { (*entry(index, slot)).active } {
+        if unsafe { (*entry(index, slot)).lifetime.active } {
             count += 1;
         }
     }
@@ -167,7 +172,7 @@ fn refresh(index: usize) {
     let mut shared = 0;
     for slot in 0..MAX_HANDLERS {
         let e = unsafe { entry(index, slot).read() };
-        if e.active {
+        if e.lifetime.active {
             registered += 1;
             if e.shared {
                 shared += 1;
@@ -226,15 +231,22 @@ fn register_inner(irq: u8, handler: Handler, context: usize, flags: u32, owner: 
     let mut all_shared = true;
     for slot in 0..MAX_HANDLERS {
         let e = unsafe { entry(index, slot).read() };
-        if !e.active {
+        if !e.lifetime.occupied() {
             if free.is_none() {
                 free = Some(slot);
             }
             continue;
         }
         if e.handler.is_some_and(|h| h as usize == handler as usize) && e.context == context {
-            return 0;
+            return if e.owner != owner {
+                -2
+            } else if e.lifetime.active {
+                0
+            } else {
+                -6
+            };
         }
+        // Retiring bindings retain their sharing contract until removal, too.
         active += 1;
         all_shared &= e.shared;
     }
@@ -244,9 +256,13 @@ fn register_inner(irq: u8, handler: Handler, context: usize, flags: u32, owner: 
     let Some(slot) = free else {
         return -3;
     };
+    let Some(generation) = (unsafe { (*raw()).next_generation }).checked_add(1) else {
+        return -3;
+    };
+    unsafe { (*raw()).next_generation = generation };
     unsafe {
         entry(index, slot).write(Entry {
-            active: true,
+            lifetime: Lifetime::new(generation),
             shared,
             handler: Some(handler),
             context,
@@ -255,8 +271,8 @@ fn register_inner(irq: u8, handler: Handler, context: usize, flags: u32, owner: 
     };
     refresh(index);
     if !enable(irq, flags) {
-        // The existing runtime owner also serializes dispatch. Withdraw only
-        // this unpublished hardware grant; existing shared handlers remain.
+        // Runtime serializes table publication/admission. Withdraw only this
+        // unpublished hardware grant; existing shared handlers remain.
         unsafe { entry(index, slot).write(Entry::EMPTY) };
         refresh(index);
         return -5;
@@ -286,22 +302,29 @@ pub unsafe extern "C" fn r4os_rust_irq_router_register(
     runtime::restore_runtime(saved);
     result
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_irq_router_cleanup(owner: u32) -> u32 {
+pub(crate) struct Cleanup {
+    pub removed: u32,
+    pub quiesced: bool,
+}
+fn cleanup_inner(owner: u32, remove: bool) -> Cleanup {
     if owner == 0 {
-        return 0;
+        return Cleanup {
+            removed: 0,
+            quiesced: true,
+        };
     }
     let saved = runtime::save_runtime();
     let mut removed = 0;
+    let mut busy = false;
     for index in 0..MAX_IRQS {
         let mut changed = false;
         for slot in 0..MAX_HANDLERS {
             let e = unsafe { entry(index, slot).read() };
-            if !e.active || e.owner != owner {
+            if !e.lifetime.occupied() || e.owner != owner {
                 continue;
             }
-            unsafe { entry(index, slot).write(Entry::EMPTY) };
-            removed += 1;
+            unsafe { (*entry(index, slot)).lifetime.retire() };
+            busy |= e.lifetime.in_flight;
             changed = true;
         }
         if changed {
@@ -311,8 +334,33 @@ pub extern "C" fn r4os_rust_irq_router_cleanup(owner: u32) -> u32 {
             }
         }
     }
+    // All registrations are withdrawn before testing the owner's final drain.
+    // A failed drain retains every callback/context, not only the busy entry.
+    if !busy && remove {
+        for index in 0..MAX_IRQS {
+            for slot in 0..MAX_HANDLERS {
+                let e = unsafe { entry(index, slot).read() };
+                if e.lifetime.occupied() && e.owner == owner {
+                    unsafe { entry(index, slot).write(Entry::EMPTY) };
+                    removed += 1;
+                }
+            }
+        }
+    }
     runtime::restore_runtime(saved);
-    removed
+    Cleanup {
+        removed,
+        quiesced: !busy,
+    }
+}
+/// Withdraw and drain before provider teardown, retaining the identities so
+/// provider Shutdown may still obtain its own successful unregister receipt.
+pub(crate) fn retire_owner(owner: u32) -> bool {
+    cleanup_inner(owner, false).quiesced
+}
+/// Final removal follows provider/MSI cleanup; no new callback was admitted.
+pub(crate) fn cleanup(owner: u32) -> Cleanup {
+    cleanup_inner(owner, true)
 }
 /// # Safety
 /// Exact callback/context identity belongs to the live registering caller.
@@ -330,22 +378,52 @@ pub unsafe extern "C" fn r4os_rust_irq_router_unregister(
     let mut result = -2;
     for slot in 0..MAX_HANDLERS {
         let e = unsafe { entry(index, slot).read() };
-        if !e.active
+        if !e.lifetime.occupied()
             || !e.handler.is_some_and(|h| h as usize == handler as usize)
             || e.context != context
         {
             continue;
         }
-        unsafe { entry(index, slot).write(Entry::EMPTY) };
+        unsafe { (*entry(index, slot)).lifetime.retire() };
         refresh(index);
         if handlers(index) == 0 && !kernel_owned(irq) {
             disable(irq);
         }
-        result = 0;
+        // Never wait under runtime or a caller's device/lifecycle lock.
+        // Nonzero preserves the caller's context; retry completes removal.
+        result = if e.lifetime.in_flight {
+            -3
+        } else {
+            unsafe { entry(index, slot).write(Entry::EMPTY) };
+            0
+        };
         break;
     }
     runtime::restore_runtime(saved);
     result
+}
+/// A failed MSI-X unmask cannot report registration failure while its context
+/// is still executing. This cold rollback waits without runtime admission;
+/// ordinary unregister remains nonblocking for callers retaining device locks.
+/// # Safety
+/// Exact resident registration; caller is outside IRQ and runtime admission.
+pub(crate) unsafe fn withdraw_and_drain(irq: u8, handler: Handler, context: usize) {
+    let flags = runtime::save_local();
+    assert!(
+        !runtime::held() && !in_dispatch(),
+        "IRQ rollback retained an execution owner"
+    );
+    runtime::restore_local(flags);
+    loop {
+        match unsafe { r4os_rust_irq_router_unregister(irq, handler, context) } {
+            0 | -2 => return,
+            -3 => {
+                crate::arch::tlb::service_pending();
+                core::hint::spin_loop();
+            }
+            _ => panic!("IRQ rollback lost its registration identity"),
+        }
+    }
 }
 /// # Safety
 /// Exclusive aligned output of the exact selected fixed C stats record.
@@ -359,15 +437,18 @@ pub unsafe extern "C" fn r4os_rust_irq_router_stats(
         return -1;
     }
     let saved = runtime::save_runtime();
+    let detail_value = unsafe { timing(irq as usize).read() };
+    let stats_value = unsafe { stats(irq as usize).read() };
+    runtime::restore_runtime(saved);
+    // Caller memory is not a router-table owner; a demand fault must not
+    // enter its pager while retaining the global runtime admission.
     unsafe {
         if detail {
-            out.cast::<Timing>().write(timing(irq as usize).read());
+            out.cast::<Timing>().write(detail_value);
         } else {
-            out.cast::<contract::IrqStats>()
-                .write(stats(irq as usize).read());
+            out.cast::<contract::IrqStats>().write(stats_value);
         }
     }
-    runtime::restore_runtime(saved);
     0
 }
 #[unsafe(no_mangle)]
@@ -375,9 +456,9 @@ pub extern "C" fn r4os_rust_irq_router_local(owner: bool) -> u32 {
     let cpu = percpu::current_index() as usize;
     unsafe {
         if owner {
-            (&(*raw()).owner)[cpu]
+            ptr::addr_of!((*raw()).owner).cast::<u32>().add(cpu).read()
         } else {
-            (&(*raw()).depth)[cpu]
+            ptr::addr_of!((*raw()).depth).cast::<u32>().add(cpu).read()
         }
     }
 }
@@ -417,20 +498,52 @@ fn record(index: usize, start: monotonic::Stamp, end: monotonic::Stamp, handler:
     }
 }
 /// # Safety
-/// Called within the existing IRQ runtime admission. Handlers retain their
-/// module lifetime, cannot dispatch tasks, and use the exact native FPU guard.
+/// Called with local IRQ admission and without an outer runtime owner.
+/// Handlers retain their module lifetime through the registration, cannot
+/// dispatch tasks, and use the exact native FPU guard.
 /// No Rust state borrow or resource-owning Drop spans a foreign callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_irq_router_dispatch(irq: u8) {
     unsafe { dispatch_observed(irq, 0) };
 }
 /// # Safety
-/// Real dispatch supplies the actual saved RIP under existing IRQ runtime admission.
+/// Real dispatch supplies the actual saved RIP with IF=0 and no runtime owner.
+/// The separate vector owner never waits for hardware while retaining runtime;
+/// callbacks can acquire short runtime admission to publish their exact wakes.
 pub(crate) unsafe fn dispatch_observed(irq: u8, rip: u64) {
     if irq as usize >= MAX_IRQS {
         return;
     }
+    let local_flags = runtime::save_local();
+    assert!(
+        !runtime::held(),
+        "IRQ dispatch retained an outer runtime owner"
+    );
     let index = irq as usize;
+    let saved = runtime::save_runtime();
+    let generations: [u64; MAX_HANDLERS] = core::array::from_fn(|slot| {
+        let e = unsafe { entry(index, slot).read() };
+        if e.lifetime.active {
+            e.lifetime.generation
+        } else {
+            0
+        }
+    });
+    runtime::restore_runtime(saved);
+    if generations.iter().all(|&generation| generation == 0) {
+        runtime::restore_local(local_flags);
+        return;
+    }
+    while DISPATCH[index]
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        // An independent page-table requester may require this CPU's ACK.
+        // Only this exact IRQ vector is contended; runtime remains available.
+        crate::arch::tlb::service_pending();
+        core::hint::spin_loop();
+    }
+    let saved = runtime::save_runtime();
     let mut invoked = false;
     let mut last_result = 0;
     let measure_dispatch = config::ENABLE_METRICS && unsafe { (*stats(index)).registered != 0 };
@@ -445,21 +558,42 @@ pub(crate) unsafe fn dispatch_observed(irq: u8, rip: u64) {
         };
     }
     let cpu = percpu::current_index() as usize;
-    unsafe { (&mut (*raw()).depth)[cpu] = (&(*raw()).depth)[cpu].saturating_add(1) };
-    for slot in 0..MAX_HANDLERS {
+    unsafe {
+        let p = ptr::addr_of_mut!((*raw()).depth).cast::<u32>().add(cpu);
+        p.write(
+            p.read()
+                .checked_add(1)
+                .expect("IRQ dispatch depth overflow"),
+        );
+    };
+    runtime::restore_runtime(saved);
+    for (slot, generation) in generations.into_iter().enumerate() {
+        if generation == 0 {
+            continue;
+        }
+        let saved = runtime::save_runtime();
         let e = unsafe { entry(index, slot).read() };
-        if !e.active {
+        if !e.lifetime.active || e.lifetime.generation != generation {
+            runtime::restore_runtime(saved);
             continue;
         }
         let Some(handler) = e.handler else {
+            runtime::restore_runtime(saved);
             continue;
         };
         if !plausible(handler) {
+            runtime::restore_runtime(saved);
             report(1, irq, handler, e.owner);
             continue;
         }
+        assert!(unsafe { (*entry(index, slot)).lifetime.admit(generation) });
         invoked = true;
-        unsafe { (&mut (*raw()).owner)[cpu] = e.owner };
+        unsafe {
+            ptr::addr_of_mut!((*raw()).owner)
+                .cast::<u32>()
+                .add(cpu)
+                .write(e.owner)
+        };
         let start = if config::ENABLE_METRICS {
             timer::tick_count()
         } else {
@@ -475,19 +609,31 @@ pub(crate) unsafe fn dispatch_observed(irq: u8, rip: u64) {
                 (*timing(index)).observer_reads = (*timing(index)).observer_reads.saturating_add(1)
             };
         }
-        let mut guard = MaybeUninit::<scheduler::ExternalIrqFpuGuard>::uninit();
-        unsafe { scheduler::r4os_rust_scheduler_irq_enter(guard.as_mut_ptr()) };
+        let guard = scheduler::irq_enter_owned();
         if e.owner != 0 {
             crate::sched::fpu_observation::external(rip, irq, e.owner, handler as usize as u64);
         }
+        runtime::restore_runtime(saved);
+        // Only immutable copies and the exact FPU receipt span this callback.
+        // Slot/context cannot be freed while its generation is in flight.
         last_result = unsafe { handler(irq, e.context) };
-        unsafe { scheduler::r4os_rust_scheduler_irq_leave(guard.as_ptr()) };
+        let timing_end = if config::ENABLE_METRICS {
+            monotonic::capture()
+        } else {
+            monotonic::Stamp::default()
+        };
+        let elapsed = if config::ENABLE_METRICS {
+            timer::tick_count().saturating_sub(start)
+        } else {
+            0
+        };
+        let saved = runtime::save_runtime();
+        scheduler::irq_leave_owned(guard);
+        unsafe { (*entry(index, slot)).lifetime.finish(generation) };
         if config::ENABLE_METRICS {
-            let timing_end = monotonic::capture();
             unsafe {
                 (*timing(index)).observer_reads = (*timing(index)).observer_reads.saturating_add(1)
             };
-            let elapsed = timer::tick_count().saturating_sub(start);
             unsafe {
                 let s = &mut *stats(index);
                 s.handler_total_ticks = s.handler_total_ticks.wrapping_add(elapsed);
@@ -498,12 +644,17 @@ pub(crate) unsafe fn dispatch_observed(irq: u8, rip: u64) {
         }
         unsafe {
             (*stats(index)).last_owner = e.owner;
-            (&mut (*raw()).owner)[cpu] = 0;
+            ptr::addr_of_mut!((*raw()).owner)
+                .cast::<u32>()
+                .add(cpu)
+                .write(0);
             if last_result & 1 != 0 {
                 (*stats(index)).handled_count = (*stats(index)).handled_count.wrapping_add(1);
             }
         }
+        runtime::restore_runtime(saved);
     }
+    let saved = runtime::save_runtime();
     unsafe {
         if invoked {
             (*stats(index)).dispatch_count = (*stats(index)).dispatch_count.wrapping_add(1);
@@ -517,7 +668,22 @@ pub(crate) unsafe fn dispatch_observed(irq: u8, rip: u64) {
         };
         record(index, dispatch_start, dispatch_end, false);
     }
-    unsafe { (&mut (*raw()).depth)[cpu] -= 1 };
+    unsafe {
+        let p = ptr::addr_of_mut!((*raw()).depth).cast::<u32>().add(cpu);
+        p.write(
+            p.read()
+                .checked_sub(1)
+                .expect("IRQ dispatch depth underflow"),
+        );
+    };
+    runtime::restore_runtime(saved);
+    DISPATCH[index].store(false, Ordering::Release);
+    runtime::restore_local(local_flags);
+}
+
+/// Caller already owns runtime table admission (the real architecture IRQ).
+pub(crate) fn has_handlers_owned(irq: u8) -> bool {
+    (irq as usize) < MAX_IRQS && unsafe { (*stats(irq as usize)).registered != 0 }
 }
 const _: () = {
     assert!(mem::size_of::<Timing>() == 88);
