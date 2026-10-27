@@ -398,15 +398,8 @@ fn start_workers() -> bool {
         let (id, _) = unsafe { task::immutable_identity(created) };
         unsafe {
             (*worker(lane)).task_id.store(id, Ordering::Release);
-            task::task_api::r4os_rust_task_mutate(
-                0,
-                created,
-                timer::tick_count(),
-                0,
-                ptr::null(),
-                0,
-            );
         }
+        scheduler::publish_created(created);
     }
     let ap_count = (WORKER_COUNT..MAX_WORKERS)
         .filter(|&i| unsafe { (*worker(i)).task_id.load(Ordering::Acquire) != 0 })

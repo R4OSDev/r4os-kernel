@@ -1,5 +1,6 @@
 //! Explicit work only. A resident BSP controller reuses native boot cases;
 //! AP callers see the immutable report only after the release/acquire handoff.
+mod idle;
 pub(crate) mod park;
 pub(crate) mod tasks;
 mod unwind;
@@ -167,7 +168,7 @@ unsafe extern "C" fn controller() {
     }
     let selected = unsafe { (*REPORT.0.get()).selected };
     let mut failed = false;
-    for bit in 0..8 {
+    for bit in 0..9 {
         let mask = 1 << bit;
         if selected & mask == 0 {
             continue;
@@ -183,6 +184,7 @@ unsafe extern "C" fn controller() {
             0 => Some(sync_selftest::cases()),
             1 => Some(unwind::run()),
             7 => crate::sched::worker_observation::run(),
+            8 => idle::run(),
             _ => unsafe { task_probe::live::case(bit) },
         };
         match result {

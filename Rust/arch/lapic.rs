@@ -433,6 +433,9 @@ fn start_secondary(requested_hz: u32) -> bool {
     let _ = deadline::start(initial as u32, hz);
     true
 }
+pub(crate) fn secondary_timer_sample(cpu: u32) -> Option<(u64, u64, u64, u32, u32)> {
+    deadline::timer_sample(cpu)
+}
 pub(crate) struct PausedTimer {
     cpu: u32,
     divider: u32,
@@ -440,6 +443,62 @@ pub(crate) struct PausedTimer {
     initial: u32,
     epoch: u64,
     deadline: Option<deadline::Paused>,
+}
+impl PausedTimer {
+    pub(crate) fn clock_current(&self) -> bool {
+        self.deadline
+            .as_ref()
+            .is_none_or(deadline::paused_clock_current)
+    }
+    pub(crate) fn matches_current(&self) -> bool {
+        self.cpu == percpu::current_index()
+            && self.epoch != 0
+            && self.epoch == crate::platform::cpu_topology::epoch(self.cpu)
+    }
+}
+
+/// Scheduler idle loan, local IF=0. None means no required local event; a
+/// finite retry is a one-shot, never a new fixed periodic idle tick.
+pub(crate) fn arm_secondary_idle(token: &PausedTimer, ticks: Option<u64>) -> bool {
+    if !token.matches_current() {
+        return false;
+    }
+    if let Some(deadline) = token.deadline.as_ref() {
+        // A failed deadline arm must consume/restore this exact loan first.
+        // Its hardware INITIAL register can be zero; count fallback uses the
+        // calibrated owner's state, never that deadline-mode register value.
+        return deadline::arm_idle(deadline, ticks);
+    }
+    write(DIVIDE, token.divider);
+    let lvt = token.lvt & !(PERIODIC | (1 << 18) | MASKED);
+    write(LVT, lvt | MASKED);
+    write(INITIAL, 0);
+    if let Some(ticks) = ticks {
+        let count = u64::from(token.initial)
+            .saturating_mul(ticks.max(1))
+            .min(u64::from(u32::MAX - 1)) as u32;
+        if count == 0 {
+            return false;
+        }
+        write(INITIAL, count);
+        write(LVT, lvt);
+        read(LVT) == lvt && read(INITIAL) == count
+    } else {
+        read(LVT) & MASKED != 0 && read(INITIAL) == 0
+    }
+}
+
+/// Restore the exact AP's active periodic quantum timer before any productive
+/// stack can run. This consumes the scheduler loan before lifecycle can pause.
+pub(crate) fn finish_secondary_idle(token: PausedTimer) -> bool {
+    if !token.matches_current() {
+        return false;
+    }
+    if let Some(deadline) = token.deadline {
+        deadline::finish_idle(deadline)
+    } else {
+        resume_secondary(token)
+    }
 }
 /// Local IF=0 quiescent AP only. Do not mutate the BSP timer snapshot.
 pub(crate) fn pause_secondary() -> Option<PausedTimer> {

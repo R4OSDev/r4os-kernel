@@ -53,6 +53,7 @@ struct CpuState {
     pending: bool,
     current_work: bool,
     balance_next_cpu: u32,
+    refill_cache: super::refill_cache::Cache,
     fairness: Fairness,
 }
 impl CpuState {
@@ -64,6 +65,7 @@ impl CpuState {
         pending: false,
         current_work: false,
         balance_next_cpu: 0,
+        refill_cache: super::refill_cache::Cache::EMPTY,
         fairness: Fairness::EMPTY,
     };
 }
@@ -379,6 +381,13 @@ fn log(event: u8, task: Task, a: u64, b: u64) {
     unsafe { scheduler_log(event, task, a, b) }
 }
 unsafe fn switch_context(outgoing: *mut u64, incoming: u64) {
+    let next = local().current;
+    if !next.is_null() && !view(next).cpu_idle {
+        assert!(
+            super::secondary_idle::resume(),
+            "AP quantum timer restore rejected"
+        );
+    }
     unsafe {
         r4os_context_switch(outgoing, incoming);
     }
@@ -1102,7 +1111,7 @@ fn refill_ready_at(now: Option<u64>) {
         return;
     }
     // pull_prepared already memoizes its lazy supplier once per attempt.
-    refill_from_sources(target, || now.unwrap_or_else(tick));
+    refill_from_sources(target, || now.unwrap_or_else(tick), true);
 }
 fn balance_checkpoint(now: u64) {
     let index = slot(percpu::current_index());
@@ -1110,19 +1119,36 @@ fn balance_checkpoint(now: u64) {
         return;
     }
     change(|s| s.balance_at[index] = now.saturating_add(QUANTUM));
-    let moved = refill_from_sources(percpu::current_index(), || now);
+    let moved = refill_from_sources(percpu::current_index(), || now, false);
     if !moved.is_null() {
         unsafe { super::task::balance::mark_periodic(moved.cast()) };
     }
 }
-fn refill_from_sources(target: u32, now: impl FnMut() -> u64) -> Task {
+fn refill_from_sources(target: u32, mut now: impl FnMut() -> u64, hints: bool) -> Task {
     let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
     if online.count_ones() < 2 {
         return ptr::null_mut();
     }
+    if hints {
+        let (registry, ready) = unsafe { super::task::balance::search_revisions() };
+        let key = super::refill_cache::Key {
+            registry,
+            ready,
+            online,
+            cpu_epoch: crate::platform::cpu_topology::epoch(target),
+            current: cpu_state(target).current as usize,
+            target_load: unsafe {
+                super::task::balance::workload(target, cpu_state(target).current.cast())
+            },
+        };
+        local_change(|s| s.refill_cache.begin(key));
+    }
     let start = local().balance_next_cpu;
     for source in crate::arch::smp_policy::online_from(online & !(1 << target), start) {
         if !cpu_state(source).initialized {
+            continue;
+        }
+        if hints && local().refill_cache.skip(source) {
             continue;
         }
         let Some(transfer) = (unsafe {
@@ -1133,12 +1159,28 @@ fn refill_from_sources(target: u32, now: impl FnMut() -> u64) -> Task {
                 cpu_state(target).current.cast(),
             )
         }) else {
+            if hints {
+                local_change(|s| s.refill_cache.rejected(source, true, false, true));
+            }
             continue;
         };
         // One donor and at most eight candidates per attempt. Rotate donors
         // even when their bounded prefix contains only bound tasks.
         local_change(|s| s.balance_next_cpu = (source + 1) % MAX_CPUS as u32);
-        return balance_ready(transfer, now);
+        let complete = unsafe { super::task::balance::complete_prefix(source) };
+        let mut clock_used = false;
+        let moved = balance_ready(transfer, || {
+            clock_used = true;
+            now()
+        });
+        if hints && moved.is_null() {
+            let stable = unsafe { super::task::balance::stable_exclusion(source, target) };
+            local_change(|s| {
+                s.refill_cache
+                    .rejected(source, complete, clock_used, stable)
+            });
+        }
+        return moved;
     }
     ptr::null_mut()
 }
@@ -1179,7 +1221,21 @@ fn balance_wake(source: u32, ready_time: u64) -> Task {
         }) else {
             return ptr::null_mut();
         };
-        balance_ready(transfer, || ready_time)
+        let moved = balance_ready(transfer, || ready_time);
+        if moved.is_null() {
+            let target_current = cpu_state(target).current;
+            if !target_current.is_null()
+                && view(target_current).cpu_idle
+                && !unsafe { super::task::balance::stable_exclusion(source, target) }
+            {
+                // A completed static exclusion needs no extra IPI. An
+                // incomplete prefix can miss the newly published ninth task.
+                // Wake the exact chosen idle CPU anyway. Its next bounded
+                // refill/retry must not depend on an old periodic idle tick.
+                send_reschedule(target);
+            }
+        }
+        moved
     })
 }
 /// # Safety
@@ -1232,6 +1288,7 @@ pub(crate) unsafe fn rank_changed(
 // caller re-notifies within that same runtime admission. Reuse that functional
 // time snapshot for wake cooldowns rather than publishing the global clock again.
 pub(crate) fn notify_ready(task: Task) {
+    unsafe { super::task::balance::note_ready_publication() };
     let item = view(task);
     let target = item.home_cpu;
     let moved = balance_wake(target, item.ready_since_tick);
@@ -1481,6 +1538,22 @@ fn wait_until_deadline() {
     }
     if bsp {
         timer::r4os_rust_timer_control(12, query(8, ptr::null_mut(), 0), 0);
+    } else if idle_switch_complete(percpu::current_index()) {
+        let sources =
+            percpu::r4os_rust_percpu_control(14, 0, 0, 0) & !(1u64 << percpu::current_index());
+        let retry = (!local().refill_cache.all_empty(sources)).then_some(QUANTUM);
+        // Unknown/clock-dependent donor work retries at a bounded quantum;
+        // a complete unchanged empty search has no local timer obligation.
+        let _ = super::secondary_idle::prepare(retry);
+    } else {
+        // park_blocked_owned also waits on the exact physically current
+        // blocked stack when switching is forbidden. It can become Running
+        // in place, without switch_context restoring a timer. Only the
+        // permanent, fully installed idle stack may retain this loan.
+        assert!(
+            super::secondary_idle::resume(),
+            "blocked-stack timer restore"
+        );
     }
     let idle_entry = {
         let owner = runtime::RuntimeGuard::acquire();
@@ -1655,6 +1728,7 @@ pub(crate) fn on_reschedule_irq(preemptible: bool) {
 }
 fn reschedule<const VECTOR_RECEIVED: bool>(preemptible: bool) {
     let flags = runtime::save_runtime();
+    super::secondary_idle::clock_changed();
     if VECTOR_RECEIVED {
         // Actual0xf0 only, under this same outer switch admission. Scheduling
         // deferral below must not retain the already consumed transport credit.

@@ -45,7 +45,10 @@ pub(super) unsafe fn start() -> bool {
         (*c::state()).worker_id = id;
         STATS.policy_worker_started.store(1, Relaxed);
         STATS.policy_worker_task_id.store(id, Relaxed);
-        task::task_api::r4os_rust_task_mutate(0, worker, timer::tick_count(), 0, ptr::null(), 0);
+        assert!(
+            crate::sched::scheduler::publish_created(worker),
+            "page cache worker first publication"
+        );
         c::signal();
         true
     }

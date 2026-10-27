@@ -180,6 +180,7 @@ fn release(source: u32) -> bool {
             if i == 2 {
                 for p in &TASKS[..3] {
                     (*registry::core(p.load(Ordering::Acquire))).cpu_affinity_bound = false;
+                    crate::sched::task::balance::note_ready_publication();
                 }
             }
             sync_objects::r4os_rust_sync_event(event(i), 0, 0);

@@ -989,16 +989,7 @@ pub unsafe extern "C" fn r4os_rust_net_rx_runtime_start(input: *const RxPeers) -
             (*s).rx_task_generation = generation;
         }
     }
-    unsafe {
-        task::task_api::r4os_rust_task_mutate(
-            0,
-            worker.cast(),
-            timing::now_ticks(),
-            0,
-            ptr::null(),
-            0,
-        )
-    };
+    scheduler::publish_created(worker.cast());
     // Poll, maintenance and unqualified callbacks retain the original BSP task.
     // Failure to allocate this optional processor preserves that whole path.
     if crate::arch::percpu::r4os_rust_percpu_control(14, 0, 0, 0).count_ones() > 1 {
@@ -1025,16 +1016,7 @@ pub unsafe extern "C" fn r4os_rust_net_rx_runtime_start(input: *const RxPeers) -
             let (id, generation) = unsafe { task::immutable_identity(ap.cast()) };
             AP_TASK_GENERATION.store(generation, Ordering::Release);
             AP_TASK_ID.store(id, Ordering::Release);
-            unsafe {
-                task::task_api::r4os_rust_task_mutate(
-                    0,
-                    ap.cast(),
-                    timing::now_ticks(),
-                    0,
-                    ptr::null(),
-                    0,
-                )
-            };
+            scheduler::publish_created(ap.cast());
             signal_frames();
         }
     }

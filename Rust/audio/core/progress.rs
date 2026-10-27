@@ -10,7 +10,7 @@ pub(crate) unsafe fn start_progress_worker() -> bool {
         let request = task_api::CreateRequest {
             name: name.as_ptr(),
             name_len: name.len(),
-            state: 1,
+            state: 3,
             role: 1,
             needs_fpu: true,
             smp_eligible: true,
@@ -20,10 +20,15 @@ pub(crate) unsafe fn start_progress_worker() -> bool {
             entry: Some(progress_worker),
         };
         let mut failure = 0;
-        if task_api::r4os_rust_task_create(&request, false, &mut failure).is_null() {
+        let task = task_api::r4os_rust_task_create(&request, false, &mut failure);
+        if task.is_null() {
             return false;
         }
         g!(progress_worker_started) = true;
+        assert!(
+            crate::sched::scheduler::publish_created(task),
+            "audio progress first publication"
+        );
         true
     }
 }

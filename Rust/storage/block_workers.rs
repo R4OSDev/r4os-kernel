@@ -175,16 +175,7 @@ pub extern "C" fn r4os_rust_block_worker_start(lane: u8, critical: bool) -> bool
             };
         }
     }
-    unsafe {
-        task_api::r4os_rust_task_mutate(
-            0,
-            created,
-            crate::platform::timer::tick_count(),
-            0,
-            ptr::null(),
-            0,
-        );
-    }
+    scheduler::publish_created(created);
     true
 }
 #[unsafe(no_mangle)]

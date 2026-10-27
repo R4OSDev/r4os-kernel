@@ -221,7 +221,10 @@ unsafe fn create(
             reserved: 0,
         });
         admission.0 = true;
-        task_api::r4os_rust_task_mutate(0, task, timer::tick_count(), 0, ptr::null(), 0);
+        assert!(
+            crate::sched::scheduler::publish_created(task),
+            "owned program thread first publication"
+        );
         0
     }
 }

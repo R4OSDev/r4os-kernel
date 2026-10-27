@@ -154,6 +154,7 @@ fn body(ready_path: bool, end: u64) -> Option<(u32, u32, u64, u64)> {
         unsafe {
             // Only this owned saved diagnostic frame loses its temporary pin.
             (*registry::core(t)).cpu_affinity_bound = false;
+            crate::sched::task::balance::note_ready_publication();
             WAKES[0].store(timer::tick_count(), Ordering::Release);
             sync_objects::r4os_rust_sync_event(SIGNAL.0.get(), 0, 0);
         }
@@ -191,6 +192,7 @@ fn body(ready_path: bool, end: u64) -> Option<(u32, u32, u64, u64)> {
             }
             if ready_path {
                 (*c).cpu_affinity_bound = true;
+                crate::sched::task::balance::note_ready_publication();
             }
             WAKES[1].store(now, Ordering::Release);
             sync_objects::r4os_rust_sync_event(SIGNAL.0.get(), 0, 0);
@@ -200,6 +202,7 @@ fn body(ready_path: bool, end: u64) -> Option<(u32, u32, u64, u64)> {
                     return None;
                 }
                 (*c).cpu_affinity_bound = false;
+                crate::sched::task::balance::note_ready_publication();
                 scheduler::notify_ready(t.cast());
                 if facts(t) != before {
                     return None;

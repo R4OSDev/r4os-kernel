@@ -169,7 +169,7 @@ pub(super) unsafe fn start_port_task(ctx: Context) -> bool {
         let request = task_api::CreateRequest {
             name: b"xhci-port".as_ptr(),
             name_len: 9,
-            state: 1,
+            state: 3,
             role: 1,
             needs_fpu: true,
             smp_eligible: false,
@@ -191,6 +191,10 @@ pub(super) unsafe fn start_port_task(ctx: Context) -> bool {
         ctx.asynchronous()
             .task_started
             .store(true, Ordering::Release);
+        assert!(
+            crate::sched::scheduler::publish_created(task),
+            "xHCI port worker first publication"
+        );
         puts(b"[XHCI] port-task started id=");
         diag::console_dec(id);
         puts(b"\r\n");

@@ -9,6 +9,35 @@ use core::ptr;
 const CANDIDATES: usize = 8;
 
 /// # Safety
+/// Caller owns Runtime admission; these copied revisions retain no task.
+pub(crate) unsafe fn search_revisions() -> (u64, u64) {
+    unsafe { ((*registry::raw()).epoch, (*registry::raw()).ready_revision) }
+}
+
+/// # Safety
+/// Existing Ready/policy publication under Runtime, including a re-notify
+/// after temporary affinity release without changing FIFO linkage.
+pub(crate) unsafe fn note_ready_publication() {
+    unsafe {
+        (*registry::raw()).ready_revision = (*registry::raw()).ready_revision.wrapping_add(1);
+    }
+}
+
+/// # Safety
+/// The following bounded pull uses this exact unchanged Runtime-owned queue.
+pub(crate) unsafe fn complete_prefix(source: u32) -> bool {
+    unsafe { (*registry::queue(source)).count <= CANDIDATES }
+}
+
+/// # Safety
+/// Copied static exclusion from the completed traversal, under the same
+/// Runtime admission. Saved stack/FPU/guard handoffs are transient and must
+/// never become a negative hint merely because no cooldown clock was read.
+pub(crate) unsafe fn stable_exclusion(source: u32, target: u32) -> bool {
+    unsafe { (*registry::queue(source)).transfer_summary.excludes(target) }
+}
+
+/// # Safety
 /// Runtime admission and the exact task lifetime remain with the caller.
 /// Initial/wake rehome and queued transfer share every saved-state barrier.
 pub(crate) unsafe fn placeable(candidate: *mut Task, initial: bool) -> bool {
@@ -30,11 +59,7 @@ pub(crate) unsafe fn saved_continuation(candidate: *mut Task, initial: bool) -> 
             && (*c).running_cpu == 0xff
             && !(*c).cpu_idle
             && !(*c).placement_deferred
-            && (initial
-                || matches!(
-                    (*c).execution_owner_kind,
-                    ExecutionOwnerKind::None | ExecutionOwnerKind::ProgramThread
-                ))
+            && (initial || execution_owner_movable(candidate))
             && !(*c).retire_pending
             && !(*c).release_in_progress
             && !(*c).rollback_pending
@@ -46,6 +71,19 @@ pub(crate) unsafe fn saved_continuation(candidate: *mut Task, initial: bool) -> 
             && (*c).wake_tick == 0
             && (*c).rsp != 0
             && (!(*c).uses_fpu || ((*c).fpu_state_valid && (*c).fpu_state.is_some()))
+    }
+}
+/// # Safety
+/// Runtime retains the exact live Task. AsyncIO's authoritative atomic binding
+/// must confirm that every foreign callback has returned; generic saved-stack,
+/// FPU, guard and retirement checks remain at each caller.
+pub(crate) unsafe fn execution_owner_movable(task: *mut Task) -> bool {
+    unsafe {
+        match (*registry::core(task)).execution_owner_kind {
+            ExecutionOwnerKind::None | ExecutionOwnerKind::ProgramThread => true,
+            ExecutionOwnerKind::AsyncIo => crate::program::async_io::idle_transfer(task),
+            _ => false,
+        }
     }
 }
 pub(crate) unsafe fn relocatable(candidate: *mut Task) -> bool {
@@ -169,7 +207,22 @@ pub(crate) unsafe fn prepare(
     current: *mut Task,
     target_current: *mut Task,
 ) -> Option<Transfer> {
-    unsafe { imbalanced(source, target, current, target_current) }.then_some(Transfer {
+    if !unsafe { imbalanced(source, target, current, target_current) } {
+        return None;
+    }
+    unsafe {
+        let q = registry::queue(source);
+        let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
+        (*q).transfer_summary.begin(
+            (*registry::raw()).epoch,
+            (*registry::raw()).ready_revision,
+            online,
+        );
+        if (*q).transfer_summary.excludes(target) {
+            return None;
+        }
+    }
+    Some(Transfer {
         source,
         target,
         current,
@@ -232,9 +285,15 @@ pub(crate) unsafe fn pull_prepared(
                 (*c).ready_next
             };
             (*from).balance_cursor = next;
+            let possible = if (*c).smp_eligible && !(*c).cpu_affinity_bound && !(*c).cpu_idle {
+                super::thread_placement::allowed(candidate)
+            } else {
+                0
+            };
+            (*from).transfer_summary.visit(possible, (*from).count);
             if candidate != current
                 && candidate != target_current
-                && super::thread_placement::allows(candidate, target)
+                && possible & (1u64 << target) != 0
                 && eligible(
                     candidate,
                     current,

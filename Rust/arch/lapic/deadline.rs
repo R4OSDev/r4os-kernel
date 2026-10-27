@@ -330,6 +330,7 @@ pub(crate) fn on_irq() -> bool {
     let t = local();
     let mode = t.mode.load(Ordering::Acquire);
     if mode == COUNT {
+        add(&t.irqs);
         return true;
     }
     if mode == PAUSED {
@@ -390,6 +391,12 @@ pub(super) struct Paused {
     mode: u32,
     next: u64,
 }
+pub(super) fn paused_clock_current(token: &Paused) -> bool {
+    token.cpu == percpu::current_index()
+        && token.epoch == cpu_topology::epoch(token.cpu)
+        && clocksource::deadline_clock(token.cpu)
+            .is_some_and(|(_, generation)| generation == token.generation)
+}
 pub(super) fn pause() -> Result<Option<Paused>, ()> {
     let _local = Local::acquire();
     let t = local();
@@ -414,6 +421,57 @@ pub(super) fn pause() -> Result<Option<Paused>, ()> {
     t.next.store(0, Ordering::Release);
     t.mode.store(PAUSED, Ordering::Release);
     Ok(Some(token))
+}
+
+/// The scheduler retains the exact original pause token throughout its idle
+/// loan. Re-arm only this CPU/epoch, never the BSP logical timer or a peer.
+pub(super) fn arm_idle(token: &Paused, ticks: Option<u64>) -> bool {
+    let _local = Local::acquire();
+    let t = local();
+    if token.cpu != percpu::current_index()
+        || token.epoch != cpu_topology::epoch(token.cpu)
+        || token.epoch != t.epoch.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    if !current(t) || token.generation != t.generation.load(Ordering::Acquire) {
+        fallback(t, 4);
+        return false;
+    }
+    mask();
+    if !wr(t, 0) {
+        fallback(t, 3);
+        return false;
+    }
+    t.next.store(0, Ordering::Release);
+    t.mode.store(PAUSED, Ordering::Release);
+    if let Some(ticks) = ticks {
+        t.mode.store(SINGLE, Ordering::Release);
+        arm(ticks).is_some()
+    } else {
+        true
+    }
+}
+
+/// End the scheduler's idle loan before dispatch or lifecycle ownership. A
+/// demoted clock restores the calibrated count fallback, not an old deadline.
+pub(super) fn finish_idle(token: Paused) -> bool {
+    let _local = Local::acquire();
+    let t = local();
+    if token.cpu != percpu::current_index()
+        || token.epoch != cpu_topology::epoch(token.cpu)
+        || token.epoch != t.epoch.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    mask();
+    if !wr(t, 0) {
+        fallback(t, 3);
+        return true;
+    }
+    t.next.store(0, Ordering::Release);
+    t.mode.store(PAUSED, Ordering::Release);
+    resume(token)
 }
 pub(super) fn resume(token: Paused) -> bool {
     let _local = Local::acquire();
@@ -484,6 +542,16 @@ pub(super) fn idle_budget_us() -> Option<u64> {
         return None;
     }
     u64::try_from(u128::from(next - now) * 1_000_000 / u128::from(hz)).ok()
+}
+pub(super) fn timer_sample(cpu: u32) -> Option<(u64, u64, u64, u32, u32)> {
+    let t = TIMERS.get(cpu as usize)?;
+    Some((
+        t.epoch.load(Ordering::Acquire),
+        t.irqs.load(Ordering::Acquire),
+        t.stale.load(Ordering::Acquire),
+        t.generation.load(Ordering::Acquire),
+        t.mode.load(Ordering::Acquire),
+    ))
 }
 pub(crate) fn log(cpu: u32) {
     use core::fmt::Write;

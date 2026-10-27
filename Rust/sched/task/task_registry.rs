@@ -62,6 +62,7 @@ pub struct ReadyQueue {
     pub ranks: [Index; ROLE_COUNT],
     pub warning_cursor: *mut Task,
     pub balance_cursor: *mut Task,
+    pub transfer_summary: crate::sched::refill_cache::Summary,
 }
 impl ReadyQueue {
     const EMPTY: Self = Self {
@@ -79,6 +80,7 @@ impl ReadyQueue {
         }; ROLE_COUNT],
         warning_cursor: null_mut(),
         balance_cursor: null_mut(),
+        transfer_summary: crate::sched::refill_cache::Summary::EMPTY,
     };
 }
 pub struct Registry {
@@ -109,6 +111,9 @@ pub struct Registry {
     pub count: usize,
     pub peak: usize,
     pub epoch: u64,
+    // Queue publication is separate from the passive inventory epoch. A task
+    // snapshot must not become unstable merely because CPUs dispatch work.
+    pub ready_revision: u64,
     pub next_id: u32,
     pub next_generation: u64,
     pub generation_exhausted: bool,
@@ -170,6 +175,7 @@ impl Registry {
         count: 0,
         peak: 0,
         epoch: 1,
+        ready_revision: 1,
         next_id: 1,
         next_generation: 1,
         generation_exhausted: false,
@@ -591,6 +597,7 @@ pub(super) unsafe fn append_ready(task: *mut Task) {
         }
         (*q).count += 1;
         (*q).dispatch_counts[dispatch_rank(task) as usize] += 1;
+        (*raw()).ready_revision = (*raw()).ready_revision.wrapping_add(1);
     }
 }
 pub(super) unsafe fn unlink_ready(task: *mut Task) {
@@ -632,6 +639,7 @@ pub(super) unsafe fn unlink_ready(task: *mut Task) {
         (*c).ready_prev = null_mut();
         (*c).ready_next = null_mut();
         (*c).ready_linked = false;
+        (*raw()).ready_revision = (*raw()).ready_revision.wrapping_add(1);
         if (*q).count != 0 {
             (*q).count -= 1;
         }

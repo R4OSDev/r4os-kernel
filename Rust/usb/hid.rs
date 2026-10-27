@@ -1056,7 +1056,10 @@ unsafe fn start_poll_task_locked() -> bool {
         let id = (*task_registry::core(worker.cast())).id;
         POLL_STARTED.store(true, Ordering::Release);
         POLL_TASK_ID.store(id, Ordering::Release);
-        task_api::r4os_rust_task_mutate(0, worker, timer::tick_count(), 0, ptr::null(), 0);
+        assert!(
+            crate::sched::scheduler::publish_created(worker),
+            "USB HID worker first publication"
+        );
         puts(b"USBHID poll-task started id=");
         diag::console_dec(id);
         puts(b"\r\n");

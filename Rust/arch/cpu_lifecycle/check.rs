@@ -254,6 +254,28 @@ pub(crate) fn run() -> c::ProgramKernelCpuLifecycleCheck {
     if mask.count_ones() < 3 || mask & 7 != 7 {
         return r;
     }
+    // Select an actually admissible AP before installing this probe's own
+    // fixed/busy witnesses. A foreign nonmigratable main/active callback on
+    // CPU1 is a valid safety refusal, not a failed fixed-witness contract.
+    // Every original case/IF/resource/epoch oracle below remains unchanged.
+    let choice = {
+        let _runtime = RuntimeGuard::acquire();
+        (1..crate::platform::cpu_topology::count()).find_map(|cpu| {
+            if mask & (1u64 << cpu) == 0
+                || unsafe { cpu_drain::preflight(cpu, mask & !(1u64 << cpu)) }.is_err()
+            {
+                return None;
+            }
+            (1..crate::platform::cpu_topology::count())
+                .find(|&peer| peer != cpu && mask & (1u64 << peer) != 0)
+                .map(|peer| (cpu, peer))
+        })
+    };
+    let Some((cpu, helper)) = choice else {
+        r.status = c::cpu_lifecycle_check_status_busy;
+        r.reason = reason_value(Reason::KernelContext);
+        return r;
+    };
     if BUSY
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -261,8 +283,6 @@ pub(crate) fn run() -> c::ProgramKernelCpuLifecycleCheck {
         r.status = c::cpu_lifecycle_check_status_busy;
         return r;
     }
-    let cpu = 1;
-    let helper = 2;
     r.cpu_index = cpu;
     r.configured_cpus = crate::platform::cpu_topology::count();
     r.available_before = mask.count_ones();

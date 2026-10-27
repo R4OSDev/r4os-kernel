@@ -12,7 +12,6 @@ use crate::{
         ProgramProcessCompletion as Completion, ProgramProcessHandle as Handle, R4XStartImport,
     },
     fs::{drive::Drive, vfs_types::Bytes},
-    platform::timer,
     sched::{
         scheduler,
         task::{task_api, task_registry},
@@ -233,9 +232,10 @@ unsafe extern "C" fn shell_entry() {
     unsafe { entry::r4os_rust_program_entry_main(true) }
 }
 unsafe fn mark_ready(task: *mut core::ffi::c_void) {
-    unsafe {
-        task_api::r4os_rust_task_mutate(0, task, timer::tick_count(), 0, ptr::null(), 0);
-    }
+    assert!(
+        crate::sched::scheduler::publish_created(task),
+        "owned program first publication"
+    );
 }
 unsafe fn inherit_console(instance: *mut ProgramInstance, id: u32) {
     unsafe {

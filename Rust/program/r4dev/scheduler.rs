@@ -13,10 +13,14 @@ pub unsafe extern "C" fn kernel_check(
 ) -> i32 {
     if selection == 0
         || selection
-            & !(c::kernel_scheduler_check_case_all | c::kernel_scheduler_check_case_workers)
+            & !(c::kernel_scheduler_check_case_all
+                | c::kernel_scheduler_check_case_workers
+                | c::kernel_scheduler_check_case_idle)
             != 0
         || (selection & c::kernel_scheduler_check_case_workers != 0
             && selection != c::kernel_scheduler_check_case_workers)
+        || (selection & c::kernel_scheduler_check_case_idle != 0
+            && selection != c::kernel_scheduler_check_case_idle)
         || out.is_null()
         || unsafe { (*out).version } != c::kernel_scheduler_check_version
         || unsafe { (*out).size } < mem::size_of::<c::ProgramKernelSchedulerCheck>() as u32

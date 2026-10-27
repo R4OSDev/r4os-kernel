@@ -49,10 +49,8 @@ unsafe fn affected(task: *mut Task, cpu: u32) -> bool {
 unsafe fn safe_saved(task: *mut Task) -> bool {
     unsafe {
         let c = registry::core(task);
-        matches!(
-            (*c).execution_owner_kind,
-            ExecutionOwnerKind::None | ExecutionOwnerKind::ProgramThread
-        ) && (*c).running_cpu == 0xff
+        balance::execution_owner_movable(task)
+            && (*c).running_cpu == 0xff
             && !(*c).placement_deferred
             && !(*c).retire_pending
             && !(*c).release_in_progress
@@ -93,10 +91,10 @@ pub(crate) unsafe fn preflight(cpu: u32, remaining: u64) -> Result<(), Reason> {
                     if (*c).cpu_affinity_bound || !(*c).smp_eligible {
                         return Err(Reason::Fixed);
                     }
-                    if !matches!(
-                        (*c).execution_owner_kind,
-                        ExecutionOwnerKind::None | ExecutionOwnerKind::ProgramThread
-                    ) {
+                    if !balance::execution_owner_movable(task)
+                        || (*c).execution_owner_kind == ExecutionOwnerKind::AsyncIo
+                            && scheduler::current_on_cpu(cpu).cast::<Task>() == task
+                    {
                         return Err(Reason::KernelContext);
                     }
                     if (*c).held_lock_count != 0

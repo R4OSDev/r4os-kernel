@@ -168,7 +168,7 @@ pub fn enable(driver: Owner, backend: a::GfxBackendBinding) -> Result<(), Error>
         let request = task_api::CreateRequest {
             name: b"gfx-mode".as_ptr(),
             name_len: 8,
-            state: 1,
+            state: 3,
             role: 1,
             needs_fpu: true,
             smp_eligible: false,
@@ -178,10 +178,15 @@ pub fn enable(driver: Owner, backend: a::GfxBackendBinding) -> Result<(), Error>
             entry: Some(worker_main),
         };
         let mut failure = 0;
-        if unsafe { task_api::r4os_rust_task_create(&request, false, &mut failure) }.is_null() {
+        let task = unsafe { task_api::r4os_rust_task_create(&request, false, &mut failure) };
+        if task.is_null() {
             return Err(Error::OutOfMemory);
         }
         unsafe { STARTED.0.get().write(true) };
+        assert!(
+            crate::sched::scheduler::publish_created(task),
+            "graphics mode worker first publication"
+        );
     }
     native(
         0,

@@ -595,7 +595,15 @@ pub(crate) fn idle_checkpoint() {
             note_busy(index, Reason::Resources);
             return;
         };
-        if !crate::sched::scheduler::idle_switch_complete(index) || !percpu::park_current() {
+        if !crate::sched::scheduler::idle_switch_complete(index) {
+            note_busy(index, Reason::Resources);
+            return;
+        }
+        if !crate::sched::secondary_idle::resume() {
+            note_busy(index, Reason::Timer);
+            return;
+        }
+        if !percpu::park_current() {
             note_busy(index, Reason::Resources);
             return;
         }

@@ -370,10 +370,24 @@ unsafe fn worker_for(task: *mut Task) -> *mut Worker {
             return ptr::null_mut();
         }
         let worker = (*core).execution_owner_context.cast::<Worker>();
+        if !(0..WORKERS).any(|i| ptr::eq(ptr::addr_of!((*state()).workers[i]), worker)) {
+            return ptr::null_mut();
+        }
         if (*worker).task_id != (*core).id || (*worker).task_generation != (*core).generation {
             return ptr::null_mut();
         }
         worker
+    }
+}
+/// # Safety
+/// Runtime retains this exact live Task/generation. A worker slot is reset
+/// only after release_task has retired that Task. Its existing atomic request
+/// binding spans every foreign operation/abort; null therefore admits only
+/// the guard-free idle or returned-callback boundary, never a live backend.
+pub(crate) unsafe fn idle_transfer(task: *mut Task) -> bool {
+    unsafe {
+        let worker = worker_for(task);
+        !worker.is_null() && (*worker).request.load(Ordering::Acquire).is_null()
     }
 }
 unsafe fn request_for(task: *mut Task) -> *mut Request {
@@ -490,7 +504,10 @@ unsafe fn ensure_workers(service: bool) -> bool {
                 (*worker).task_generation = (*core).generation;
                 (*worker).service = service;
                 (*state()).creations = (*state()).creations.wrapping_add(1);
-                task_api::r4os_rust_task_mutate(0, task, timer::tick_count(), 0, ptr::null(), 0);
+                assert!(
+                    crate::sched::scheduler::publish_created(task),
+                    "owned async worker first publication"
+                );
             }
             available = true;
         }

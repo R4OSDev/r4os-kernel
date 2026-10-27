@@ -359,6 +359,10 @@ unsafe fn scenario(file: &launch::File, working: *mut Drive, cpu: u32, mode: u8)
                     timed_out = true;
                     abort();
                 }
+                // Explicit periodic-preemption baseline: the witnessed peer
+                // is already physically spinning with its active timer. Do
+                // not replace this isolated no-IPI comparison with a normal
+                // first-publication doorbell (production uses publish_created).
                 task_api::r4os_rust_task_mutate(0, task, timer::tick_count(), 0, ptr::null(), 0);
             } else if !timed_out && flag.load(Ordering::Acquire) == 1 {
                 // Baseline after actual PREEMPT_SPIN entry, not witness startup.
