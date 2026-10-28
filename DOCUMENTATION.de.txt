@@ -70,3 +70,65 @@ fachliche Wellen: Docs/Core/KernelRustMigration.txt. Endabnahme, genaue
 Artefakte, Standardbenchmark und Pruefgrenzen: Docs/Core/KernelRustFinal.txt.
 Ressourcen-/Taskvertraege: Agents/Konventionen.txt sowie
 Docs/Core/ProgramLifecycle.txt und Speicherverwaltung.txt.
+
+0.87.65 / Kernel418: AP-Idle-Timer und IRQ-/Task-FPU-Entscheidung
+----------------------------------------------------------------
+SPEED-038-R5: Ein bereits nachweislich disarmierter leerer AP-Idle-Loan
+muss nicht nochmals den lokalen Timer programmieren. Der Count-Pfad
+merkt den bestaetigten maskierten Nullzustand ausschliesslich im exakten
+CPU-/Topologieepochentoken. Ein weiterer leerer Prepare kann ihn ohne MMIO
+uebernehmen. Eine endliche Frist loescht diese Zusage und programmiert und
+prueft weiterhin den urspruenglichen One-Shot. Es gibt keine globale
+Timerzustandsannahme oder neue persistente Besitzertabelle.
+
+Der Deadline-Pfad prueft zuerst CPU, Epoche, aktuell qualifizierte Quelle
+und Uhrgeneration. Nur PAUSED mit next=0 ist wiederverwendbar; SINGLE mit
+next=0 nach einem Timer-IRQ ist es nicht. Eine endliche Frist wird weiterhin
+real gesetzt, spart dabei nur das bereits bestaetigte mask/zero. finish_idle
+spart denselben doppelten Disarm ausschliesslich im PAUSED/Nullzustand.
+resume bleibt unveraendert: Epoche/Quelle erneut pruefen und zukuenftiges
+Quantum, neue Periode oder kalibrierten Count-Fallback wiederherstellen.
+Keine Aenderung von Quantum, Timeout, Placement, CPU-Kapazitaet oder HLT.
+
+Der bestehende explizite IDLE256 berichtet zusaetzlich echte Retained-
+Rueckgaben als AP-IDLE65 retained_empty_prepares. Zuruecksetzen/Zaehlen/Kopie
+nur in dessen zugelassenem Beobachtungsfenster; kein periodischer Sampler,
+neuer normaler RPC oder zusaetzlicher Hardwarezugriff fuer Messwerte.
+Originale500Ticks,50ms zusammenhaengende Quietspans, hoechstens ein insgesamt
+erlaubter alter IRQ pro unveraendertem Loan, aktive IRQs,16Fristen und
+exakte Retirementquittungen bleiben unverkuerzt.
+
+SPEED-046: Die gemeinsame IRQ-/Task-FPU-Uebergabe wird begruendet NICHT
+implementiert. Der redundante Restore/Save beim Handler mit nachfolgendem
+echtem Taskwechsel ist als Pfad belegt; Haeufigkeit und Zeitanteil fehlen.
+Assembly sichert GPR/Frame, kein XSTATE-Abbild auf dem IRQ-Stack. Der Router
+pinnt jeden Handler mit eigener Generation und gibt ihm unter IF=0 die
+kanonische FP-Umgebung. Jeder Guard sichert und restauriert den exakt
+gebundenen Task; ein normaler Taskwechsel im Callback ist nicht zulaessig.
+Das native Taskbild bleibt aber ein veraenderlicher Puffer, kein versioniertes
+IRQ-Snapshot. Erst nach allen Handlern/EOI entscheidet der Scheduler, auch
+ueber keinen Wechsel oder denselben Task. Ein XSAVEOPT-Tag bindet CPU,
+Taskgeneration und Bildadresse nach echtem Restore; er beweist weder einen
+Bildversionsstand noch die Gleichheit noch lebender Register. Ein gesparter
+Restore darf deshalb keinen kuenstlichen Restored-Tag erzeugen.
+
+Program-Fault-Recovery verlangt gespeichertes IF=1; normale IRQ-Callbacks
+haben IF=0. Der terminale FP-Fault-Snapshot erfasst reale Register und
+publizierte Taskidentitaet, ist aber keine konsumierbare Caller-Uebergabe.
+Eine neue Optimierung braeuchte eine explizite consumed-or-restored-Quittung
+fuer No-Switch, Same-Task, verschachtelte/direkte Eintritte, Faults und
+terminale Zweige samt physischer Qualifikation. Vorhandene FPUENV-/IRQ56-
+Faelle qualifizieren diese neue Uebergabe nicht. Die individuellen Guards
+bleiben vollstaendig erhalten. Ein falscher Stack-XSTATE-Kommentar wurde
+korrigiert. Analyse und genaue Quellhashes: Temp/08765-analysis.json sowie
+SPEED-046.decision_08765; keine neue FPU-Handoff-Abnahme behauptet.
+
+Qualifikation: normaler418-Build/fmt/check/clippy, originale KVM4-Core-/Clock-/
+Count-/Subsystemfaelle und frische native16CPU-Abnahme einschliesslich echter
+CPU-Epoche, FPU, Audio, GPU-Replay und regulaerem Neustart. Originaler erster
+Fokusfehler bleibt getrennt fuer66; spaeterer Pass erklaert ihn nicht.
+Genau1STANDARD65 d6dcc38c-b37a-4b63-b7f1-f816708cf4cf vollstaendig lokal und
+auf R4OS Server validiert. Unisolierter Indexvergleich, keine kausale
+Beschleunigungsbehauptung. Physische Sicht/Hoeren/Latenz SKIP.
+Vollstaendige Grenzen, Artefakte und aktuelle Belege:
+Docs/Core/Parallelitaet.txt Abschnitt0.87.65 und dessen Originalarchiv.

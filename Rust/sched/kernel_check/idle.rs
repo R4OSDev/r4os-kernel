@@ -198,6 +198,7 @@ pub(super) fn run() -> Option<bool> {
     let elapsed = timer::tick_count().saturating_sub(begin_tick);
     let mut candidate = None;
     let mut quiet = 0u32;
+    let mut retained = 0u32;
     let mut excess_irqs = false;
     for cpu in 1..64u32 {
         let m = measured[cpu as usize];
@@ -215,9 +216,24 @@ pub(super) fn run() -> Option<bool> {
         let mut line = crate::boot::log::Line::<768>::new();
         write!(&mut line,"[AP-IDLE58] cpu={} epoch={} generation={} mode={} nominal_hz={} observed_ticks={} irq_before={} irq_after={} stale_before={} stale_after={} actual_delta={} quiet_ticks={} longest_quiet={} quiet_spans={} max_quiet_irq_delta={} qualified={} coherent={}/{} retry_arms={}/{} entries={}/{} returns={}/{}\r\n",cpu,epoch,generation,mode,timer::frequency(),elapsed,irqs,end_irqs,stale,end_stale,delta,m.ticks,m.longest,m.spans,m.maximum_irqs,u8::from(qualified),u8::from(first.coherent),u8::from(last.coherent),b.retry_arms,a.retry_arms,b.entries,a.entries,b.returns,a.returns).expect("bounded idle receipt");
         crate::boot::log::text(line.as_bytes());
+        let mut line = crate::boot::log::Line::<256>::new();
+        write!(
+            &mut line,
+            "[AP-IDLE65] cpu={} epoch={} retained_empty_prepares={}/{} qualified={}\r\n",
+            cpu,
+            epoch,
+            b.retained_empty,
+            a.retained_empty,
+            u8::from(qualified)
+        )
+        .expect("bounded retained idle receipt");
+        crate::boot::log::text(line.as_bytes());
         excess_irqs |= m.excess;
         if qualified {
             quiet += 1;
+            if a.retained_empty != 0 {
+                retained += 1;
+            }
             if candidate.is_none() && last.quiet() {
                 candidate = Some((cpu, last.timer.0));
             }
@@ -228,6 +244,10 @@ pub(super) fn run() -> Option<bool> {
     // retry-arm or clock/CPU epoch transition; a slow periodic storm also fails.
     if excess_irqs {
         crate::boot::log::text(b"[AP-IDLE58] result=FAIL reason=quiet-irq-bound\r\n");
+        return Some(false);
+    }
+    if retained == 0 {
+        crate::boot::log::text(b"[AP-IDLE65] result=FAIL reason=no-retained-empty-loan\r\n");
         return Some(false);
     }
     let Some((cpu, epoch)) = candidate else {

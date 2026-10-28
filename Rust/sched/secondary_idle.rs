@@ -17,6 +17,7 @@ struct Receipt {
     entries: AtomicU64,
     returns: AtomicU64,
     retry_arms: AtomicU64,
+    retained_empty: AtomicU64,
     paused: AtomicBool,
     retrying: AtomicBool,
 }
@@ -26,6 +27,7 @@ static RECEIPTS: [Receipt; 64] = [const {
         entries: AtomicU64::new(0),
         returns: AtomicU64::new(0),
         retry_arms: AtomicU64::new(0),
+        retained_empty: AtomicU64::new(0),
         paused: AtomicBool::new(false),
         retrying: AtomicBool::new(false),
     }
@@ -39,6 +41,7 @@ impl Observation {
             .ok()?;
         for r in &RECEIPTS {
             r.paused.store(false, Ordering::Release);
+            r.retained_empty.store(0, Ordering::Release);
         }
         // Let already sleeping APs publish a real local receipt. This hint
         // neither creates work nor changes placement or schedulable capacity.
@@ -61,6 +64,7 @@ pub(crate) struct Sample {
     pub(crate) entries: u64,
     pub(crate) returns: u64,
     pub(crate) retry_arms: u64,
+    pub(crate) retained_empty: u64,
     pub(crate) paused: bool,
     pub(crate) retrying: bool,
 }
@@ -73,6 +77,7 @@ pub(crate) fn sample(cpu: u32) -> Option<Sample> {
         entries,
         returns,
         retry_arms: r.retry_arms.load(Ordering::Acquire),
+        retained_empty: r.retained_empty.load(Ordering::Acquire),
         paused: r.paused.load(Ordering::Acquire),
         retrying: r.retrying.load(Ordering::Acquire),
     };
@@ -111,10 +116,14 @@ pub(crate) fn prepare(retry: Option<u64>) -> bool {
                     RECEIPTS[cpu].entries.fetch_add(1, Ordering::Release);
                 }
             }
-            let armed = slot
-                .as_ref()
-                .is_some_and(|t| lapic::arm_secondary_idle(t, retry));
+            let arm = slot.as_mut().map_or(lapic::IdleArm::Failed, |t| {
+                lapic::arm_secondary_idle(t, retry)
+            });
+            let armed = arm != lapic::IdleArm::Failed;
             if observed {
+                if arm == lapic::IdleArm::Retained {
+                    RECEIPTS[cpu].retained_empty.fetch_add(1, Ordering::Release);
+                }
                 if armed && retry.is_some() {
                     RECEIPTS[cpu].retry_arms.fetch_add(1, Ordering::Release);
                 }

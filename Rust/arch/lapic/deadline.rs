@@ -1,7 +1,9 @@
 //! The LAPIC owner's CPU-local TSC-deadline mode. All mutations retain local
 //! IF=0, never a wait or a foreign callback. Only copied atomic telemetry is
 //! read remotely; a timer cannot be borrowed by another CPU or start epoch.
-use super::{DIVIDE, INITIAL, LVT, MASKED, PERIODIC, VECTOR, deadline_math as math, read, write};
+use super::{
+    DIVIDE, INITIAL, IdleArm, LVT, MASKED, PERIODIC, VECTOR, deadline_math as math, read, write,
+};
 use crate::{
     arch::{percpu, runtime, safe_msr, smp_policy::MAX_CPUS},
     platform::{clocksource, cpu_topology},
@@ -425,32 +427,48 @@ pub(super) fn pause() -> Result<Option<Paused>, ()> {
 
 /// The scheduler retains the exact original pause token throughout its idle
 /// loan. Re-arm only this CPU/epoch, never the BSP logical timer or a peer.
-pub(super) fn arm_idle(token: &Paused, ticks: Option<u64>) -> bool {
+pub(super) fn arm_idle(token: &Paused, ticks: Option<u64>) -> IdleArm {
     let _local = Local::acquire();
     let t = local();
     if token.cpu != percpu::current_index()
         || token.epoch != cpu_topology::epoch(token.cpu)
         || token.epoch != t.epoch.load(Ordering::Acquire)
     {
-        return false;
+        return IdleArm::Failed;
     }
     if !current(t) || token.generation != t.generation.load(Ordering::Acquire) {
         fallback(t, 4);
-        return false;
+        return IdleArm::Failed;
     }
-    mask();
-    if !wr(t, 0) {
-        fallback(t, 3);
-        return false;
+    // PAUSED/zero is published only after the local owner disarmed its
+    // hardware. IRQ admission preserves it. Validate epoch/source first;
+    // a fired SINGLE timer with next=0 is deliberately NOT this state.
+    if disarmed(t) {
+        if ticks.is_none() {
+            return IdleArm::Retained;
+        }
+    } else {
+        mask();
+        if !wr(t, 0) {
+            fallback(t, 3);
+            return IdleArm::Failed;
+        }
+        t.next.store(0, Ordering::Release);
+        t.mode.store(PAUSED, Ordering::Release);
     }
-    t.next.store(0, Ordering::Release);
-    t.mode.store(PAUSED, Ordering::Release);
     if let Some(ticks) = ticks {
         t.mode.store(SINGLE, Ordering::Release);
-        arm(ticks).is_some()
+        if arm(ticks).is_some() {
+            IdleArm::Programmed
+        } else {
+            IdleArm::Failed
+        }
     } else {
-        true
+        IdleArm::Programmed
     }
+}
+fn disarmed(t: &Timer) -> bool {
+    t.mode.load(Ordering::Acquire) == PAUSED && t.next.load(Ordering::Acquire) == 0
 }
 
 /// End the scheduler's idle loan before dispatch or lifecycle ownership. A
@@ -464,13 +482,15 @@ pub(super) fn finish_idle(token: Paused) -> bool {
     {
         return false;
     }
-    mask();
-    if !wr(t, 0) {
-        fallback(t, 3);
-        return true;
+    if !disarmed(t) {
+        mask();
+        if !wr(t, 0) {
+            fallback(t, 3);
+            return true;
+        }
+        t.next.store(0, Ordering::Release);
+        t.mode.store(PAUSED, Ordering::Release);
     }
-    t.next.store(0, Ordering::Release);
-    t.mode.store(PAUSED, Ordering::Release);
     resume(token)
 }
 pub(super) fn resume(token: Paused) -> bool {

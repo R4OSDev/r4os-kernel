@@ -443,6 +443,7 @@ pub(crate) struct PausedTimer {
     initial: u32,
     epoch: u64,
     deadline: Option<deadline::Paused>,
+    count_disarmed: bool,
 }
 impl PausedTimer {
     pub(crate) fn clock_current(&self) -> bool {
@@ -459,9 +460,15 @@ impl PausedTimer {
 
 /// Scheduler idle loan, local IF=0. None means no required local event; a
 /// finite retry is a one-shot, never a new fixed periodic idle tick.
-pub(crate) fn arm_secondary_idle(token: &PausedTimer, ticks: Option<u64>) -> bool {
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum IdleArm {
+    Failed,
+    Retained,
+    Programmed,
+}
+pub(crate) fn arm_secondary_idle(token: &mut PausedTimer, ticks: Option<u64>) -> IdleArm {
     if !token.matches_current() {
-        return false;
+        return IdleArm::Failed;
     }
     if let Some(deadline) = token.deadline.as_ref() {
         // A failed deadline arm must consume/restore this exact loan first.
@@ -469,6 +476,12 @@ pub(crate) fn arm_secondary_idle(token: &PausedTimer, ticks: Option<u64>) -> boo
         // calibrated owner's state, never that deadline-mode register value.
         return deadline::arm_idle(deadline, ticks);
     }
+    // Only this exact local loan programs the count timer. pause_secondary
+    // verified it masked/zero; an unchanged empty loan needs no MMIO at all.
+    if ticks.is_none() && token.count_disarmed {
+        return IdleArm::Retained;
+    }
+    token.count_disarmed = false;
     write(DIVIDE, token.divider);
     let lvt = token.lvt & !(PERIODIC | (1 << 18) | MASKED);
     write(LVT, lvt | MASKED);
@@ -478,13 +491,22 @@ pub(crate) fn arm_secondary_idle(token: &PausedTimer, ticks: Option<u64>) -> boo
             .saturating_mul(ticks.max(1))
             .min(u64::from(u32::MAX - 1)) as u32;
         if count == 0 {
-            return false;
+            return IdleArm::Failed;
         }
         write(INITIAL, count);
         write(LVT, lvt);
-        read(LVT) == lvt && read(INITIAL) == count
+        if read(LVT) == lvt && read(INITIAL) == count {
+            IdleArm::Programmed
+        } else {
+            IdleArm::Failed
+        }
     } else {
-        read(LVT) & MASKED != 0 && read(INITIAL) == 0
+        token.count_disarmed = read(LVT) & MASKED != 0 && read(INITIAL) == 0;
+        if token.count_disarmed {
+            IdleArm::Programmed
+        } else {
+            IdleArm::Failed
+        }
     }
 }
 
@@ -514,6 +536,7 @@ pub(crate) fn pause_secondary() -> Option<PausedTimer> {
         initial: read(INITIAL),
         epoch: crate::platform::cpu_topology::epoch(cpu),
         deadline: paused,
+        count_disarmed: true,
     };
     if token.deadline.is_some() {
         return Some(token);

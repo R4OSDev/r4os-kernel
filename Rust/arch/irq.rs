@@ -11,8 +11,10 @@ fn eoi() {
     lapic::r4os_rust_lapic_control(8, 0, 0);
 }
 /// # Safety
-/// isr.S retains the complete frame and FPU image on the exact interrupted task
-/// stack. Local runtime/IF follows that stack through physical preemption.
+/// isr.S retains the register frame on the exact interrupted task stack.
+/// XSTATE belongs to the native task image: each foreign handler has its own
+/// canonical guard; the scheduler saves/restores it for physical preemption.
+/// Local runtime/IF follows the interrupted stack through that preemption.
 pub unsafe fn dispatch(frame: *const InterruptFrame) {
     if super::machine_check::terminal_active() {
         crate::boot::fatal::halt();
