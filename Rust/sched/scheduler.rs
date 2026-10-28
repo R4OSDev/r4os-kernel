@@ -1365,8 +1365,9 @@ pub(crate) fn publish_created(task: Task) -> bool {
     runtime::restore_runtime(flags);
     true
 }
-fn defer_critical(task: Task, ticks: u64, preemptible: bool) -> bool {
+fn defer_critical(task: Task, ticks: u64, preemptible: bool, rip: u64) -> bool {
     if preempt_depth() != 0 {
+        super::worker_observation::deferred(rip, ticks, true);
         change(|s| {
             s.preemption_deferred_critical_count =
                 s.preemption_deferred_critical_count.wrapping_add(1)
@@ -1376,6 +1377,7 @@ fn defer_critical(task: Task, ticks: u64, preemptible: bool) -> bool {
         return true;
     }
     if !preemptible {
+        super::worker_observation::deferred(rip, ticks, false);
         change(|s| {
             s.preemption_deferred_kernel_ip_count =
                 s.preemption_deferred_kernel_ip_count.wrapping_add(1)
@@ -1407,7 +1409,7 @@ pub fn preempt_pending(preemptible: bool) -> bool {
     let ticks = since(tick(), view(running).last_scheduled_tick);
     change(|s| s.preemption_eligible_tick_count = s.preemption_eligible_tick_count.wrapping_add(1));
     mutate(10, running, 0, 0);
-    if defer_critical(running, ticks, preemptible) {
+    if defer_critical(running, ticks, preemptible, 0) {
         return false;
     }
     change(|s| {
@@ -1586,7 +1588,7 @@ pub(crate) fn idle_entry_still_empty() -> bool {
     refill_ready();
     !due && !pi_pending && ready_count() == 0 && idle_switch_complete(index)
 }
-fn timer_preemption(now: u64, preemptible: bool) -> bool {
+fn timer_preemption(now: u64, preemptible: bool, rip: u64) -> bool {
     change(|s| {
         s.preemption_simulation_tick_count = s.preemption_simulation_tick_count.wrapping_add(1)
     });
@@ -1637,7 +1639,7 @@ fn timer_preemption(now: u64, preemptible: bool) -> bool {
         s.preemption_eligible_tick_count = s.preemption_eligible_tick_count.wrapping_add(1);
     });
     mutate(10, running, 0, 0);
-    if defer_critical(running, ticks, preemptible) {
+    if defer_critical(running, ticks, preemptible, rip) {
         return false;
     }
     let index = percpu::current_index() as usize;
@@ -1693,6 +1695,9 @@ fn warnings(now: u64) {
     }
 }
 pub fn on_tick(now: u64, preemptible: bool, secondary: bool) -> bool {
+    on_tick_from_irq(now, preemptible, secondary, 0)
+}
+pub(crate) fn on_tick_from_irq(now: u64, preemptible: bool, secondary: bool, rip: u64) -> bool {
     if secondary && !enabled() {
         return false;
     }
@@ -1716,7 +1721,7 @@ pub fn on_tick(now: u64, preemptible: bool, secondary: bool) -> bool {
     unsafe {
         super::mutex_pi::pump();
     }
-    let result = timer_preemption(now, preemptible);
+    let result = timer_preemption(now, preemptible, rip);
     warnings(now);
     result
 }

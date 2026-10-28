@@ -35,7 +35,7 @@ pub unsafe fn dispatch(frame: *const InterruptFrame) {
         crate::sched::fpu_observation::timer(rip);
     }
     if runtime::current_cpu() != 0 && irq == 0 {
-        let preempt = scheduler::on_tick(timer::tick_count(), preemptible, true);
+        let preempt = scheduler::on_tick_from_irq(timer::tick_count(), preemptible, true, rip);
         eoi();
         if preempt {
             scheduler::preempt_timer_from_irq(rip);
@@ -47,8 +47,12 @@ pub unsafe fn dispatch(frame: *const InterruptFrame) {
     let mut preempt = false;
     match irq {
         0 => {
-            preempt =
-                scheduler::on_tick(timer::r4os_rust_timer_control(4, 0, 0), preemptible, false);
+            preempt = scheduler::on_tick_from_irq(
+                timer::r4os_rust_timer_control(4, 0, 0),
+                preemptible,
+                false,
+                rip,
+            );
             wake_checkpoint = scheduler::wakeup_checkpoint();
         }
         1 | 12 => {

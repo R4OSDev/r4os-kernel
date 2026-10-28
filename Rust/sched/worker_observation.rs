@@ -23,6 +23,20 @@ const RECEIPTS: usize = 16;
 // supported ATA PIO. Observe its actual return; the default all/127 controller
 // keeps its original deadline. No extra job is sampled by this expiry wait.
 const WINDOW_TICKS: u64 = 30_000;
+const DEFERRED_RECEIPTS: usize = 16;
+#[derive(Clone, Copy)]
+struct Deferred {
+    task: u32,
+    generation: u64,
+    scheduled: u64,
+    age_ticks: u64,
+    rip: u64,
+    cpu: u32,
+    critical: bool,
+    priority: u32,
+    role: u32,
+    name: [u8; 24],
+}
 #[derive(Clone, Copy)]
 pub(crate) struct Stamp {
     sequence: u64,
@@ -51,6 +65,10 @@ struct State {
     end_cpus: [u64; KINDS],
     records: [[Option<Receipt>; RECEIPTS]; KINDS],
     invalid: u64,
+    deferred: [Option<Deferred>; DEFERRED_RECEIPTS],
+    deferred_tail: Option<Deferred>,
+    deferred_last: Option<(u32, u64, u64, u64)>,
+    deferred_overflow: u64,
 }
 impl State {
     const EMPTY: Self = Self {
@@ -63,6 +81,10 @@ impl State {
         end_cpus: [0; KINDS],
         records: [[None; RECEIPTS]; KINDS],
         invalid: 0,
+        deferred: [None; DEFERRED_RECEIPTS],
+        deferred_tail: None,
+        deferred_last: None,
+        deferred_overflow: 0,
     };
 }
 struct Cell(UnsafeCell<State>);
@@ -71,6 +93,63 @@ struct Cell(UnsafeCell<State>);
 unsafe impl Sync for Cell {}
 static DATA: Cell = Cell(UnsafeCell::new(State::EMPTY));
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Only an actually eligible, deferred timer switch supplies a nonzero RIP.
+/// Caller already holds the IRQ runtime owner. The original WORKERS window
+/// is the sole opt-in; no clock, allocation, formatter or callback runs here.
+pub(crate) fn deferred(rip: u64, ticks: u64, critical: bool) {
+    if ticks < 250 || rip == 0 || !ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let task = scheduler::current();
+    if task.is_null() || percpu::current_index() != 0 {
+        return;
+    }
+    unsafe {
+        let core = registry::core(task.cast());
+        if (*core).cpu_idle || (*core).generation == 0 {
+            return;
+        }
+        let state = &mut *DATA.0.get();
+        if let Some((id, generation, scheduled, age)) = state.deferred_last
+            && id == (*core).id
+            && generation == (*core).generation
+            && scheduled == (*core).last_scheduled_tick
+            && ticks < age.saturating_add(50)
+        {
+            return;
+        }
+        let mut row = Deferred {
+            task: (*core).id,
+            generation: (*core).generation,
+            scheduled: (*core).last_scheduled_tick,
+            age_ticks: ticks,
+            rip,
+            cpu: percpu::current_index(),
+            critical,
+            priority: (*core).priority as u32,
+            role: (*core).role as u32,
+            name: [0; 24],
+        };
+        let name = (*core).name;
+        let n = name.len.min(row.name.len());
+        if n != 0 {
+            core::ptr::copy_nonoverlapping(name.pointer, row.name.as_mut_ptr(), n);
+        }
+        state.deferred_last = Some((row.task, row.generation, row.scheduled, row.age_ticks));
+        if let Some(slot) = state.deferred.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(row);
+        } else {
+            state.deferred_overflow = state.deferred_overflow.saturating_add(1);
+            if state
+                .deferred_tail
+                .is_none_or(|old| row.age_ticks > old.age_ticks)
+            {
+                state.deferred_tail = Some(row);
+            }
+        }
+    }
+}
 
 pub(crate) fn begin(kind: usize, owner: u32, owner_generation: u64, key: u64) -> Option<Stamp> {
     if !ACTIVE.load(Ordering::Acquire) {
@@ -238,6 +317,38 @@ pub(crate) fn run() -> Option<bool> {
         }
     }
     ok &= union.count_ones() >= 2;
+    for (index, row) in state
+        .deferred
+        .into_iter()
+        .chain([state.deferred_tail])
+        .enumerate()
+    {
+        let Some(row) = row else { continue };
+        let n = row
+            .name
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(row.name.len());
+        let mut line = Line::<384>::new();
+        let _ = write!(
+            line,
+            "DEFER59 window={} index={} task={}/{} name={} cpu={} scheduled={} age-ticks={} rip={:016X} critical={} priority={} role={} overflow={} scope=eligible-timer-defer-not-isolated-cpu-time\r\n",
+            sequence,
+            index,
+            row.task,
+            row.generation,
+            core::str::from_utf8(&row.name[..n]).unwrap_or("?"),
+            row.cpu,
+            row.scheduled,
+            row.age_ticks,
+            row.rip,
+            row.critical,
+            row.priority,
+            row.role,
+            state.deferred_overflow
+        );
+        line.emit();
+    }
     let mut line = Line::<192>::new();
     let _ = write!(
         line,
