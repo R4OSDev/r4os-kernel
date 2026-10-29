@@ -626,14 +626,22 @@ fn configure_desk() {
         gui_activity_wait: super::platform_callbacks::desk_gui_activity_wait as *const () as usize,
         gui_activity_notify: super::platform_callbacks::desk_gui_activity_notify as *const ()
             as usize,
+        gui_pointer_capture_info: super::gui_pointer::info as *const () as usize,
+        gui_pointer_capture_acquire: super::gui_pointer::acquire as *const () as usize,
+        gui_pointer_capture_release: super::gui_pointer::release as *const () as usize,
+        gui_pointer_capture_host: super::gui_pointer::host as *const () as usize,
         ..Default::default()
     };
     DESK.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Desk>() == 584);
+    assert!(mem::size_of::<c::R4XStartR4Desk>() == 616);
     assert!(mem::offset_of!(c::R4XStartR4Desk, gui_activity_wait) == 568);
     assert!(mem::offset_of!(c::R4XStartR4Desk, gui_activity_notify) == 576);
+    assert!(mem::offset_of!(c::R4XStartR4Desk, gui_pointer_capture_info) == 584);
+    assert!(mem::offset_of!(c::R4XStartR4Desk, gui_pointer_capture_acquire) == 592);
+    assert!(mem::offset_of!(c::R4XStartR4Desk, gui_pointer_capture_release) == 600);
+    assert!(mem::offset_of!(c::R4XStartR4Desk, gui_pointer_capture_host) == 608);
     assert!(mem::offset_of!(c::R4XStartR4Desk, console_text_info) == 552);
     assert!(mem::offset_of!(c::R4XStartR4Desk, console_set_encoding) == 560);
     assert!(mem::offset_of!(c::R4XStartR4Desk, console_read_events) == 536);

@@ -268,6 +268,7 @@ pub unsafe extern "C" fn r4os_rust_program_api_window(
     by_handle: bool,
 ) -> i32 {
     unsafe {
+        let source = context::handle().unwrap_or_default();
         if by_handle {
             if handle.is_null() || !registry::valid(handle.read()) {
                 return -1;
@@ -309,11 +310,25 @@ pub unsafe extern "C" fn r4os_rust_program_api_window(
             let _guard = Guard::acquire(0);
             let old = AtomicI32::from_ptr(ptr::addr_of_mut!((*gui).window_id))
                 .swap(value, Ordering::AcqRel);
+            let before_pointer = super::gui_pointer::revision();
+            let owner = Handle {
+                instance_id: lease.0.id,
+                reserved: 0,
+                generation: lease.0.generation,
+            };
+            super::gui_pointer::associate(gui, owner, old, value, source);
+            let pointer_changed = before_pointer != super::gui_pointer::revision();
             (*gui).window_info.window_id = value;
             AtomicBool::from_ptr(ptr::addr_of_mut!((*gui).start_attach_pending))
                 .store(false, Ordering::Release);
             if old != value {
                 registry::epoch();
+            }
+            drop(_guard);
+            drop(_registry);
+            if pointer_changed {
+                super::gui_activity::signal(gui);
+                crate::service::desktop_events::r4os_rust_desktop_signal();
             }
             0
         } else {
@@ -340,9 +355,23 @@ pub unsafe extern "C" fn r4os_rust_program_api_window(
             let _guard = Guard::acquire(0);
             let old = AtomicI32::from_ptr(ptr::addr_of_mut!((*gui).window_id))
                 .swap(value, Ordering::AcqRel);
+            let before_pointer = super::gui_pointer::revision();
+            let owner = Handle {
+                instance_id: lease.0.id,
+                reserved: 0,
+                generation: lease.0.generation,
+            };
+            super::gui_pointer::associate(gui, owner, old, value, source);
+            let pointer_changed = before_pointer != super::gui_pointer::revision();
             (*gui).window_info.window_id = value;
             if old != value {
                 registry::epoch();
+            }
+            drop(_guard);
+            drop(_registry);
+            if pointer_changed {
+                super::gui_activity::signal(gui);
+                crate::service::desktop_events::r4os_rust_desktop_signal();
             }
             0
         }

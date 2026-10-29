@@ -6,7 +6,7 @@ use super::{
     registry_state, registry_types::ProgramInstance, threads,
 };
 use crate::{
-    contract::{GuiEvent as Event, GuiSize, GuiWindowInfo as WindowInfo},
+    contract::{self as c, GuiEvent as Event, GuiSize, GuiWindowInfo as WindowInfo},
     memory::owner::Guard,
     sched::sync_locks,
 };
@@ -108,6 +108,7 @@ pub(super) unsafe fn find_move(gui: *const t::Gui) -> Option<usize> {
 }
 pub(super) unsafe fn remove(gui: *mut t::Gui, index: usize) {
     unsafe {
+        super::gui_pointer::removed(gui, index);
         let mut index = index;
         loop {
             let next = (index + 1) % 64;
@@ -133,12 +134,23 @@ pub(super) unsafe fn pending(gui: *const t::Gui) -> u32 {
             64 - (*gui).event_head + (*gui).event_tail
         })
         .expect("GUI queued events")
+            + super::gui_pointer::pending(gui)
     }
 }
 pub(super) unsafe fn enqueue(gui: *mut t::Gui, event: *const Event) -> i32 {
+    let event = unsafe { event.read() };
+    let guard = Guard::acquire(0);
+    let result = unsafe { enqueue_locked(gui, event) };
+    drop(guard);
+    if result == 0 {
+        unsafe {
+            super::gui_activity::signal(gui);
+        }
+    }
+    result
+}
+pub(super) unsafe fn enqueue_locked(gui: *mut t::Gui, event: Event) -> i32 {
     unsafe {
-        let event = event.read();
-        let guard = Guard::acquire(0);
         (*state()).push_attempts = (*state()).push_attempts.wrapping_add(1);
         if event.kind == 5
             && let Some(index) = find_move(gui)
@@ -163,8 +175,6 @@ pub(super) unsafe fn enqueue(gui: *mut t::Gui, event: *const Event) -> i32 {
         if pending > (*gui).event_high_water {
             (*gui).event_high_water = pending;
         }
-        drop(guard);
-        super::gui_activity::signal(gui);
         0
     }
 }
@@ -252,6 +262,7 @@ pub unsafe extern "C" fn r4os_rust_program_gui_window_info(out: *mut WindowInfo)
 pub unsafe extern "C" fn r4os_rust_program_gui_window_set(id: u32, info: *const WindowInfo) -> i32 {
     unsafe {
         process::r4os_rust_program_process_signal();
+        let source = context::handle().unwrap_or_default();
         let Some(lease) = Lease::id(id) else {
             return -1;
         };
@@ -266,6 +277,16 @@ pub unsafe extern "C" fn r4os_rust_program_gui_window_set(id: u32, info: *const 
         let value = info.read();
         let guard = Guard::acquire(0);
         let previous = (*gui).window_info;
+        let before_pointer = super::gui_pointer::revision();
+        let owner = c::ProgramProcessHandle {
+            instance_id: lease.0.id,
+            reserved: 0,
+            generation: lease.0.generation,
+        };
+        let old = AtomicI32::from_ptr(ptr::addr_of_mut!((*gui).window_id)).load(Ordering::Acquire);
+        super::gui_pointer::associate(gui, owner, old, value.window_id, source);
+        super::gui_pointer::visibility(gui, owner, value.flags);
+        let pointer_changed = before_pointer != super::gui_pointer::revision();
         let changed = previous.window_id != value.window_id
             || previous.frame_x != value.frame_x
             || previous.frame_y != value.frame_y
@@ -282,8 +303,11 @@ pub unsafe extern "C" fn r4os_rust_program_gui_window_set(id: u32, info: *const 
         drop(guard);
         // Hidden hosted windows also wait here. A real geometry/visibility
         // change belongs to this instance; repeated desktop snapshots do not.
-        if changed {
+        if changed || pointer_changed {
             super::gui_activity::signal(gui);
+        }
+        if pointer_changed {
+            crate::service::desktop_events::r4os_rust_desktop_signal();
         }
         0
     }
@@ -305,9 +329,13 @@ pub unsafe extern "C" fn r4os_rust_program_gui_event_poll(out: *mut Event) -> i3
         }
         let guard = Guard::acquire(0);
         let mut event = Event::default();
-        let available = (*gui).event_head != (*gui).event_tail;
-        if available {
+        let notice = super::gui_pointer::poll(gui);
+        let available = notice.is_some() || (*gui).event_head != (*gui).event_tail;
+        if let Some(value) = notice {
+            event = value;
+        } else if available {
             event = (*gui).events[(*gui).event_head];
+            super::gui_pointer::removed(gui, (*gui).event_head);
             (*gui).event_head = ((*gui).event_head + 1) % 64;
         }
         drop(guard);
@@ -331,6 +359,18 @@ pub unsafe extern "C" fn r4os_rust_program_gui_event_push(id: u32, event: *const
         let gui = process_data::ensure_gui(instance);
         if gui.is_null() {
             return -3;
+        }
+        let value = event.read();
+        if value.kind == c::GuiEventKind::focus_gained.0
+            || value.kind == c::GuiEventKind::focus_lost.0
+        {
+            let source = context::handle().unwrap_or_default();
+            let owner = c::ProgramProcessHandle {
+                instance_id: lease.0.id,
+                reserved: 0,
+                generation: lease.0.generation,
+            };
+            super::gui_pointer::focus(instance, owner, value, source);
         }
         enqueue(gui, event)
     }

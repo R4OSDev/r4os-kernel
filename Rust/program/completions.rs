@@ -94,6 +94,7 @@ unsafe fn consume(handle: Handle, out: *mut Completion) -> i32 {
 pub(super) unsafe fn orphan(handle: Handle) {
     unsafe {
         super::observations::orphan(handle);
+        super::gui_pointer::orphan(handle);
     }
     loop {
         if !registry::lock() {

@@ -256,16 +256,29 @@ pub fn stats() -> Stats {
 pub fn snapshot_for_api() -> State {
     poll_usb();
     let l = limits();
-    state(|s| {
-        let mut out = bounded(s.state, l);
-        let latched = s.button_press_latch;
-        if latched != 0 {
-            out.buttons |= latched;
-            s.button_press_latch = 0;
-        }
-        s.state.wheel = 0;
-        out
-    })
+    state(|s| api_state(s, l))
+}
+fn api_state(s: &mut Runtime, bounds: (i32, i32)) -> State {
+    let mut out = bounded(s.state, bounds);
+    let latched = s.button_press_latch;
+    if latched != 0 {
+        out.buttons |= latched;
+        s.button_press_latch = 0;
+    }
+    s.state.wheel = 0;
+    out
+}
+/// One exact consuming input sample, including its preclamp totals. Drivers
+/// publish both under LOCK; no packet can cross this snapshot boundary.
+pub fn motion_snapshot_for_api() -> (State, u64) {
+    poll_usb();
+    let bounds = limits();
+    state(|s| (api_state(s, bounds), MOTION_TOTALS.load(Ordering::Relaxed)))
+}
+/// Nonconsuming capture baseline: no USB poll, press-latch consumption, wheel
+/// reset, cursor warp, display call or synthetic motion.
+pub(crate) fn capture_snapshot() -> (State, u64) {
+    state(|s| (s.state, MOTION_TOTALS.load(Ordering::Relaxed)))
 }
 pub fn inject(dx: i32, dy: i32, buttons: u8, wheel: i32) {
     let (x, y) = limits();

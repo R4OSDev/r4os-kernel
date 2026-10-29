@@ -116,8 +116,18 @@ pub unsafe fn mouse_motion(out: *mut a::MouseMotion) -> i32 {
         motion_x: 0,
         motion_y: 0,
     };
-    unsafe { mouse_state(&mut value.mouse) };
-    let totals = mouse::motion_totals();
+    let (sample, totals) = mouse::motion_snapshot_for_api();
+    value.mouse = a::Mouse {
+        x: sample.x,
+        y: sample.y,
+        dx: sample.dx,
+        dy: sample.dy,
+        wheel: sample.wheel,
+        buttons: sample.buttons,
+        present: u8::from(sample.present),
+        reserved: 0,
+        packets: sample.packets,
+    };
     value.motion_x = totals as u32;
     value.motion_y = (totals >> 32) as u32;
     unsafe { out.write(value) };
