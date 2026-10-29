@@ -24,6 +24,28 @@ unsafe fn valid(type_id: u8, data: *const c_void, owner: u32) -> bool {
 unsafe fn free(type_id: u8, data: *mut c_void, owner: u32) -> bool {
     unsafe { payload::r4os_rust_program_payload_release(type_id, data, owner, u16::from(type_id)) }
 }
+/// Construct the same empty console hierarchy for eager CUI admission or a
+/// GUI's first stdout/stderr write. Neither path allocates an output block yet.
+pub(super) unsafe fn allocate_console(owner: u32) -> *mut t::Console {
+    unsafe {
+        let console = payload::r4os_rust_program_payload_allocate(4, owner, 4).cast::<t::Console>();
+        if console.is_null() {
+            return ptr::null_mut();
+        }
+        let transcript = payload::r4os_rust_program_payload_allocate(11, owner, 11).cast::<t::ConsoleTranscript>();
+        if transcript.is_null() {
+            assert!(payload::r4os_rust_program_payload_release(
+                4,
+                console.cast(),
+                owner,
+                4
+            ));
+            return ptr::null_mut();
+        }
+        (*console).transcript_payload = transcript;
+        console
+    }
+}
 pub(super) unsafe fn valid_transaction(owner: u32, storage: *const t::InstanceStorage) -> bool {
     unsafe {
         let mut result = true;
@@ -194,21 +216,13 @@ pub(super) unsafe fn allocate(
         }
         match class {
             0 => {
-                let console =
-                    payload::r4os_rust_program_payload_allocate(4, owner, 4).cast::<t::Console>();
+                let console = allocate_console(owner);
                 if console.is_null() {
                     stat(mem::offset_of!(t::Stats, transaction_rollbacks));
                     rollback(owner, &mut storage);
                     return None;
                 }
                 storage.console = console;
-                (*console).transcript_payload =
-                    payload::r4os_rust_program_payload_allocate(11, owner, 11).cast();
-                if (*console).transcript_payload.is_null() {
-                    stat(mem::offset_of!(t::Stats, transaction_rollbacks));
-                    rollback(owner, &mut storage);
-                    return None;
-                }
             }
             1 => {
                 storage.gui = payload::r4os_rust_program_payload_allocate(6, owner, 6).cast();
@@ -267,6 +281,7 @@ pub(super) unsafe fn detach(
             (*completion).output_payload = transcript.cast();
             (*completion).output_length = (*transcript).output_len;
             (*completion).output_revision = (*console).revision;
+            (*completion).flags |= (*console).capture_flags;
             if (*completion).output_length != 0 {
                 (*completion).flags |= contract::program_completion_flag_output;
             }

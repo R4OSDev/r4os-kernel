@@ -44,6 +44,8 @@ pub struct Shared {
     pub next_growth_failure: bool,
     pub generation_exhausted: bool,
     pub reaper_started: bool,
+    pub observation_head: *mut ProgramObservationNode,
+    pub next_observation_id: u64,
 }
 const fn initial_stats() -> ProgramRegistryStats {
     // Integer/bool-only snapshot record, including explicit C padding.
@@ -92,6 +94,8 @@ static STATE: Cell<Shared> = Cell::new(Shared {
     next_growth_failure: false,
     generation_exhausted: false,
     reaper_started: false,
+    observation_head: ptr::null_mut(),
+    next_observation_id: 1,
 });
 pub fn state() -> *mut Shared {
     STATE.get()
@@ -103,7 +107,7 @@ pub extern "C" fn r4os_rust_program_registry_state() -> *mut Shared {
     state()
 }
 const _: () = {
-    assert!(core::mem::size_of::<Shared>() == 152);
+    assert!(core::mem::size_of::<Shared>() == 168);
     assert!(core::mem::offset_of!(Shared, epoch) == 48);
     assert!(core::mem::offset_of!(Shared, next_generation) == 64);
     assert!(core::mem::offset_of!(Shared, failure_cursor) == 136);

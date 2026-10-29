@@ -209,6 +209,10 @@ fn configure_sys() {
             as usize,
         program_lifecycle_programs: super::inventory::r4os_rust_program_lifecycle_programs
             as *const () as usize,
+        program_observation_retain: super::observations::retain as *const () as usize,
+        program_observation_wait: super::observations::wait as *const () as usize,
+        program_observation_read: super::observations::read as *const () as usize,
+        program_observation_release: super::observations::release as *const () as usize,
         directory_batch: crate::program::system::directory::r4os_rust_sys_directory_batch
             as *const () as usize,
         drive_info_geometry: crate::program::system::directory::r4os_rust_sys_drive_info_geometry
@@ -322,7 +326,11 @@ fn configure_sys() {
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1336);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1368);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, program_observation_retain) == 1336);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, program_observation_wait) == 1344);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, program_observation_read) == 1352);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, program_observation_release) == 1360);
     assert!(mem::offset_of!(c::R4XStartR4Sys, drive_info_geometry) == 1320);
     assert!(mem::offset_of!(c::R4XStartR4Sys, directory_batch) == 1328);
     assert!(mem::size_of::<c::DirectoryBatchCursor>() == 2160);

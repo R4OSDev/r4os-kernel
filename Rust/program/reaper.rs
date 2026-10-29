@@ -251,12 +251,16 @@ pub unsafe extern "C" fn r4os_rust_program_reap_slot(slot: *mut ProgramRegistryS
         (*current).completion = ptr::null_mut();
         (*node).slot_attached = false;
         (*node).flags |= 1;
+        if (*node).retain_output {
+            (*node).flags |= crate::contract::program_completion_flag_output_available;
+        }
         (*node).state = 2;
         let stats = (*state()).stats;
         if (*stats).completion_pending != 0 {
             (*stats).completion_pending -= 1;
         }
-        let auto_consume = if (*node).owner {
+        let observed = (*node).observation_refs != 0;
+        let auto_consume = if (*node).owner || observed {
             (*stats).completion_ready = (*stats).completion_ready.wrapping_add(1);
             false
         } else {
@@ -266,6 +270,9 @@ pub unsafe extern "C" fn r4os_rust_program_reap_slot(slot: *mut ProgramRegistryS
         };
         registry::clear_slot(current);
         registry::unlock();
+        if observed {
+            super::observations::signal();
+        }
         program_reap_report(report, 7);
         if auto_consume {
             completions::release(node);

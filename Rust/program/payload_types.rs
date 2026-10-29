@@ -97,6 +97,7 @@ pub struct Console {
     pub input_queue: [u32; 4096],
     pub input_pending_bytes: u32,
     pub text: r4os_text_core::Output,
+    pub capture_flags: u32,
 }
 
 #[repr(C)]
@@ -473,6 +474,7 @@ pub unsafe fn initialize(kind: u8, memory: *mut u8) {
                 ptr::addr_of_mut!((*payload).input_wait).write(WaitQueue::EMPTY);
                 ptr::addr_of_mut!((*payload).state).write(contract::ConsoleState::default());
                 ptr::addr_of_mut!((*payload).text).write(r4os_text_core::Output::EMPTY);
+                ptr::addr_of_mut!((*payload).capture_flags).write(0);
             }
             5 => {
                 let payload = memory.cast::<ConsoleOutput>();
@@ -688,7 +690,8 @@ const _: () = {
     assert!(mem::offset_of!(ConsoleTranscript, output_len) == 6164);
     assert!(mem::offset_of!(ConsoleTranscript, segments) == 0);
     assert!(mem::offset_of!(Console, text) == 16700);
-    assert!(mem::size_of::<Console>() == 16728);
+    assert!(mem::size_of::<Console>() == 16736);
+    assert!(mem::offset_of!(Console, capture_flags) == 16728);
     assert!(mem::align_of::<Console>() == 8);
     assert!(mem::offset_of!(Console, header) == 216);
     assert!(mem::offset_of!(Console, transcript_payload) == 0);

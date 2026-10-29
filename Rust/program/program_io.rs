@@ -79,6 +79,8 @@ pub(super) unsafe fn output(stream: u32, data: Bytes) {
         if percpu::current_index() == 0 {
             let capture = CAPTURE.0.get();
             if (*capture).present && scheduler::current() == (*capture).owner {
+                // This exclusive foreground capture is not the retained
+                // handle transcript; OutputAvailable stays unset for it.
                 for &ch in data_bytes {
                     if ch == b'\n' {
                         capture_byte(b'\r');
@@ -95,6 +97,7 @@ pub(super) unsafe fn output(stream: u32, data: Bytes) {
         }
         let instance = context::current();
         if !instance.is_null() {
+            super::observations::output_incomplete(instance);
             for &ch in data_bytes {
                 if ch == b'\n' {
                     smoke(instance, stream, b'\r');

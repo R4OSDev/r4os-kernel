@@ -18,7 +18,7 @@ use core::{
     ptr, slice,
     sync::atomic::{AtomicBool, Ordering},
 };
-const CAPACITY: usize = 16384;
+pub(super) const CAPACITY: usize = 16384;
 #[repr(C)]
 pub struct State {
     pub write_calls: u64,
@@ -417,6 +417,7 @@ unsafe fn drop_prefix(instance: *mut ProgramInstance, count: usize) {
         let actual = dropped - remaining;
         if actual != 0 {
             let console = payload::console(instance);
+            (*console).capture_flags |= contract::program_completion_flag_output_truncated;
             (*console).state.output_dropped_bytes = (*console)
                 .state
                 .output_dropped_bytes
@@ -780,6 +781,9 @@ unsafe fn clear_state(instance: *mut ProgramInstance) {
         if transcript.is_null() {
             return;
         }
+        if (*transcript).output_len != 0 {
+            (*console).capture_flags |= contract::program_completion_flag_output_incomplete;
+        }
         release_segments(transcript, true);
         (*console).state.clear_count = (*console).state.clear_count.wrapping_add(1);
         (*console).state.output_len = 0;
@@ -821,6 +825,7 @@ unsafe fn backspace(instance: *mut ProgramInstance) {
         while length < count && r4os_text_core::continuation(tail[count - length]) {
             length += 1;
         }
+        (*console).capture_flags |= contract::program_completion_flag_output_incomplete;
         for _ in 0..length {
             let tail =
                 ptr::addr_of_mut!((*transcript).segments[(*transcript).segment_count as usize - 1]);
@@ -873,6 +878,8 @@ unsafe fn emit(
             return;
         }
         let Some(stored) = source_byte(source, ch) else {
+            (*payload::console(source)).capture_flags |=
+                contract::program_completion_flag_output_incomplete;
             return;
         };
         let appended = append_reference(
@@ -884,6 +891,9 @@ unsafe fn emit(
         if appended {
             stream_count(source, stream);
             *source_changed = true;
+        } else {
+            (*payload::console(source)).capture_flags |=
+                contract::program_completion_flag_output_incomplete;
         }
         if !target.is_null() {
             if target == source {
@@ -893,6 +903,9 @@ unsafe fn emit(
                 if shown {
                     stream_count(target, stream);
                     *target_changed = true;
+                } else {
+                    (*payload::console(target)).capture_flags |=
+                        contract::program_completion_flag_output_incomplete;
                 }
                 if appended && shown {
                     add!(shared_bytes, 1);
@@ -976,6 +989,12 @@ unsafe fn emit_scalar(
             return;
         };
         if !matches!(scalar, 8 | 12) && ensure_writer(source, text.len()).is_null() {
+            (*payload::console(source)).capture_flags |=
+                contract::program_completion_flag_output_incomplete;
+            if !target.is_null() && target != source {
+                (*payload::console(target)).capture_flags |=
+                    contract::program_completion_flag_output_incomplete;
+            }
             return;
         }
         for &byte in text.as_bytes() {
@@ -1031,11 +1050,29 @@ unsafe fn route_instance(
     finish: bool,
 ) -> bool {
     unsafe {
-        if source.is_null() || (*source).app_class != 0 || (*source).console_payload.is_null() {
+        if source.is_null() {
+            return false;
+        }
+        if !matches!((*source).app_class, 0 | 1) {
+            return false;
+        }
+        let gui_output = (*source).app_class == 1;
+        if gui_output {
+            // Silent GUI applications keep no console allocation. Captured
+            // stdout/stderr is separate from their R4DRAW frame/presentation.
+            if finish && (*source).console_payload.is_null() {
+                return true;
+            }
+            if super::process_data::ensure_console(source).is_null() {
+                super::observations::output_incomplete(source);
+                return true;
+            }
+        }
+        if (*source).console_payload.is_null() {
             return false;
         }
         let console = payload::console(source);
-        let inherited = (*console).io_target_id != 0;
+        let inherited = !gui_output && (*console).io_target_id != 0;
         let lease = if inherited {
             Lease::handle(contract::ProgramProcessHandle {
                 instance_id: (*console).io_target_id,
@@ -1045,7 +1082,9 @@ unsafe fn route_instance(
         } else {
             None
         };
-        let target = if inherited {
+        let target = if gui_output {
+            source
+        } else if inherited {
             match lease.as_ref() {
                 Some(pin) if (*pin.0.instance).app_class == 0 => pin.0.instance,
                 _ => ptr::null_mut(),
@@ -1132,7 +1171,7 @@ unsafe fn route_instance(
             }
             if target == source {
                 if source_changed || target_changed {
-                    revision(source, true, true);
+                    revision(source, !gui_output, true);
                 }
             } else {
                 if source_changed {

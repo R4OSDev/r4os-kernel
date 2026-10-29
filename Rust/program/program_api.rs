@@ -417,7 +417,7 @@ unsafe fn copy_completion_snapshot(
     out_read: *mut u32,
 ) -> i32 {
     unsafe {
-        let mut resident = [0u8; 16384];
+        let mut resident = [0u8; console::CAPACITY];
         let count = {
             let Some(_guard) = Registry::acquire() else {
                 return -5;
@@ -430,7 +430,7 @@ unsafe fn copy_completion_snapshot(
                 return -5;
             }
             let transcript = (*node).output_payload.cast::<t::ConsoleTranscript>();
-            if transcript.is_null() || (*node).flags & 2 == 0 {
+            if (*node).flags & c::program_completion_flag_output_available == 0 {
                 return -12;
             }
             let start = offset as usize;
@@ -439,6 +439,9 @@ unsafe fn copy_completion_snapshot(
                 return -13;
             }
             let count = (capacity as usize).min(len - start);
+            if count != 0 && transcript.is_null() {
+                return -12;
+            }
             if count != 0
                 && console::r4os_rust_program_console_read(
                     transcript,

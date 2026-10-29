@@ -40,6 +40,48 @@ pub(super) unsafe fn ensure_environment(instance: *mut ProgramInstance) -> *mut 
         environment
     }
 }
+/// Publish one fully initialized console hierarchy. Output locking protects
+/// subsequent transcript writes; allocation never runs under the data owner.
+pub(super) unsafe fn ensure_console(instance: *mut ProgramInstance) -> *mut t::Console {
+    unsafe {
+        let guard = Guard::acquire(0);
+        let existing = (*instance).console_payload;
+        drop(guard);
+        if !existing.is_null() {
+            return existing.cast();
+        }
+        let Some(_operation) = threads::Operation::enter() else {
+            return ptr::null_mut();
+        };
+        let candidate = super::instance_storage::allocate_console((*instance).id);
+        if candidate.is_null() {
+            return ptr::null_mut();
+        }
+        let guard = Guard::acquire(0);
+        let chosen = if (*instance).console_payload.is_null() {
+            candidate.cast()
+        } else {
+            (*instance).console_payload
+        };
+        (*instance).console_payload = chosen;
+        drop(guard);
+        if chosen != candidate.cast() {
+            assert!(payload::r4os_rust_program_payload_release(
+                11,
+                (*candidate).transcript_payload.cast(),
+                (*instance).id,
+                11
+            ));
+            assert!(payload::r4os_rust_program_payload_release(
+                4,
+                candidate.cast(),
+                (*instance).id,
+                4
+            ));
+        }
+        chosen.cast()
+    }
+}
 pub(super) unsafe fn ensure_gui(instance: *mut ProgramInstance) -> *mut t::Gui {
     unsafe {
         let guard = Guard::acquire(0);

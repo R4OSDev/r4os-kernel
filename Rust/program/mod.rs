@@ -39,6 +39,7 @@ pub mod memory;
 pub mod network_api;
 pub mod network_projection;
 pub mod notifications;
+pub mod observations;
 pub mod payload;
 pub mod payload_types;
 pub mod peer_lifetime;

@@ -5,7 +5,7 @@ use super::{registry, registry_state::state, registry_types::*};
 use crate::contract::{ProgramProcessCompletion as Completion, ProgramProcessHandle as Handle};
 use core::ptr;
 
-unsafe fn record(node: *const ProgramCompletionNode) -> Completion {
+pub(super) unsafe fn record(node: *const ProgramCompletionNode) -> Completion {
     unsafe {
         Completion {
             handle: (*node).handle,
@@ -76,17 +76,25 @@ unsafe fn consume(handle: Handle, out: *mut Completion) -> i32 {
         if !out.is_null() {
             out.write(record(node));
         }
-        registry::unlink_completion(node);
+        let retained = (*node).observation_refs != 0;
+        if !retained {
+            registry::unlink_completion(node);
+        }
         (*node).state = 3;
         if (*(*state()).stats).completion_ready != 0 {
             (*(*state()).stats).completion_ready -= 1;
         }
         registry::unlock();
-        release(node);
+        if !retained {
+            release(node);
+        }
     }
     0
 }
 pub(super) unsafe fn orphan(handle: Handle) {
+    unsafe {
+        super::observations::orphan(handle);
+    }
     loop {
         if !registry::lock() {
             return;
@@ -105,12 +113,17 @@ pub(super) unsafe fn orphan(handle: Handle) {
                 (*node).flags &= !8;
                 changed = true;
                 if (*node).state == 2 {
-                    registry::unlink_completion(node);
+                    let retained = (*node).observation_refs != 0;
+                    if !retained {
+                        registry::unlink_completion(node);
+                    }
                     (*node).state = 3;
                     if (*(*state()).stats).completion_ready != 0 {
                         (*(*state()).stats).completion_ready -= 1;
                     }
-                    reap = node;
+                    if !retained {
+                        reap = node;
+                    }
                 }
                 break;
             }
@@ -136,12 +149,17 @@ unsafe fn abandon(handle: Handle) {
             (*node).owner_handle = Handle::default();
             (*node).flags &= !8;
             if (*node).state == 2 {
-                registry::unlink_completion(node);
+                let retained = (*node).observation_refs != 0;
+                if !retained {
+                    registry::unlink_completion(node);
+                }
                 (*node).state = 3;
                 if (*(*state()).stats).completion_ready != 0 {
                     (*(*state()).stats).completion_ready -= 1;
                 }
-                consumed = node;
+                if !retained {
+                    consumed = node;
+                }
             }
         }
     }
