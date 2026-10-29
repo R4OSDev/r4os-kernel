@@ -10,6 +10,7 @@ pub(crate) mod context;
 pub mod directory;
 mod fs;
 pub mod io;
+pub(crate) mod name_limits;
 pub mod namespace;
 pub mod stream;
 pub mod stream_api;

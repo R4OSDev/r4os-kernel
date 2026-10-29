@@ -34,11 +34,21 @@ pub(crate) fn install_program_providers() {
     MODULE.store(true, Ordering::Release);
 }
 pub(super) unsafe fn resolve(raw: &[u8], out: &mut path::Buffer<1024>) -> Option<Target> {
-    if !path::valid_unicode(raw) || !PATH.load(Ordering::Acquire) {
+    if !path::valid_unicode(raw) {
         return None;
     }
+    unsafe { resolve_checked(raw, out).ok() }
+}
+/// The caller has already validated Unicode and component budgets.
+pub(super) unsafe fn resolve_checked(
+    raw: &[u8],
+    out: &mut path::Buffer<1024>,
+) -> Result<Target, super::super::program_api::ResolveError> {
+    if !PATH.load(Ordering::Acquire) {
+        return Err(super::super::program_api::ResolveError::Invalid);
+    }
     let target = unsafe {
-        super::super::program_api::resolve(
+        super::super::program_api::resolve_detailed(
             crate::fs::vfs_types::Bytes {
                 data: raw.as_ptr(),
                 len: raw.len(),
@@ -46,7 +56,7 @@ pub(super) unsafe fn resolve(raw: &[u8], out: &mut path::Buffer<1024>) -> Option
             out.as_mut_ptr(),
         )
     }?;
-    Some(Target {
+    Ok(Target {
         drive_ref: target.drive,
         path: Bytes {
             data: target.path.data,
@@ -145,6 +155,9 @@ impl PathBuffers {
     }
     pub unsafe fn resolve_copied(&mut self) -> Option<Target> {
         unsafe { resolve(self.raw.initialized(self.len), &mut self.resolved) }
+    }
+    pub unsafe fn resolve_named(&mut self) -> Result<Target, i32> {
+        unsafe { super::name_limits::resolve(self.raw.initialized(self.len), &mut self.resolved) }
     }
     pub unsafe fn resolve(&mut self, input: *const u8) -> Option<Target> {
         if !unsafe { self.copy(input) } {

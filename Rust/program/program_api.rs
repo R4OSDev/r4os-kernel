@@ -33,48 +33,56 @@ pub struct Target {
 fn separator(value: u8) -> bool {
     matches!(value, b'/' | b'\\')
 }
-unsafe fn build(cwd: &[u8], arg: &[u8], out: *mut u8) -> Option<usize> {
+#[derive(Clone, Copy)]
+pub(crate) enum ResolveError {
+    Invalid,
+    TooLong,
+}
+unsafe fn build(cwd: &[u8], arg: &[u8], out: *mut u8) -> Result<usize, ResolveError> {
     unsafe {
         let mut combined = [MaybeUninit::<u8>::uninit(); PATH];
         let data = combined.as_mut_ptr().cast::<u8>();
         let mut len;
         if !arg.is_empty() && separator(arg[0]) {
             if arg.len() > PATH {
-                return None;
+                return Err(ResolveError::TooLong);
             }
             ptr::copy_nonoverlapping(arg.as_ptr(), data, arg.len());
             len = arg.len();
         } else {
             if cwd.len() > PATH {
-                return None;
+                return Err(ResolveError::TooLong);
             }
             ptr::copy_nonoverlapping(cwd.as_ptr(), data, cwd.len());
             len = cwd.len();
             if len > 1 {
                 if len >= PATH {
-                    return None;
+                    return Err(ResolveError::TooLong);
                 }
                 data.add(len).write(b'\\');
                 len += 1;
             }
             if len + arg.len() > PATH {
-                return None;
+                return Err(ResolveError::TooLong);
             }
             ptr::copy_nonoverlapping(arg.as_ptr(), data.add(len), arg.len());
             len += arg.len();
         }
         let mut n = 0;
         if process_data::r4os_rust_program_data_canonical(Bytes { data, len }, out, &mut n) {
-            Some(n)
+            Ok(n)
         } else {
-            None
+            Err(ResolveError::Invalid)
         }
     }
 }
 pub(crate) unsafe fn resolve(raw: Bytes, out: *mut u8) -> Option<Target> {
+    unsafe { resolve_detailed(raw, out).ok() }
+}
+pub(crate) unsafe fn resolve_detailed(raw: Bytes, out: *mut u8) -> Result<Target, ResolveError> {
     unsafe {
         if raw.len == 0 {
-            return None;
+            return Err(ResolveError::Invalid);
         }
         let raw = util::bytes(raw);
         let instance = context::current();
@@ -83,7 +91,7 @@ pub(crate) unsafe fn resolve(raw: Bytes, out: *mut u8) -> Option<Target> {
         let cwd_data = cwd.as_mut_ptr().cast::<u8>();
         let len;
         if !instance.is_null() {
-            let _guard = Registry::acquire()?;
+            let _guard = Registry::acquire().ok_or(ResolveError::Invalid)?;
             let process = payload::process(instance);
             current = (*process).work_drive_letter;
             len = (*process).work_cwd_len;
@@ -98,13 +106,13 @@ pub(crate) unsafe fn resolve(raw: Bytes, out: *mut u8) -> Option<Target> {
         }
         let mut drive = drive::r4os_rust_fs_drive_lookup(1, usize::from(current));
         if drive.is_null() {
-            return None;
+            return Err(ResolveError::Invalid);
         }
         let mut rest = raw;
         if raw.len() >= 2 && raw[1] == b':' && raw[0].is_ascii_alphabetic() {
             drive = drive::r4os_rust_fs_drive_lookup(1, usize::from(raw[0]));
             if drive.is_null() {
-                return None;
+                return Err(ResolveError::Invalid);
             }
             rest = &raw[2..];
         }
@@ -114,7 +122,7 @@ pub(crate) unsafe fn resolve(raw: Bytes, out: *mut u8) -> Option<Target> {
             &(&(*drive).cwd)[..(*drive).cwd_len]
         };
         let len = build(cwd, rest, out)?;
-        Some(Target {
+        Ok(Target {
             drive,
             path: Bytes { data: out, len },
         })
@@ -668,7 +676,7 @@ pub unsafe extern "C" fn r4os_rust_program_api_build(
     len: *mut usize,
 ) -> bool {
     unsafe {
-        let Some(n) = build(util::bytes(cwd), util::bytes(arg), out) else {
+        let Ok(n) = build(util::bytes(cwd), util::bytes(arg), out) else {
             return false;
         };
         len.write(n);

@@ -32,7 +32,8 @@ pub(super) unsafe fn allocate_console(owner: u32) -> *mut t::Console {
         if console.is_null() {
             return ptr::null_mut();
         }
-        let transcript = payload::r4os_rust_program_payload_allocate(11, owner, 11).cast::<t::ConsoleTranscript>();
+        let transcript = payload::r4os_rust_program_payload_allocate(11, owner, 11)
+            .cast::<t::ConsoleTranscript>();
         if transcript.is_null() {
             assert!(payload::r4os_rust_program_payload_release(
                 4,

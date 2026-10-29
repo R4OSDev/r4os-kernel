@@ -3,7 +3,7 @@
 use super::super::registry_format_types::Bytes;
 use super::{
     context::{self as ctx, PathBuffers, Target},
-    fs, path, registry_state, stream, stream_publish as publish, stream_state as s,
+    fs, name_limits, path, registry_state, stream, stream_publish as publish, stream_state as s,
 };
 use crate::contract as c;
 use core::{mem::MaybeUninit, ptr};
@@ -20,16 +20,31 @@ unsafe fn targets(
     inputs: [*const u8; 3],
     invalid: i32,
     bad: i32,
+    precise_names: bool,
 ) -> Result<[Target; 3], i32> {
     unsafe {
         for (buffer, input) in buffers.iter_mut().zip(inputs) {
             if !buffer.copy(input) {
-                return Err(invalid);
+                return Err(if precise_names {
+                    c::file_replace_atomic_error_name_too_long
+                } else {
+                    invalid
+                });
             }
         }
         let mut output = [MaybeUninit::uninit(); 3];
         for (slot, buffer) in output.iter_mut().zip(buffers) {
-            slot.write(buffer.resolve_copied().ok_or(bad)?);
+            slot.write(if precise_names {
+                buffer.resolve_named().map_err(|error| {
+                    if error == c::file_stream_error_invalid {
+                        bad
+                    } else {
+                        error
+                    }
+                })?
+            } else {
+                buffer.resolve_copied().ok_or(bad)?
+            });
         }
         Ok(output.map(|slot| slot.assume_init()))
     }
@@ -82,7 +97,7 @@ pub unsafe extern "C" fn r4os_rust_sys_file_replace(
             return -1;
         }
         let mut buffers = [const { PathBuffers::new() }; 3];
-        let targets = match targets(&mut buffers, [target, staged, backup], -1, -4) {
+        let targets = match targets(&mut buffers, [target, staged, backup], -1, -4, true) {
             Ok(value) => value,
             Err(error) => return error,
         };
@@ -101,18 +116,23 @@ pub unsafe extern "C" fn r4os_rust_sys_file_replace(
         if paths.iter().any(|path| path::root(path)) {
             return -4;
         }
+        for path in paths {
+            if let Some(error) = name_limits::provider_error(volume.kind, path) {
+                return error;
+            }
+        }
         let parent_path = path::parent(paths[0]);
         if parent_path != path::parent(paths[1]) || parent_path != path::parent(paths[2]) {
             return -8;
         }
         let names = paths.map(path::base);
         if !short(names[1]) || !short(names[2]) {
-            return -8;
+            return c::file_replace_atomic_error_name_not_supported;
         }
         // Create-only FAT publication requires a short target too. Reject
         // before publish_started so the owned stage remains abortable.
         if require_owned && volume.kind == 0 && !short(names[0]) {
-            return -8;
+            return c::file_replace_atomic_error_name_not_supported;
         }
         let mut request = some!(
             if require_owned {
@@ -304,7 +324,7 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_declare(
             _ => return -1,
         };
         let mut buffers = [const { PathBuffers::new() }; 3];
-        let targets = match targets(&mut buffers, [staged, target, backup], -1, -3) {
+        let targets = match targets(&mut buffers, [staged, target, backup], -1, -3, false) {
             Ok(value) => value,
             Err(error) => return error,
         };
@@ -504,7 +524,7 @@ pub unsafe extern "C" fn r4os_rust_sys_update_checked(
             return -1;
         }
         let mut buffers = [const { PathBuffers::new() }; 3];
-        let targets = match targets(&mut buffers, [target, staged, backup], -1, -3) {
+        let targets = match targets(&mut buffers, [target, staged, backup], -1, -3, false) {
             Ok(value) => value,
             Err(error) => return error,
         };

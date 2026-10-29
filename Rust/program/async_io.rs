@@ -819,7 +819,11 @@ unsafe fn submit(
         }
         if path.add(n).read() != 0 {
             clear_request(req);
-            return INVALID;
+            return if kind == Kind::StreamBegin {
+                c::file_stream_error_name_too_long
+            } else {
+                INVALID
+            };
         }
         (*req).path[n] = 0;
         (*req).path_len = n;

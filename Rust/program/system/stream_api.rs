@@ -1,7 +1,9 @@
 //! Original public stream begin/write/finish/abort and storage lease admission.
 //! Every slot lookup occurs after the exact volume gate; no stale pointer is
 //! selected before a wait, and ambiguous handovers retain their exact token.
-use super::{context as ctx, fs, path, stream, stream_publish as publish, stream_state as s};
+use super::{
+    context as ctx, fs, name_limits, path, stream, stream_publish as publish, stream_state as s,
+};
 use crate::{
     arch::runtime::RuntimeGuard,
     contract as c,
@@ -38,15 +40,18 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_begin(input: *const u8, flags: u32
         let mut raw_buffer = path::Buffer::<1024>::new();
         let raw = some!(
             path::copy_z(input, &mut raw_buffer),
-            c::file_stream_error_invalid
+            c::file_stream_error_name_too_long
         );
         let mut resolved = path::Buffer::<1024>::new();
-        let target = some!(
-            ctx::resolve(raw, &mut resolved),
-            c::file_stream_error_invalid
-        );
+        let target = match name_limits::resolve(raw, &mut resolved) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
         let volume = some!(ctx::volume(target), c::file_stream_error_io);
         let target_path = target.path.slice();
+        if let Some(error) = name_limits::provider_error(volume.kind, target_path) {
+            return error;
+        }
         if path::root(target_path) {
             return c::file_stream_error_io;
         }

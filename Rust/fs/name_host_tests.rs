@@ -68,6 +68,22 @@ fn exact_name_units_capacity_and_ntfs_foreign_records() {
     assert_eq!(nt::to_utf8(&wire, &mut text), Some(name.len()));
     assert_eq!(&text[..name.len()], name.as_bytes());
     assert!(text[name.len()..].iter().all(|b| *b == 0x5a));
+    assert_eq!(program_path::unicode_error(name.as_bytes()), None);
+    assert_eq!(
+        program_path::unicode_error(format!("C:\\{name}x").as_bytes()),
+        Some(program_path::UnicodeError::TooLong)
+    );
+    assert_eq!(
+        program_path::unicode_error(b"C:\\bad\xc1\xa1"),
+        Some(program_path::UnicodeError::Malformed)
+    );
+    assert!(fat_names::valid(b"N27-LONG-STAGING-0123456789.TMP"));
+    assert!(!fat_names::valid_short(b"N27-LONG-STAGING-0123456789.TMP"));
+    assert!(fat_names::valid(b"N27+STAG.TMP"));
+    assert!(!fat_names::valid(b".N27-stage.tmp"));
+    assert!(nt::valid_name(b".N27-stage.tmp"));
+    assert!(fat_names::valid_short(b"A.")); // existing short alias, not a valid LFN
+    assert!(!fat_names::valid_long(b"A."));
     assert!(!nt::valid_name(format!("{name}x").as_bytes()));
     assert!(!fat_names::valid(format!("{name}x").as_bytes()));
     assert!(!fat_names::valid("\u{ffff}".as_bytes())); // VFAT padding marker
