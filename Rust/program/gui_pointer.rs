@@ -221,6 +221,20 @@ pub(super) unsafe fn associate(
             (*state).host = if host_ok { source } else { Handle::default() };
             (*state).host_epoch = if host_ok { (*root()).host_epoch } else { 0 };
             (*state).focused = false;
+            super::gui_input::rebind(
+                gui,
+                c::GuiPointerWindowIdentity {
+                    owner,
+                    epoch: (*state).epoch,
+                    window_id: next,
+                    reserved: 0,
+                },
+                if old != next {
+                    c::gui_input_reset_reason_window_closed
+                } else {
+                    c::gui_input_reset_reason_desktop_changed
+                },
+            );
         }
         if next < 0 {
             (*state).epoch = 0;
@@ -261,10 +275,22 @@ pub(super) unsafe fn focus(
         return;
     }
     let guard = Guard::acquire(0);
-    let before = unsafe { revision() };
+    let changed = unsafe { focus_locked(gui, owner, event, source) };
+    drop(guard);
+    if changed {
+        unsafe { signal(gui) };
+    }
+}
+unsafe fn focus_locked(
+    gui: *mut t::Gui,
+    owner: Handle,
+    event: c::GuiEvent,
+    source: Handle,
+) -> bool {
     unsafe {
+        let before = revision();
         if !same((*gui).pointer.host, source) || (*gui).pointer.host_epoch != (*root()).host_epoch {
-            return;
+            return false;
         }
         (*gui).pointer.focused = event.kind == c::GuiEventKind::focus_gained.0;
         if !(*gui).pointer.focused && same((*root()).value.capture.window.owner, owner) {
@@ -275,15 +301,10 @@ pub(super) unsafe fn focus(
                 event.tick,
             );
         }
-    }
-    let changed = unsafe { revision() != before };
-    drop(guard);
-    if changed {
-        unsafe {
-            signal(gui);
-        }
+        revision() != before
     }
 }
+
 unsafe fn own_window(instance: *mut ProgramInstance, owner: Handle) -> c::GuiPointerWindowIdentity {
     let gui = unsafe { gui(instance) };
     if gui.is_null() {
@@ -302,6 +323,10 @@ unsafe fn own_window(instance: *mut ProgramInstance, owner: Handle) -> c::GuiPoi
             reserved: 0,
         }
     }
+}
+/// Existing program metadata admission is retained by the caller.
+pub(super) unsafe fn window_epoch(gui: *const t::Gui) -> u64 {
+    unsafe { (*gui).pointer.epoch }
 }
 fn admission() -> Option<task_context::Admission> {
     if threads::compute_worker() {
@@ -405,6 +430,9 @@ pub(crate) unsafe extern "C" fn acquire(
         }
         if !window_same(expected, own_window(instance, owner)) {
             return c::gui_pointer_error_stale;
+        }
+        if super::gui_input::blocked(gui) {
+            return c::gui_pointer_error_busy;
         }
         if !valid((*root()).host)
             || !same((*gui).pointer.host, (*root()).host)
@@ -837,6 +865,171 @@ pub(crate) unsafe extern "C" fn host(
         Err(error) => error,
     }
 }
+/// Nonblocking ordinary host input. Registry precedes metadata exactly as in
+/// native capture; neither owner spans notification or caller output.
+pub(crate) unsafe extern "C" fn host_input(
+    request: *const c::GuiHostInputRequest,
+    out: *mut c::GuiPointerWindowIdentity,
+) -> i32 {
+    if request.is_null() || out.is_null() {
+        return c::gui_host_input_error_invalid;
+    }
+    let request = unsafe { request.read() };
+    if request.operation > c::gui_host_input_operation_reset
+        || request.window.reserved != 0
+        || !valid(request.window.owner)
+        || request.window.window_id < 0
+        || (request.operation != c::gui_host_input_operation_reset && request.reason != 0)
+    {
+        return c::gui_host_input_error_invalid;
+    }
+    let zero_event = request.event.kind == 0
+        && matches!(request.event.window_id, -1 | 0)
+        && request.event.x == 0
+        && request.event.y == 0
+        && request.event.key == 0
+        && request.event.buttons == 0
+        && request.event.modifiers == 0;
+    if request.operation == c::gui_host_input_operation_query
+        && (request.window.epoch != 0 || !zero_event || request.event.tick != 0)
+    {
+        return c::gui_host_input_error_invalid;
+    }
+    if request.operation == c::gui_host_input_operation_reset
+        && (!zero_event
+            || ![
+                c::gui_input_reset_reason_overflow,
+                c::gui_input_reset_reason_focus_lost,
+                c::gui_input_reset_reason_window_closed,
+                c::gui_input_reset_reason_desktop_changed,
+                c::gui_input_reset_reason_process_ended,
+            ]
+            .contains(&request.reason))
+    {
+        return c::gui_host_input_error_invalid;
+    }
+    if request.operation == c::gui_host_input_operation_post
+        && (request.event.kind == 0
+            || request.event.kind > c::GuiEventKind::mouse_wheel.0
+            || request.event.window_id != request.window.window_id)
+    {
+        return c::gui_host_input_error_invalid;
+    }
+    let Some(_caller) = admission() else {
+        return c::gui_host_input_error_context;
+    };
+    let Some(source) = (unsafe { context::handle() }) else {
+        return c::gui_host_input_error_context;
+    };
+    let Some(registry) = registry::Guard::acquire() else {
+        return c::gui_host_input_error_context;
+    };
+    let guard = Guard::acquire(0);
+    let mut capture_changed = false;
+    let result = unsafe {
+        (|| -> Result<(c::GuiPointerWindowIdentity, bool), i32> {
+            if !same((*root()).host, source) {
+                return Err(c::gui_host_input_error_context);
+            }
+            let gui = destination(request.window.owner);
+            if gui.is_null() {
+                return Err(c::gui_host_input_error_stale);
+            }
+            let slot = registry::lookup_handle(request.window.owner, true);
+            let identity = own_window(ptr::addr_of_mut!((*slot).instance), request.window.owner);
+            if identity.epoch == 0
+                || identity.window_id != request.window.window_id
+                || !same((*gui).pointer.host, source)
+                || (*gui).pointer.host_epoch != (*root()).host_epoch
+                || (request.operation != c::gui_host_input_operation_query
+                    && !window_same(identity, request.window))
+            {
+                return Err(c::gui_host_input_error_stale);
+            }
+            match request.operation {
+                c::gui_host_input_operation_query => Ok((identity, false)),
+                c::gui_host_input_operation_post => {
+                    if request.event.kind == c::GuiEventKind::focus_gained.0
+                        || request.event.kind == c::GuiEventKind::focus_lost.0
+                    {
+                        capture_changed |= focus_locked(gui, identity.owner, request.event, source);
+                    }
+                    if super::gui_input::ordinary(request.event.kind)
+                        && ((*gui).window_info.flags & c::GuiWindowFlag::visible == 0
+                            || (*gui).window_info.flags
+                                & (c::GuiWindowFlag::minimized | c::GuiWindowFlag::close_requested)
+                                != 0)
+                    {
+                        return Err(c::gui_host_input_error_stale);
+                    }
+                    if super::gui_input::blocked(gui) {
+                        super::gui_input::arm(gui);
+                        return Err(c::gui_host_input_error_busy);
+                    }
+                    let code = gui_events::enqueue_locked(gui, request.event);
+                    if code == -3 {
+                        super::gui_input::arm(gui);
+                    }
+                    if code != 0 {
+                        return Err(code);
+                    }
+                    Ok((identity, true))
+                }
+                c::gui_host_input_operation_reset => {
+                    let before = revision();
+                    if same((*root()).value.capture.window.owner, identity.owner)
+                        && live((*root()).value.state)
+                    {
+                        let reason = match request.reason {
+                            c::gui_input_reset_reason_overflow => {
+                                c::gui_pointer_reason_input_overflow
+                            }
+                            c::gui_input_reset_reason_focus_lost => {
+                                c::gui_pointer_reason_focus_lost
+                            }
+                            c::gui_input_reset_reason_window_closed => {
+                                c::gui_pointer_reason_window_closed
+                            }
+                            c::gui_input_reset_reason_desktop_changed => {
+                                c::gui_pointer_reason_desktop_changed
+                            }
+                            _ => c::gui_pointer_reason_process_ended,
+                        };
+                        terminal(
+                            gui,
+                            c::gui_pointer_state_cancelled,
+                            reason,
+                            request.event.tick,
+                        );
+                    }
+                    if request.reason != c::gui_input_reset_reason_overflow {
+                        (*gui).pointer.focused = false;
+                    }
+                    super::gui_input::reset(gui, identity, request.reason, request.event.tick);
+                    capture_changed |= revision() != before;
+                    Ok((identity, true))
+                }
+                _ => unreachable!(),
+            }
+        })()
+    };
+    drop(guard);
+    drop(registry);
+    if capture_changed {
+        unsafe { signal_owner(request.window.owner) };
+    }
+    match result {
+        Ok((identity, changed)) => {
+            unsafe { out.write(identity) };
+            if changed && !capture_changed {
+                unsafe { notify_owner(identity.owner) };
+            }
+            0
+        }
+        Err(code) => code,
+    }
+}
+
 /// # Safety
 /// Exact ending owner; caller holds no registry mutex. Live recipients are
 /// found while Registry is held, before metadata0, then signalled by lease.
@@ -851,6 +1044,7 @@ pub(super) unsafe fn orphan(owner: Handle) {
     };
     let guard = Guard::acquire(0);
     let mut notify = Handle::default();
+    let mut host_ended = false;
     unsafe {
         if live((*root()).value.state)
             && (same((*root()).value.capture.window.owner, owner)
@@ -874,6 +1068,7 @@ pub(super) unsafe fn orphan(owner: Handle) {
             );
         }
         if same((*root()).host, owner) {
+            host_ended = true;
             (*root()).host = Handle::default();
             (*root()).host_epoch = 0;
             (*root()).host_capabilities = 0;
@@ -885,6 +1080,76 @@ pub(super) unsafe fn orphan(owner: Handle) {
     drop(registry);
     unsafe {
         signal_owner(notify);
+        if host_ended {
+            orphan_host_inputs(owner);
+        }
+    }
+}
+/// Stream exact handles by boot-unique generation. No registry chunk pointer
+/// crosses unlock/notification: empty chunks can actually be reclaimed. No
+/// fixed recipient snapshot truncates a formerly hosted GUI's cancellation.
+unsafe fn orphan_host_inputs(host: Handle) {
+    let mut after = 0u64;
+    loop {
+        let Some(registry) = registry::Guard::acquire() else {
+            return;
+        };
+        let guard = Guard::acquire(0);
+        let mut next = Handle::default();
+        unsafe {
+            let mut chunk = (*super::registry_state::state()).head;
+            while !chunk.is_null() {
+                for slot in &(*chunk).slots {
+                    if !registry::running(slot.state)
+                        || slot.generation <= after
+                        || (next.generation != 0 && slot.generation >= next.generation)
+                    {
+                        continue;
+                    }
+                    let gui = slot.instance.gui_payload.cast::<t::Gui>();
+                    if !gui.is_null()
+                        && same((*gui).pointer.host, host)
+                        && (*gui).pointer.epoch != 0
+                    {
+                        next = registry::handle_for_slot(slot);
+                    }
+                }
+                chunk = (*chunk).next;
+            }
+        }
+        drop(guard);
+        drop(registry);
+        if !valid(next) {
+            return;
+        }
+        after = next.generation;
+        let Some(lease) = (unsafe { super::console::Lease::handle(next) }) else {
+            continue;
+        };
+        let gui = unsafe { (*lease.0.instance).gui_payload.cast::<t::Gui>() };
+        if gui.is_null() {
+            continue;
+        }
+        let guard = Guard::acquire(0);
+        let changed = unsafe {
+            if same((*gui).pointer.host, host)
+                && (*gui).pointer.epoch != 0
+                && !AtomicBool::from_ptr(ptr::addr_of_mut!((*lease.0.instance).done))
+                    .load(Ordering::Acquire)
+            {
+                let window = own_window(lease.0.instance, next);
+                (*gui).pointer.focused = false;
+                super::gui_input::reset(gui, window, c::gui_input_reset_reason_desktop_changed, 0);
+                true
+            } else {
+                false
+            }
+        };
+        drop(guard);
+        if changed {
+            unsafe { super::gui_activity::signal(gui) };
+        }
+        // Lease owns the exact payload until after this one notification.
     }
 }
 pub(super) unsafe fn revision() -> u64 {

@@ -24,6 +24,7 @@ pub mod gui_draw;
 pub mod gui_events;
 pub mod gui_flow;
 pub mod gui_font;
+pub(crate) mod gui_input;
 pub mod gui_lifetime;
 pub(crate) mod gui_pointer;
 pub mod gui_resources;

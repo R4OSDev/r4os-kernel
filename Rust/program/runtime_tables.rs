@@ -630,12 +630,14 @@ fn configure_desk() {
         gui_pointer_capture_acquire: super::gui_pointer::acquire as *const () as usize,
         gui_pointer_capture_release: super::gui_pointer::release as *const () as usize,
         gui_pointer_capture_host: super::gui_pointer::host as *const () as usize,
+        gui_host_input: super::gui_pointer::host_input as *const () as usize,
         ..Default::default()
     };
     DESK.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Desk>() == 616);
+    assert!(mem::size_of::<c::R4XStartR4Desk>() == 624);
+    assert!(mem::offset_of!(c::R4XStartR4Desk, gui_host_input) == 616);
     assert!(mem::offset_of!(c::R4XStartR4Desk, gui_activity_wait) == 568);
     assert!(mem::offset_of!(c::R4XStartR4Desk, gui_activity_notify) == 576);
     assert!(mem::offset_of!(c::R4XStartR4Desk, gui_pointer_capture_info) == 584);

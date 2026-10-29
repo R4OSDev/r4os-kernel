@@ -266,6 +266,7 @@ pub struct Gui {
     pub frame_owned_commands: u64,
     pub activity: super::gui_activity::Channel,
     pub pointer: super::gui_pointer::Window,
+    pub input: super::gui_input::Control,
 }
 
 #[repr(C)]
@@ -491,6 +492,7 @@ pub unsafe fn initialize(kind: u8, memory: *mut u8) {
                 let payload = memory.cast::<Gui>();
                 ptr::addr_of_mut!((*payload).activity).write(super::gui_activity::Channel::EMPTY);
                 ptr::addr_of_mut!((*payload).pointer).write(super::gui_pointer::Window::EMPTY);
+                ptr::addr_of_mut!((*payload).input).write(super::gui_input::Control::EMPTY);
                 ptr::addr_of_mut!((*payload).operation_gate).write(UnwindGuard {
                     owner: 0,
                     owner_generation: 0,
@@ -789,7 +791,8 @@ const _: () = {
     assert!(mem::offset_of!(Frame, base_commands) == 272);
     assert!(mem::offset_of!(Frame, base_resources) == 280);
     assert!(mem::offset_of!(Frame, base_raster_words) == 288);
-    assert!(mem::size_of::<Gui>() == 4280);
+    assert!(mem::size_of::<Gui>() == 4336);
+    assert!(mem::offset_of!(Gui, input) == 4280);
     assert!(mem::offset_of!(Gui, pointer) == 4032);
     assert!(mem::size_of::<super::gui_pointer::Window>() == 248);
     assert!(mem::offset_of!(Gui, activity) == 3960);

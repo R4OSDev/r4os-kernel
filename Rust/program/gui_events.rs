@@ -135,6 +135,7 @@ pub(super) unsafe fn pending(gui: *const t::Gui) -> u32 {
         })
         .expect("GUI queued events")
             + super::gui_pointer::pending(gui)
+            + super::gui_input::pending(gui, super::gui_pointer::window_epoch(gui))
     }
 }
 pub(super) unsafe fn enqueue(gui: *mut t::Gui, event: *const Event) -> i32 {
@@ -152,6 +153,10 @@ pub(super) unsafe fn enqueue(gui: *mut t::Gui, event: *const Event) -> i32 {
 pub(super) unsafe fn enqueue_locked(gui: *mut t::Gui, event: Event) -> i32 {
     unsafe {
         (*state()).push_attempts = (*state()).push_attempts.wrapping_add(1);
+        if super::gui_input::ordinary(event.kind) && super::gui_input::blocked(gui) {
+            (*state()).rejected = (*state()).rejected.wrapping_add(1);
+            return -3;
+        }
         if event.kind == 5
             && let Some(index) = find_move(gui)
         {
@@ -278,6 +283,7 @@ pub unsafe extern "C" fn r4os_rust_program_gui_window_set(id: u32, info: *const 
         let guard = Guard::acquire(0);
         let previous = (*gui).window_info;
         let before_pointer = super::gui_pointer::revision();
+        let before_epoch = super::gui_pointer::window_epoch(gui);
         let owner = c::ProgramProcessHandle {
             instance_id: lease.0.id,
             reserved: 0,
@@ -287,7 +293,8 @@ pub unsafe extern "C" fn r4os_rust_program_gui_window_set(id: u32, info: *const 
         super::gui_pointer::associate(gui, owner, old, value.window_id, source);
         super::gui_pointer::visibility(gui, owner, value.flags);
         let pointer_changed = before_pointer != super::gui_pointer::revision();
-        let changed = previous.window_id != value.window_id
+        let changed = before_epoch != super::gui_pointer::window_epoch(gui)
+            || previous.window_id != value.window_id
             || previous.frame_x != value.frame_x
             || previous.frame_y != value.frame_y
             || previous.frame_w != value.frame_w
@@ -329,7 +336,15 @@ pub unsafe extern "C" fn r4os_rust_program_gui_event_poll(out: *mut Event) -> i3
         }
         let guard = Guard::acquire(0);
         let mut event = Event::default();
-        let notice = super::gui_pointer::poll(gui);
+        let capture = super::gui_pointer::poll(gui);
+        // An older capture notice may still require its original metadata
+        // prefix. Preserve that prefix before the new ordinary-input reset.
+        let reset = if capture.is_none() && super::gui_pointer::pending(gui) == 0 {
+            super::gui_input::poll(gui, super::gui_pointer::window_epoch(gui))
+        } else {
+            None
+        };
+        let notice = capture.or(reset);
         let available = notice.is_some() || (*gui).event_head != (*gui).event_tail;
         if let Some(value) = notice {
             event = value;
@@ -338,7 +353,11 @@ pub unsafe extern "C" fn r4os_rust_program_gui_event_poll(out: *mut Event) -> i3
             super::gui_pointer::removed(gui, (*gui).event_head);
             (*gui).event_head = ((*gui).event_head + 1) % 64;
         }
+        let host_waiting = available && super::gui_input::space(gui);
         drop(guard);
+        if host_waiting {
+            crate::service::desktop_events::r4os_rust_desktop_signal();
+        }
         out.write(event);
         i32::from(available)
     }
