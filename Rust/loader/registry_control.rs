@@ -92,7 +92,7 @@ pub(crate) unsafe fn view(p: *const state::Entry) -> query::EntryView {
     }
 }
 pub(crate) unsafe fn find_name(name: &[u8]) -> Option<usize> {
-    for i in 0..state::CAPACITY {
+    for i in 0..state::capacity() {
         if !state::r4os_rust_mod_published(i) {
             continue;
         }
@@ -190,7 +190,7 @@ pub extern "C" fn r4os_rust_mod_libraries_active(publish: bool) -> bool {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_mod_count() -> usize {
-    (0..state::CAPACITY)
+    (0..state::capacity())
         .filter(|i| state::r4os_rust_mod_published(*i))
         .count()
 }
@@ -275,7 +275,7 @@ pub unsafe extern "C" fn r4os_rust_mod_init(peers: &state::Peers) {
 pub extern "C" fn r4os_rust_mod_summary() {
     let mut counts = [0usize; 6];
     let mut failed = 0usize;
-    for i in 0..state::CAPACITY {
+    for i in 0..state::capacity() {
         if !state::r4os_rust_mod_published(i) {
             continue;
         }

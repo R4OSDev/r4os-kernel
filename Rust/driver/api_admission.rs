@@ -288,6 +288,12 @@ pub extern "C" fn r4os_rust_driver_api_bind(id: u32, slot: usize) -> bool {
     if !unsafe { driver_module_identity(slot, &mut generation) } {
         return false;
     }
+    // Preflight only resident metadata. No live binding/epoch is published if
+    // preparation fails; heap growth holds no Runtime/Work/BO owner.
+    if !resources::prepare(id) || !work::prepare(id) {
+        crate::boot::log::text(b"[DRIVER] resident owner metadata memory exhausted\r\n");
+        return false;
+    }
     let state = unsafe { resources::r4os_rust_driver_resource_state() };
     if unsafe { resource_state::r4os_rust_resource_state_mutate(state, 0, id, slot, generation) }
         != 0

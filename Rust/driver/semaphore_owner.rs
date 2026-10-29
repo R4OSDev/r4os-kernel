@@ -1,4 +1,5 @@
 //! Dynamic R4D semaphore metadata, independent of queue waits/backing free.
+use crate::driver::owner_table::Rows;
 use crate::driver::treap::{Node, Tree};
 use core::{mem::size_of, ptr};
 #[repr(C)]
@@ -54,26 +55,25 @@ const _: () = {
     assert!(size_of::<Create>() == 24);
     assert!(size_of::<Destroy>() == 32);
 };
-unsafe fn slot<'a>(base: *mut Owner, cap: usize, id: u32) -> Result<&'a mut Owner, u8> {
-    if id == 0 || id as usize > cap {
+unsafe fn slot<'a>(rows: Rows<Owner>, id: u32) -> Result<&'a mut Owner, u8> {
+    if id == 0 {
         return Err(2);
     }
-    Ok(unsafe { &mut *base.add((id - 1) as usize) })
+    let row = unsafe { rows.get((id - 1) as usize) };
+    if row.is_null() {
+        return Err(2);
+    }
+    Ok(unsafe { &mut *row })
 }
-unsafe fn current<'a>(base: *mut Owner, cap: usize, id: u32) -> Result<&'a mut Owner, u8> {
-    let e = unsafe { slot(base, cap, id) }?;
+unsafe fn current<'a>(rows: Rows<Owner>, id: u32) -> Result<&'a mut Owner, u8> {
+    let e = unsafe { slot(rows, id) }?;
     if e.stats.epoch == 0 {
         return Err(3);
     }
     Ok(e)
 }
-unsafe fn matching<'a>(
-    base: *mut Owner,
-    cap: usize,
-    id: u32,
-    epoch: u64,
-) -> Result<&'a mut Owner, u8> {
-    let e = unsafe { current(base, cap, id) }?;
+unsafe fn matching<'a>(rows: Rows<Owner>, id: u32, epoch: u64) -> Result<&'a mut Owner, u8> {
+    let e = unsafe { current(rows, id) }?;
     if e.stats.epoch != epoch {
         return Err(3);
     }
@@ -82,11 +82,11 @@ unsafe fn matching<'a>(
 fn status(result: Result<(), u8>) -> u8 {
     result.err().unwrap_or(0)
 }
-unsafe fn lookup(base: *mut Owner, cap: usize, id: u32, handle: u64) -> Result<*mut Record, u8> {
+unsafe fn lookup(rows: Rows<Owner>, id: u32, handle: u64) -> Result<*mut Record, u8> {
     if handle == 0 {
         return Err(1);
     }
-    let e = unsafe { current(base, cap, id) }?;
+    let e = unsafe { current(rows, id) }?;
     let n = unsafe { e.tree.find(handle) };
     if n.is_null() {
         return Err(3);
@@ -100,8 +100,7 @@ unsafe fn lookup(base: *mut Owner, cap: usize, id: u32, handle: u64) -> Result<*
 /// headers/buffers are valid caller storage; exact wait/free tickets retain identity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_semaphore_owner_mutate(
-    base: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     id: u32,
     epoch: u64,
     op: u8,
@@ -112,7 +111,7 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_mutate(
                 if epoch == 0 {
                     return Err(1);
                 }
-                let e = unsafe { slot(base, cap, id) }?;
+                let e = unsafe { slot(rows, id) }?;
                 if e.stats.epoch != 0 {
                     return Err(5);
                 }
@@ -125,12 +124,12 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_mutate(
                 };
             }
             1 => {
-                if let Ok(e) = unsafe { current(base, cap, id) } {
+                if let Ok(e) = unsafe { current(rows, id) } {
                     e.stats.closing = true
                 }
             }
             2 => {
-                let e = unsafe { current(base, cap, id) }?;
+                let e = unsafe { current(rows, id) }?;
                 if !e.stats.closing
                     || e.stats.records != 0
                     || e.stats.pending_creates != 0
@@ -151,13 +150,12 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_mutate(
 /// headers/buffers are valid caller storage; exact wait/free tickets retain identity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_semaphore_owner_stats(
-    base: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     id: u32,
     out: *mut Stats,
 ) -> u8 {
     status((|| {
-        let e = unsafe { current(base, cap, id) }?;
+        let e = unsafe { current(rows, id) }?;
         unsafe { ptr::write(out, e.stats) };
         Ok(())
     })())
@@ -167,14 +165,13 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_stats(
 /// headers/buffers are valid caller storage; exact wait/free tickets retain identity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_semaphore_owner_begin(
-    base: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     next: *mut u64,
     id: u32,
     out: *mut Create,
 ) -> u8 {
     status((|| {
-        let e = unsafe { current(base, cap, id) }?;
+        let e = unsafe { current(rows, id) }?;
         if e.stats.closing {
             return Err(4);
         }
@@ -206,17 +203,13 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_begin(
 /// Private C records stay aligned and resident under the runtime owner. Output
 /// headers/buffers are valid caller storage; exact wait/free tickets retain identity.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_semaphore_owner_abort(
-    base: *mut Owner,
-    cap: usize,
-    c: *mut Create,
-) -> u8 {
+pub unsafe extern "C" fn r4os_rust_semaphore_owner_abort(rows: Rows<Owner>, c: *mut Create) -> u8 {
     status((|| {
         let c = unsafe { &mut *c };
         if !c.active {
             return Err(3);
         }
-        let e = unsafe { matching(base, cap, c.owner, c.epoch) }?;
+        let e = unsafe { matching(rows, c.owner, c.epoch) }?;
         assert!(e.stats.pending_creates != 0);
         e.stats.pending_creates -= 1;
         e.stats.create_failures = e.stats.create_failures.saturating_add(1);
@@ -229,8 +222,7 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_abort(
 /// headers/buffers are valid caller storage; exact wait/free tickets retain identity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_semaphore_owner_adopt(
-    base: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     c: *mut Create,
     r: *mut Record,
     visible: *mut bool,
@@ -240,7 +232,7 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_adopt(
         if !c.active {
             return Err(3);
         }
-        let e = unsafe { matching(base, cap, c.owner, c.epoch) }?;
+        let e = unsafe { matching(rows, c.owner, c.epoch) }?;
         unsafe {
             assert!((*r).owner == 0 && e.stats.pending_creates != 0);
             (*r).owner = c.owner;
@@ -267,20 +259,19 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_adopt(
 /// headers/buffers are valid caller storage; exact wait/free tickets retain identity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_semaphore_owner_lookup(
-    base: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     id: u32,
     handle: u64,
     op: u8,
     out: *mut *mut Record,
 ) -> u8 {
     status((|| {
-        let r = unsafe { lookup(base, cap, id, handle) }?;
+        let r = unsafe { lookup(rows, id, handle) }?;
         if op != 0 && unsafe { (*r).private } {
             return Err(3);
         }
         if op == 2 {
-            let e = unsafe { matching(base, cap, id, (*r).epoch) }?;
+            let e = unsafe { matching(rows, id, (*r).epoch) }?;
             if unsafe { (*r).acquires == u32::MAX } || e.stats.acquires == u32::MAX {
                 return Err(5);
             }
@@ -296,12 +287,11 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_lookup(
 /// headers/buffers are valid caller storage; exact wait/free tickets retain identity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_semaphore_owner_acquired(
-    base: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     r: *mut Record,
 ) -> u8 {
     status((|| {
-        let e = unsafe { matching(base, cap, (*r).owner, (*r).epoch) }?;
+        let e = unsafe { matching(rows, (*r).owner, (*r).epoch) }?;
         if unsafe { (*r).acquires == 0 } {
             return Err(3);
         }
@@ -315,15 +305,14 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_acquired(
 /// headers/buffers are valid caller storage; exact wait/free tickets retain identity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_semaphore_owner_destroy(
-    base: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     id: u32,
     handle: u64,
     out: *mut Destroy,
 ) -> u8 {
     status((|| {
-        let r = unsafe { lookup(base, cap, id, handle) }?;
-        let e = unsafe { matching(base, cap, id, (*r).epoch) }?;
+        let r = unsafe { lookup(rows, id, handle) }?;
+        let e = unsafe { matching(rows, id, (*r).epoch) }?;
         if unsafe { (*r).acquires != 0 } || e.stats.pending_destroys == u32::MAX {
             return Err(5);
         }
@@ -350,8 +339,7 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_destroy(
 /// headers/buffers are valid caller storage; exact wait/free tickets retain identity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_semaphore_owner_finish_destroy(
-    base: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     t: *mut Destroy,
     success: bool,
 ) -> u8 {
@@ -360,7 +348,7 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_finish_destroy(
         if !t.active {
             return Err(3);
         }
-        let e = unsafe { matching(base, cap, t.owner, t.epoch) }?;
+        let e = unsafe { matching(rows, t.owner, t.epoch) }?;
         assert!(e.stats.pending_destroys != 0);
         e.stats.pending_destroys -= 1;
         if success {
@@ -385,13 +373,12 @@ pub unsafe extern "C" fn r4os_rust_semaphore_owner_finish_destroy(
 /// headers/buffers are valid caller storage; exact wait/free tickets retain identity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_semaphore_owner_first(
-    base: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     id: u32,
     out: *mut *mut Record,
 ) -> u8 {
     status((|| {
-        let e = unsafe { current(base, cap, id) }?;
+        let e = unsafe { current(rows, id) }?;
         unsafe { ptr::write(out, e.tree.min().cast()) };
         Ok(())
     })())

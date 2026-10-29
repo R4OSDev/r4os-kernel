@@ -7,6 +7,10 @@ use super::{
     registry_queries::{Export, Section},
     resources::Catalog,
 };
+use crate::driver::{
+    owner_storage,
+    owner_table::{Empty, Table},
+};
 use crate::sched::task_context::{self, Unwind};
 use core::{
     cell::UnsafeCell,
@@ -15,7 +19,6 @@ use core::{
     ptr,
     sync::atomic::{AtomicU64, Ordering},
 };
-pub const CAPACITY: usize = 64;
 const FREE: u32 = 0;
 const RESERVED: u32 = 1;
 const PUBLISHED: u32 = 2;
@@ -68,23 +71,32 @@ impl Entry {
         value
     };
 }
-#[repr(transparent)]
-pub struct Entries(UnsafeCell<[Entry; CAPACITY]>);
-// Each record is writable only under its exact reserved claim. Release
-// publication exposes immutable contents; no Rust state borrow spans peers.
-unsafe impl Sync for Entries {}
-#[repr(transparent)]
-pub struct Catalogs(UnsafeCell<[Catalog; CAPACITY]>);
-unsafe impl Sync for Catalogs {}
-#[unsafe(no_mangle)]
-pub static r4os_rust_module_entries: Entries =
-    Entries(UnsafeCell::new([const { Entry::EMPTY }; CAPACITY]));
-#[unsafe(no_mangle)]
-pub static r4os_rust_module_claims: [AtomicU64; CAPACITY] = [const { AtomicU64::new(0) }; CAPACITY];
-#[unsafe(no_mangle)]
-pub static r4os_rust_module_catalogs: Catalogs = Catalogs(UnsafeCell::new(
-    [const { unsafe { core::mem::zeroed() } }; CAPACITY],
-));
+struct ModuleRow {
+    entry: Entry,
+    catalog: Catalog,
+    claim: AtomicU64,
+}
+impl Empty for ModuleRow {
+    const EMPTY: Self = Self {
+        entry: Entry::EMPTY,
+        catalog: unsafe { core::mem::zeroed() },
+        claim: AtomicU64::new(0),
+    };
+}
+struct Rows(UnsafeCell<Table<ModuleRow>>);
+unsafe impl Sync for Rows {}
+static ROWS: Rows = Rows(UnsafeCell::new(Table::new()));
+pub(crate) fn capacity() -> usize {
+    unsafe { (*ROWS.0.get()).capacity() }
+}
+fn row(index: usize) -> *mut ModuleRow {
+    unsafe { Table::get(ROWS.0.get(), index) }
+}
+fn slot_claim(index: usize) -> &'static AtomicU64 {
+    let p = row(index);
+    assert!(!p.is_null());
+    unsafe { &(*p).claim }
+}
 #[repr(C)]
 pub struct Prepared {
     pub slot: usize,
@@ -102,21 +114,23 @@ pub struct Peers {
     pub log: unsafe extern "C" fn(*const u8, usize),
 }
 pub(crate) fn entry(index: usize) -> *mut Entry {
-    r4os_rust_module_entries
-        .0
-        .get()
-        .cast::<Entry>()
-        .wrapping_add(index)
+    let p = row(index);
+    if p.is_null() {
+        ptr::null_mut()
+    } else {
+        unsafe { ptr::addr_of_mut!((*p).entry) }
+    }
 }
 pub const fn claim(generation: u32, state: u32) -> u64 {
     (generation as u64) << 32 | state as u64
 }
 pub(crate) fn catalog(index: usize) -> *const Catalog {
-    r4os_rust_module_catalogs
-        .0
-        .get()
-        .cast::<Catalog>()
-        .wrapping_add(index)
+    let p = row(index);
+    if p.is_null() {
+        ptr::null()
+    } else {
+        unsafe { ptr::addr_of!((*p).catalog) }
+    }
 }
 unsafe fn log(peers: &Peers, text: &[u8]) {
     unsafe { (peers.log)(text.as_ptr(), text.len()) };
@@ -126,7 +140,8 @@ unsafe fn log(peers: &Peers, text: &[u8]) {
 /// published consumer or retained image may exist while resetting the owner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_mod_reset() {
-    for (i, slot_claim) in r4os_rust_module_claims.iter().enumerate() {
+    for i in 0..capacity() {
+        let slot_claim = slot_claim(i);
         unsafe { ptr::write(entry(i), Entry::EMPTY) };
         slot_claim.store(0, Ordering::Release);
     }
@@ -135,7 +150,7 @@ pub unsafe extern "C" fn r4os_rust_mod_reset() {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_mod_published(index: usize) -> bool {
-    index < CAPACITY && r4os_rust_module_claims[index].load(Ordering::Acquire) as u32 == PUBLISHED
+    index < capacity() && slot_claim(index).load(Ordering::Acquire) as u32 == PUBLISHED
 }
 /// # Safety
 /// Load is a live caller-owned handle. The packed claim validates ownership;
@@ -144,58 +159,64 @@ pub extern "C" fn r4os_rust_mod_published(index: usize) -> bool {
 pub unsafe extern "C" fn r4os_rust_mod_owns(load: *const Prepared) -> bool {
     let slot = unsafe { (*load).slot };
     let generation = unsafe { (*load).generation };
-    r4os_rust_module_claims[slot].load(Ordering::Acquire) == claim(generation, RESERVED)
+    slot < capacity() && slot_claim(slot).load(Ordering::Acquire) == claim(generation, RESERVED)
 }
 unsafe fn reserve(out: *mut Prepared, peers: &Peers) -> bool {
     let unwind = unsafe { task_context::enter() };
     if !unwind.admitted() {
         return false;
     }
-    for (i, slot_claim) in r4os_rust_module_claims.iter().enumerate() {
-        let before = slot_claim.load(Ordering::Acquire);
-        if before as u32 != FREE {
-            continue;
+    loop {
+        for i in 0..capacity() {
+            let slot_claim = slot_claim(i);
+            let before = slot_claim.load(Ordering::Acquire);
+            if before as u32 != FREE {
+                continue;
+            }
+            let mut generation = (before >> 32) as u32;
+            generation = generation.wrapping_add(1);
+            if generation == 0 {
+                generation = 1;
+            }
+            if slot_claim
+                .compare_exchange(
+                    before,
+                    claim(generation, RESERVED),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            unsafe {
+                ptr::write(
+                    entry(i),
+                    Entry {
+                        generation,
+                        ..Entry::EMPTY
+                    },
+                )
+            };
+            unsafe {
+                ptr::write(
+                    out,
+                    Prepared {
+                        slot: i,
+                        generation,
+                        scratch: ptr::null_mut(),
+                        unwind,
+                    },
+                )
+            };
+            return true;
         }
-        let mut generation = (before >> 32) as u32;
-        generation = generation.wrapping_add(1);
-        if generation == 0 {
-            generation = 1;
+        if !owner_storage::runtime(ROWS.0.get(), capacity()) {
+            break;
         }
-        if slot_claim
-            .compare_exchange(
-                before,
-                claim(generation, RESERVED),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            continue;
-        }
-        unsafe {
-            ptr::write(
-                entry(i),
-                Entry {
-                    generation,
-                    ..Entry::EMPTY
-                },
-            )
-        };
-        unsafe {
-            ptr::write(
-                out,
-                Prepared {
-                    slot: i,
-                    generation,
-                    scratch: ptr::null_mut(),
-                    unwind,
-                },
-            )
-        };
-        return true;
     }
     unsafe { task_context::leave(unwind) };
-    unsafe { log(peers, b"[MOD] registry full\r\n") };
+    unsafe { log(peers, b"[MOD] registry metadata memory exhausted\r\n") };
     false
 }
 unsafe fn release_scratch(load: *mut Prepared, peers: &Peers) {
@@ -235,7 +256,7 @@ pub unsafe extern "C" fn r4os_rust_mod_begin(out: *mut Prepared, peers: &Peers) 
 pub unsafe extern "C" fn r4os_rust_mod_commit(load: *mut Prepared, peers: &Peers) -> usize {
     let slot = unsafe { (*load).slot };
     let generation = unsafe { (*load).generation };
-    if r4os_rust_module_claims[slot]
+    if slot_claim(slot)
         .compare_exchange(
             claim(generation, RESERVED),
             claim(generation, RETIRING),
@@ -248,7 +269,7 @@ pub unsafe extern "C" fn r4os_rust_mod_commit(load: *mut Prepared, peers: &Peers
     }
     let target = entry(slot);
     unsafe { ptr::addr_of_mut!((*target).used).write(true) };
-    r4os_rust_module_claims[slot].store(claim(generation, PUBLISHED), Ordering::Release);
+    slot_claim(slot).store(claim(generation, PUBLISHED), Ordering::Release);
     if unsafe { (*target).kind } != 5 {
         unsafe { (peers.publication)(target) };
     }
@@ -264,7 +285,7 @@ pub unsafe extern "C" fn r4os_rust_mod_commit(load: *mut Prepared, peers: &Peers
 pub unsafe extern "C" fn r4os_rust_mod_abort(load: *mut Prepared, peers: &Peers) {
     let slot = unsafe { (*load).slot };
     let generation = unsafe { (*load).generation };
-    if r4os_rust_module_claims[slot]
+    if slot_claim(slot)
         .compare_exchange(
             claim(generation, RESERVED),
             claim(generation, RETIRING),
@@ -290,7 +311,7 @@ pub unsafe extern "C" fn r4os_rust_mod_abort(load: *mut Prepared, peers: &Peers)
         };
     }
     unsafe { release_scratch(load, peers) };
-    r4os_rust_module_claims[slot].store(
+    slot_claim(slot).store(
         claim(generation, if released { FREE } else { RETAINED }),
         Ordering::Release,
     );

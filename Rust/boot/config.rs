@@ -1,4 +1,4 @@
-//! Original bounded CONFIG.R4S parser and sole resident BSP configuration.
+//! Complete CONFIG.R4S parser and sole resident immutable BSP configuration.
 use crate::{
     boot::log,
     display::boot_policy,
@@ -7,8 +7,12 @@ use crate::{
         vfs_types::{self as t, Args, Entry, op},
     },
 };
+use alloc::vec::Vec;
 use core::{cell::UnsafeCell, mem::MaybeUninit, ptr, slice};
-pub const MAX_DRIVERS: usize = 12;
+struct DriverName {
+    data: [u8; 24],
+    len: usize,
+}
 pub const MAX_DISABLED: usize = 8;
 pub const MAX_OPTIONS: usize = 8;
 pub const MAX_SHELL_PATH: usize = 96;
@@ -41,8 +45,8 @@ pub struct Config {
     pub auto_pci: bool,
     pub auto_acpi: bool,
     pub log_verbose: bool,
-    pub drivers: [[u8; 24]; 12],
-    pub driver_lens: [usize; 12],
+    drivers: Vec<DriverName>,
+    pub driver_storage_failed: bool,
     pub driver_count: usize,
     pub disabled: [[u8; 24]; 8],
     pub disabled_lens: [usize; 8],
@@ -60,8 +64,8 @@ impl Config {
         auto_pci: true,
         auto_acpi: true,
         log_verbose: false,
-        drivers: [[0; 24]; 12],
-        driver_lens: [0; 12],
+        drivers: Vec::new(),
+        driver_storage_failed: false,
         driver_count: 0,
         disabled: [[0; 24]; 8],
         disabled_lens: [0; 8],
@@ -104,7 +108,7 @@ unsafe fn record(start: u64, bytes: usize) {
 pub(crate) unsafe fn load() -> *const Config {
     unsafe {
         let start = crate::loader::performance::begin_config_load();
-        STATE.0.get().write(Config::EMPTY);
+        ptr::replace(STATE.0.get(), Config::EMPTY);
         set_shell_path(DEFAULT_SHELL_PATH);
         let Some(volume) = vfs::mounted_volume(b'C') else {
             puts(b"[CONF][WARN] C: FAT32 volume missing, using defaults\r\n");
@@ -133,7 +137,20 @@ pub(crate) unsafe fn load() -> *const Config {
             return STATE.0.get();
         }
         let entry = entry.assume_init();
-        let mut buffer = [0; 2048];
+        let mut buffer = Vec::new();
+        let Some(bytes) = usize::try_from(entry.size).ok() else {
+            g!(driver_storage_failed) = true;
+            puts(b"[CONF][ERROR] CONFIG length not representable; no configured drivers admitted\r\n");
+            record(start, 0);
+            return STATE.0.get();
+        };
+        if buffer.try_reserve_exact(bytes).is_err() {
+            g!(driver_storage_failed) = true;
+            puts(b"[CONF][ERROR] CONFIG memory exhausted; no configured drivers admitted\r\n");
+            record(start, 0);
+            return STATE.0.get();
+        }
+        buffer.resize(bytes, 0);
         let Some(len) = vfs::read_file_raw(volume, &entry, buffer.as_mut_ptr(), buffer.len())
         else {
             puts(b"[CONF][WARN] /CONFIG.R4S read failed, using defaults\r\n");
@@ -141,6 +158,12 @@ pub(crate) unsafe fn load() -> *const Config {
             record(start, 0);
             return STATE.0.get();
         };
+        if len != buffer.len() {
+            g!(driver_storage_failed) = true;
+            puts(b"[CONF][ERROR] CONFIG incomplete; no configured drivers admitted\r\n");
+            record(start, len);
+            return STATE.0.get();
+        }
         puts(b"[CONF] /CONFIG.R4S loaded bytes=");
         dec(len);
         puts(b"\r\n");
@@ -162,7 +185,12 @@ pub(crate) unsafe fn driver_name(index: usize) -> t::Bytes {
         if index >= g!(driver_count) {
             return span(&[]);
         }
-        span(&(&g!(drivers)[index])[..g!(driver_lens)[index]])
+        {
+            let Some(driver) = (&*ptr::addr_of!(g!(drivers))).get(index) else {
+                return span(&[]);
+            };
+            span(&driver.data[..driver.len])
+        }
     }
 }
 pub(crate) unsafe fn disabled_name(index: usize) -> t::Bytes {
@@ -185,8 +213,9 @@ pub(crate) unsafe fn is_disabled(config: *const Config, name: &[u8]) -> bool {
 }
 pub(crate) unsafe fn has_driver(config: *const Config, name: &[u8]) -> bool {
     unsafe {
-        for i in 0..(*config).driver_count {
-            if (&(*config).drivers[i])[..(*config).driver_lens[i]].eq_ignore_ascii_case(name) {
+        let drivers = &(*config).drivers;
+        for driver in drivers {
+            if driver.data[..driver.len].eq_ignore_ascii_case(name) {
                 return true;
             }
         }
@@ -337,18 +366,26 @@ unsafe fn parse_option(rest: &[u8]) {
 }
 unsafe fn add_driver(name: &[u8]) {
     unsafe {
-        if g!(driver_count) >= MAX_DRIVERS {
-            return;
-        }
-        let index = g!(driver_count);
-        if !valid_driver_name(name) {
-            puts(b"[CONF][WARN] invalid DRIVER entry\r\n");
-            g!(driver_lens)[index] = 0;
-            g!(driver_count) += 1;
-            return;
-        }
-        copy_name(name, &mut g!(drivers)[index], &mut g!(driver_lens)[index]);
         g!(driver_count) += 1;
+        if g!(driver_storage_failed) {
+            return;
+        }
+        if g!(drivers).try_reserve(1).is_err() {
+            g!(drivers).clear();
+            g!(driver_storage_failed) = true;
+            puts(b"[CONF][ERROR] DRIVER metadata exhausted; complete configured plan rejected\r\n");
+            return;
+        }
+        let mut entry = DriverName {
+            data: [0; 24],
+            len: 0,
+        };
+        if valid_driver_name(name) {
+            copy_name(name, &mut entry.data, &mut entry.len);
+        } else {
+            puts(b"[CONF][WARN] invalid DRIVER entry\r\n");
+        }
+        g!(drivers).push(entry);
     }
 }
 fn valid_driver_name(name: &[u8]) -> bool {
@@ -506,8 +543,8 @@ pub unsafe extern "C" fn r4os_rust_boot_config(
     }
 }
 const _: () = {
-    assert!(size_of::<Config>() == 1840);
+    assert!(size_of::<Config>() == 1488);
     assert!(size_of::<OptionRecord>() == 120);
-    assert!(core::mem::offset_of!(Config, options) == 664);
-    assert!(core::mem::offset_of!(Config, shell_path) == 1632);
+    assert!(core::mem::offset_of!(Config, options) == 312);
+    assert!(core::mem::offset_of!(Config, shell_path) == 1280);
 };

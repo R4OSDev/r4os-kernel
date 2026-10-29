@@ -4,6 +4,10 @@
 use super::{
     file, format, registry_control as ctl, registry_loader as loader, registry_state as modules,
 };
+use crate::driver::{
+    owner_storage,
+    owner_table::{Empty, Table},
+};
 use crate::{
     contract as api,
     driver::{api_admission as admission, api_cleanup as cleanup, registry},
@@ -21,7 +25,12 @@ use core::{
     mem::{self, MaybeUninit},
     ptr, slice,
 };
-const N: usize = registry::MAX_DRIVERS;
+impl Empty for Runtime {
+    const EMPTY: Self = Self::EMPTY;
+}
+impl Empty for Module {
+    const EMPTY: Self = Self::EMPTY;
+}
 const LOADED: u8 = 0;
 const ALREADY: u8 = 1;
 const NAME_INVALID: u8 = 2;
@@ -103,8 +112,8 @@ impl Module {
     };
 }
 struct Data {
-    runtime: [Runtime; N],
-    modules: [Module; N],
+    runtime: Table<Runtime>,
+    modules: Table<Module>,
     next_generation: u64,
     transition: bool,
 }
@@ -112,8 +121,8 @@ struct Owner(UnsafeCell<Data>);
 // The original reentrant lifecycle guard owns every field and exact instance.
 unsafe impl Sync for Owner {}
 static DATA: Owner = Owner(UnsafeCell::new(Data {
-    runtime: [Runtime::EMPTY; N],
-    modules: [Module::EMPTY; N],
+    runtime: Table::new(),
+    modules: Table::new(),
     next_generation: 1,
     transition: false,
 }));
@@ -163,19 +172,23 @@ fn report(prefix: &[u8], name: &[u8], suffix: &[u8]) {
     log(name);
     log(suffix);
 }
+fn runtimes() -> *mut Table<Runtime> {
+    unsafe { ptr::addr_of_mut!((*DATA.0.get()).runtime) }
+}
+fn module_rows() -> *mut Table<Module> {
+    unsafe { ptr::addr_of_mut!((*DATA.0.get()).modules) }
+}
+fn runtime_capacity() -> usize {
+    unsafe { (*runtimes()).capacity() }
+}
+fn module_capacity() -> usize {
+    unsafe { (*module_rows()).capacity() }
+}
 fn rt(index: usize) -> *mut Runtime {
-    unsafe {
-        ptr::addr_of_mut!((*DATA.0.get()).runtime)
-            .cast::<Runtime>()
-            .add(index)
-    }
+    unsafe { Table::get(runtimes(), index) }
 }
 fn md(index: usize) -> *mut Module {
-    unsafe {
-        ptr::addr_of_mut!((*DATA.0.get()).modules)
-            .cast::<Module>()
-            .add(index)
-    }
+    unsafe { Table::get(module_rows(), index) }
 }
 fn handoff() -> u64 {
     (u64::from(timer::frequency()) * 250).div_ceil(1000).max(1)
@@ -202,7 +215,7 @@ impl Drop for Life {
     }
 }
 fn find_runtime(name: &[u8]) -> Option<usize> {
-    for i in 0..N {
+    for i in 0..runtime_capacity() {
         let p = rt(i);
         if unsafe { (*p).used } && same(unsafe { (*p).name.bytes() }, name) {
             return Some(i);
@@ -211,7 +224,7 @@ fn find_runtime(name: &[u8]) -> Option<usize> {
     None
 }
 fn find_module(name: &[u8]) -> Option<usize> {
-    for i in 0..N {
+    for i in 0..module_capacity() {
         let p = md(i);
         if unsafe { (*p).used } && same(unsafe { (*p).name.bytes() }, name) {
             return Some(i);
@@ -220,10 +233,26 @@ fn find_module(name: &[u8]) -> Option<usize> {
     None
 }
 fn free_runtime() -> Option<usize> {
-    (0..N).find(|&i| unsafe { !(*rt(i)).used })
+    loop {
+        let capacity = runtime_capacity();
+        if let Some(i) = (0..capacity).find(|&i| unsafe { !(*rt(i)).used }) {
+            return Some(i);
+        }
+        if !owner_storage::runtime(runtimes(), capacity) {
+            return None;
+        }
+    }
 }
 fn free_module() -> Option<usize> {
-    (0..N).find(|&i| unsafe { !(*md(i)).used })
+    loop {
+        let capacity = module_capacity();
+        if let Some(i) = (0..capacity).find(|&i| unsafe { !(*md(i)).used }) {
+            return Some(i);
+        }
+        if !owner_storage::runtime(module_rows(), capacity) {
+            return None;
+        }
+    }
 }
 fn generation() -> u64 {
     unsafe {
@@ -552,7 +581,7 @@ fn descriptor(
         return Err(if runtime { INVALID_FILE } else { LOAD_FAILED });
     };
     let Some(slot) = free_module() else {
-        log(b"[R4D] module driver table full\r\n");
+        log(b"[R4D] module-driver metadata memory exhausted\r\n");
         return Err(LOAD_FAILED);
     };
     let module_slot = prepared.commit().ok_or(LOAD_FAILED)?;
@@ -684,7 +713,7 @@ fn init_module(slot: usize, source: u8) -> u8 {
         )
     };
     if registry_slot == usize::MAX {
-        log(b"[R4D] registry full\r\n");
+        log(b"[R4D] driver registry metadata/identity exhausted\r\n");
         return LOAD_FAILED;
     }
     let owner = u32::try_from(registry_slot + 1).expect("driver owner");
@@ -724,7 +753,7 @@ fn init_module(slot: usize, source: u8) -> u8 {
     set_state(registry_slot, 2);
     set_state(registry_slot, 3);
     let Some(runtime_slot) = free_runtime() else {
-        log(b"[R4D] runtime table full\r\n");
+        log(b"[R4D] driver runtime metadata memory exhausted\r\n");
         let ok = failed_cleanup(shutdown, owner, name.bytes(), p, registry_slot);
         unsafe { (*p).quarantined = !ok };
         set_state(registry_slot, if ok { 6 } else { 7 });
@@ -854,7 +883,7 @@ fn transition() -> bool {
     unsafe { (*DATA.0.get()).transition = true };
     let mut success = true;
     let mut stopped = 0;
-    for i in 0..N {
+    for i in 0..module_capacity() {
         let d = unsafe { ptr::read(md(i)) };
         if d.used
             && d.quarantined
@@ -868,7 +897,7 @@ fn transition() -> bool {
             success = false;
         }
     }
-    for index in (0..N).rev() {
+    for index in (0..runtime_capacity()).rev() {
         let p = rt(index);
         if unsafe {
             !(*p).used
@@ -983,7 +1012,7 @@ fn discover() {
     let Some(_life) = Life::enter(u64::MAX, false) else {
         return;
     };
-    for i in 0..N {
+    for i in 0..module_capacity() {
         unsafe { ptr::write(md(i), Module::EMPTY) };
     }
     let Some(volume) = mount() else {
@@ -1182,7 +1211,7 @@ pub unsafe extern "C" fn r4os_rust_r4d_info(owner: u32, out: *mut api::DriverMod
     let Some(_life) = Life::enter(0, false) else {
         return 1;
     };
-    for i in 0..N {
+    for i in 0..runtime_capacity() {
         let p = rt(i);
         if unsafe { !(*p).used || (*p).owner != owner } {
             continue;

@@ -2,7 +2,8 @@
 //! owner serializes all calls except the passive clock. File plans retain the native loader
 //! source and exact captured resource record through existing filesystem waits.
 use crate::driver::{
-    registry::MAX_DRIVERS,
+    owner_storage,
+    owner_table::{Empty, Rows, Table},
     resource_state::{self, Binding, State},
 };
 use crate::{
@@ -17,13 +18,22 @@ const EMPTY_BINDING: Binding = Binding {
     module_generation: 0,
     closing: false,
 };
+impl Empty for Binding {
+    const EMPTY: Self = EMPTY_BINDING;
+}
+struct BindingTable(UnsafeCell<Table<Binding>>);
+unsafe impl Sync for BindingTable {}
+static BINDINGS: BindingTable = BindingTable(UnsafeCell::new(Table::new()));
+pub(crate) fn prepare(owner: u32) -> bool {
+    owner != 0 && owner_storage::runtime(BINDINGS.0.get(), owner as usize - 1)
+}
 struct ResourceState(UnsafeCell<State>);
 // Before publication only the BSP writes; every later operation is serialized
 // by DriverApi's exact instance execution guard, including synchronous I/O.
 unsafe impl Sync for ResourceState {}
 static STATE: ResourceState = ResourceState(UnsafeCell::new(State {
     next_epoch: 1,
-    bindings: [EMPTY_BINDING; MAX_DRIVERS],
+    bindings: Rows::resident(BINDINGS.0.get()),
 }));
 #[repr(C)]
 struct Lookup {
@@ -49,17 +59,17 @@ unsafe fn binding(owner: u32) -> Option<Binding> {
 /// Copied identity only under the exact wait-spanning DriverApi owner. Closing
 /// bindings remain usable solely for the owner's terminal unregister/cleanup.
 pub(crate) fn owned_binding(owner: u32, allow_closing: bool) -> Option<Binding> {
-    if owner == 0
-        || owner as usize > MAX_DRIVERS
-        || super::api_admission::r4os_rust_driver_api_owner_scalar(2) != owner
-    {
+    if owner == 0 || super::api_admission::r4os_rust_driver_api_owner_scalar(2) != owner {
         return None;
     }
     let value = unsafe {
-        ptr::addr_of!((*STATE.0.get()).bindings)
-            .cast::<Binding>()
-            .add(owner as usize - 1)
-            .read()
+        {
+            let p = (*STATE.0.get()).bindings.get(owner as usize - 1);
+            if p.is_null() {
+                return None;
+            }
+            p.read()
+        }
     };
     (value.epoch != 0 && (allow_closing || !value.closing)).then_some(value)
 }

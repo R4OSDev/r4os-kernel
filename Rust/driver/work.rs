@@ -30,8 +30,10 @@ pub type Metrics = a::ProgramDriverWorkPerformanceMetrics;
 pub type Request = a::DriverWorkRequest;
 pub type Handler = unsafe extern "C" fn(usize) -> i32;
 const CAP: usize = 16;
-const OWNERS: usize = 16;
-pub(crate) const OWNER_CAPACITY: u32 = OWNERS as u32;
+use crate::driver::{
+    owner_storage,
+    owner_table::{Empty, Table},
+};
 const NONE: u8 = 255;
 const FREE: u8 = 0;
 const QUEUED: u8 = 1;
@@ -307,6 +309,35 @@ impl Item {
         },
     };
 }
+struct OwnerWork {
+    metrics: Metrics,
+    deadlines: DeadlineMetrics,
+    current: q::OwnerBookkeeping,
+    head: u8,
+    tail: u8,
+}
+impl Empty for OwnerWork {
+    const EMPTY: Self = Self {
+        metrics: METRICS_EMPTY,
+        deadlines: DEADLINE_EMPTY,
+        current: OWNER_EMPTY,
+        head: NONE,
+        tail: NONE,
+    };
+}
+fn work_owner(s: &mut State, index: usize) -> &mut OwnerWork {
+    let p = unsafe { Table::get(ptr::addr_of_mut!(s.owners), index) };
+    assert!(!p.is_null());
+    unsafe { &mut *p }
+}
+pub(crate) fn prepare(id: u32) -> bool {
+    id != 0
+        && owner_storage::ensure(
+            unsafe { ptr::addr_of_mut!((*raw()).owners) },
+            id as usize - 1,
+            || owner::Guard::acquire(3),
+        )
+}
 struct State {
     initialized: bool,
     worker_started: bool,
@@ -322,12 +353,8 @@ struct State {
     deadline_event: Event,
     summary: Summary,
     metrics: Metrics,
-    owner_metrics: [Metrics; OWNERS],
+    owners: Table<OwnerWork>,
     deadline_metrics: DeadlineMetrics,
-    owner_deadline_metrics: [DeadlineMetrics; OWNERS],
-    owner_current: [q::OwnerBookkeeping; OWNERS],
-    owner_final_head: [u8; OWNERS],
-    owner_final_tail: [u8; OWNERS],
     waiters: u32,
     waiters_max: u32,
     last_submitted_owner: u32,
@@ -363,12 +390,8 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
     },
     summary: SUMMARY_EMPTY,
     metrics: METRICS_EMPTY,
-    owner_metrics: [METRICS_EMPTY; OWNERS],
+    owners: Table::new(),
     deadline_metrics: DEADLINE_EMPTY,
-    owner_deadline_metrics: [DEADLINE_EMPTY; OWNERS],
-    owner_current: [const { OWNER_EMPTY }; OWNERS],
-    owner_final_head: [NONE; OWNERS],
-    owner_final_tail: [NONE; OWNERS],
     waiters: 0,
     waiters_max: 0,
     last_submitted_owner: 0,
@@ -382,7 +405,9 @@ fn raw() -> *mut State {
     STATE.0.get()
 }
 fn index(id: u32) -> Option<usize> {
-    if id == 0 || id as usize > OWNERS {
+    if id == 0
+        || unsafe { Table::get(ptr::addr_of_mut!((*raw()).owners), id as usize - 1) }.is_null()
+    {
         None
     } else {
         Some((id - 1) as usize)
@@ -457,21 +482,21 @@ fn add(s: &mut State, id: u32, field: fn(&mut Metrics) -> &mut u64, value: u64) 
     let f = field(&mut s.metrics);
     *f = f.wrapping_add(value);
     if let Some(i) = index(id) {
-        let f = field(&mut s.owner_metrics[i]);
+        let f = field(&mut work_owner(s, i).metrics);
         *f = f.wrapping_add(value)
     }
 }
 fn set(s: &mut State, id: u32, field: fn(&mut Metrics) -> &mut u64, value: u64) {
     *field(&mut s.metrics) = value;
     if let Some(i) = index(id) {
-        *field(&mut s.owner_metrics[i]) = value
+        *field(&mut work_owner(s, i).metrics) = value
     }
 }
 fn max(s: &mut State, id: u32, field: fn(&mut Metrics) -> &mut u64, value: u64) {
     let f = field(&mut s.metrics);
     *f = (*f).max(value);
     if let Some(i) = index(id) {
-        let f = field(&mut s.owner_metrics[i]);
+        let f = field(&mut work_owner(s, i).metrics);
         *f = (*f).max(value)
     }
 }
@@ -479,7 +504,7 @@ fn add_deadline(s: &mut State, id: u32, field: fn(&mut DeadlineMetrics) -> &mut 
     let f = field(&mut s.deadline_metrics);
     *f = f.wrapping_add(value);
     if let Some(i) = index(id) {
-        let f = field(&mut s.owner_deadline_metrics[i]);
+        let f = field(&mut work_owner(s, i).deadlines);
         *f = f.wrapping_add(value)
     }
 }
@@ -487,7 +512,7 @@ fn max_deadline(s: &mut State, id: u32, field: fn(&mut DeadlineMetrics) -> &mut 
     let f = field(&mut s.deadline_metrics);
     *f = (*f).max(value);
     if let Some(i) = index(id) {
-        let f = field(&mut s.owner_deadline_metrics[i]);
+        let f = field(&mut work_owner(s, i).deadlines);
         *f = (*f).max(value)
     }
 }
@@ -499,7 +524,7 @@ fn query(s: &State, op: u8, slot: usize) -> usize {
 }
 fn ledger(s: &mut State, id: u32, op: u8, value: u8) {
     if let Some(i) = index(id) {
-        unsafe { q::r4os_rust_work_owner_ledger(&mut s.owner_current[i], op, value) };
+        unsafe { q::r4os_rust_work_owner_ledger(&mut work_owner(s, i).current, op, value) };
     }
 }
 fn sync_legacy(s: &mut State) {
@@ -510,27 +535,27 @@ fn sync_legacy(s: &mut State) {
 
 fn append_final(s: &mut State, id: u32, slot: usize) {
     let Some(i) = index(id) else { return };
-    let tail = s.owner_final_tail[i];
+    let tail = work_owner(s, i).tail;
     s.items[slot].owner_final_prev = tail;
     s.items[slot].owner_final_next = NONE;
     if tail == NONE {
-        s.owner_final_head[i] = slot as u8
+        work_owner(s, i).head = slot as u8
     } else {
         s.items[tail as usize].owner_final_next = slot as u8
     }
-    s.owner_final_tail[i] = slot as u8;
+    work_owner(s, i).tail = slot as u8;
 }
 fn remove_final(s: &mut State, id: u32, slot: usize) {
     let Some(i) = index(id) else { return };
     let prev = s.items[slot].owner_final_prev;
     let next = s.items[slot].owner_final_next;
     if prev == NONE {
-        s.owner_final_head[i] = next
+        work_owner(s, i).head = next
     } else {
         s.items[prev as usize].owner_final_next = next
     }
     if next == NONE {
-        s.owner_final_tail[i] = prev
+        work_owner(s, i).tail = prev
     } else {
         s.items[next as usize].owner_final_prev = prev
     }
@@ -1735,16 +1760,17 @@ pub unsafe extern "C" fn r4os_rust_driver_work_performance(id: u32, out: *mut Pe
     let metrics = if id == 0 {
         s.metrics
     } else {
-        oi.map(|i| s.owner_metrics[i]).unwrap_or(METRICS_EMPTY)
+        oi.map(|i| work_owner(s, i).metrics)
+            .unwrap_or(METRICS_EMPTY)
     };
     let d = if id == 0 {
         s.deadline_metrics
     } else {
-        oi.map(|i| s.owner_deadline_metrics[i])
+        oi.map(|i| work_owner(s, i).deadlines)
             .unwrap_or(DEADLINE_EMPTY)
     };
     let current = oi
-        .map(|i| unsafe { ptr::read(&s.owner_current[i]) })
+        .map(|i| unsafe { ptr::read(&work_owner(s, i).current) })
         .unwrap_or(OWNER_EMPTY);
     let present = id == 0
         || (oi.is_some()
@@ -1815,7 +1841,7 @@ pub unsafe extern "C" fn r4os_rust_driver_work_performance(id: u32, out: *mut Pe
         if id == 0 {
             s.book.final_head
         } else {
-            oi.map(|i| s.owner_final_head[i]).unwrap_or(NONE)
+            oi.map(|i| work_owner(s, i).head).unwrap_or(NONE)
         }
     } else {
         NONE

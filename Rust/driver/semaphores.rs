@@ -1,5 +1,9 @@
 //! R4D semaphores retain exact resident records through real waits. Closing
 //! blocks new creation; existing queues receive no synthetic permit/cancel.
+use crate::driver::{
+    owner_storage,
+    owner_table::{Empty, Rows, Table},
+};
 use crate::{
     arch::runtime::{self, RuntimeGuard},
     contract as a,
@@ -19,37 +23,16 @@ use core::{
     mem::{MaybeUninit, size_of},
     ptr,
 };
-const CAP: usize = crate::driver::registry::MAX_DRIVERS;
 #[repr(C)]
 struct State {
-    owners: [m::Owner; CAP],
+    owners: Table<m::Owner>,
     next_handle: u64,
 }
 struct Storage(UnsafeCell<State>);
 // SAFETY: the original scheduler runtime owner serializes all metadata.
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new(State {
-    owners: [const {
-        m::Owner {
-            stats: m::Stats {
-                epoch: 0,
-                records: 0,
-                private: 0,
-                creates: 0,
-                create_failures: 0,
-                destroys: 0,
-                destroy_failures: 0,
-                pending_creates: 0,
-                pending_destroys: 0,
-                acquires: 0,
-                closing: false,
-            },
-            tree: Tree {
-                root: ptr::null_mut(),
-                xorshift: 0,
-            },
-        }
-    }; CAP],
+    owners: Table::new(),
     next_handle: 1,
 }));
 #[repr(C)]
@@ -61,8 +44,14 @@ const _: () = {
     assert!(size_of::<Record>() == 120);
     assert!(core::mem::offset_of!(Record, payload) == 72);
 };
-fn owners() -> *mut m::Owner {
-    unsafe { ptr::addr_of_mut!((*STATE.0.get()).owners).cast() }
+fn owner_table() -> *mut Table<m::Owner> {
+    unsafe { ptr::addr_of_mut!((*STATE.0.get()).owners) }
+}
+fn owners() -> Rows<m::Owner> {
+    Rows::resident(owner_table())
+}
+pub(crate) fn prepare(owner: u32) -> bool {
+    owner != 0 && owner_storage::runtime(owner_table(), owner as usize - 1)
 }
 fn code(c: u8) -> i32 {
     match c {
@@ -96,7 +85,7 @@ unsafe fn valid<T>(out: *const T) -> bool {
 }
 fn snapshot(owner: u32) -> Result<m::Stats, i32> {
     let mut value = MaybeUninit::uninit();
-    let c = unsafe { m::r4os_rust_semaphore_owner_stats(owners(), CAP, owner, value.as_mut_ptr()) };
+    let c = unsafe { m::r4os_rust_semaphore_owner_stats(owners(), owner, value.as_mut_ptr()) };
     if c == 0 {
         Ok(unsafe { value.assume_init() })
     } else {
@@ -105,8 +94,7 @@ fn snapshot(owner: u32) -> Result<m::Stats, i32> {
 }
 fn record(owner: u32, handle: u64, op: u8) -> Result<*mut Record, i32> {
     let mut out = ptr::null_mut();
-    let c =
-        unsafe { m::r4os_rust_semaphore_owner_lookup(owners(), CAP, owner, handle, op, &mut out) };
+    let c = unsafe { m::r4os_rust_semaphore_owner_lookup(owners(), owner, handle, op, &mut out) };
     if c == 0 { Ok(out.cast()) } else { Err(code(c)) }
 }
 #[unsafe(no_mangle)]
@@ -125,8 +113,11 @@ pub extern "C" fn r4os_rust_driver_semaphore_can_sleep() -> bool {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_semaphore_bind(owner: u32, epoch: u64) -> bool {
+    if !prepare(owner) {
+        return false;
+    }
     let _g = RuntimeGuard::acquire();
-    unsafe { m::r4os_rust_semaphore_owner_mutate(owners(), CAP, owner, epoch, 0) == 0 }
+    unsafe { m::r4os_rust_semaphore_owner_mutate(owners(), owner, epoch, 0) == 0 }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_semaphore_discard(owner: u32, epoch: u64) -> bool {
@@ -136,8 +127,8 @@ pub extern "C" fn r4os_rust_driver_semaphore_discard(owner: u32, epoch: u64) -> 
         return false;
     }
     unsafe {
-        m::r4os_rust_semaphore_owner_mutate(owners(), CAP, owner, 0, 1);
-        m::r4os_rust_semaphore_owner_mutate(owners(), CAP, owner, 0, 2) == 0
+        m::r4os_rust_semaphore_owner_mutate(owners(), owner, 0, 1);
+        m::r4os_rust_semaphore_owner_mutate(owners(), owner, 0, 2) == 0
     }
 }
 #[unsafe(no_mangle)]
@@ -180,7 +171,6 @@ pub unsafe extern "C" fn r4os_rust_driver_semaphore_create(
         let c = unsafe {
             m::r4os_rust_semaphore_owner_begin(
                 owners(),
-                CAP,
                 ptr::addr_of_mut!((*STATE.0.get()).next_handle),
                 owner,
                 ticket.as_mut_ptr(),
@@ -195,7 +185,7 @@ pub unsafe extern "C" fn r4os_rust_driver_semaphore_create(
     if memory.is_null() {
         let _g = RuntimeGuard::acquire();
         assert_eq!(
-            unsafe { m::r4os_rust_semaphore_owner_abort(owners(), CAP, &mut ticket) },
+            unsafe { m::r4os_rust_semaphore_owner_abort(owners(), &mut ticket) },
             0
         );
         return a::driver_semaphore_error_memory;
@@ -230,13 +220,7 @@ pub unsafe extern "C" fn r4os_rust_driver_semaphore_create(
     let mut visible = false;
     assert_eq!(
         unsafe {
-            m::r4os_rust_semaphore_owner_adopt(
-                owners(),
-                CAP,
-                &mut ticket,
-                record.cast(),
-                &mut visible,
-            )
+            m::r4os_rust_semaphore_owner_adopt(owners(), &mut ticket, record.cast(), &mut visible)
         },
         0
     );
@@ -294,7 +278,7 @@ pub extern "C" fn r4os_rust_driver_semaphore_acquire(owner: u32, handle: u64, ti
     {
         let _g = RuntimeGuard::acquire();
         assert_eq!(
-            unsafe { m::r4os_rust_semaphore_owner_acquired(owners(), CAP, r.cast()) },
+            unsafe { m::r4os_rust_semaphore_owner_acquired(owners(), r.cast()) },
             0
         )
     }
@@ -336,7 +320,7 @@ fn remove(owner: u32, handle: u64, private: bool) -> i32 {
             return c;
         }
         let c = unsafe {
-            m::r4os_rust_semaphore_owner_destroy(owners(), CAP, owner, handle, ticket.as_mut_ptr())
+            m::r4os_rust_semaphore_owner_destroy(owners(), owner, handle, ticket.as_mut_ptr())
         };
         if c != 0 {
             return code(c);
@@ -352,7 +336,7 @@ fn remove(owner: u32, handle: u64, private: bool) -> i32 {
         unsafe { heap::r4os_rust_heap_free(ticket.record.cast(), size_of::<Record>()) } == 0;
     let _g = RuntimeGuard::acquire();
     assert_eq!(
-        unsafe { m::r4os_rust_semaphore_owner_finish_destroy(owners(), CAP, &mut ticket, success) },
+        unsafe { m::r4os_rust_semaphore_owner_finish_destroy(owners(), &mut ticket, success) },
         0
     );
     if success {
@@ -446,7 +430,7 @@ pub unsafe extern "C" fn r4os_rust_driver_semaphore_stats(
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_semaphore_close(owner: u32) {
     let _g = RuntimeGuard::acquire();
-    unsafe { m::r4os_rust_semaphore_owner_mutate(owners(), CAP, owner, 0, 1) };
+    unsafe { m::r4os_rust_semaphore_owner_mutate(owners(), owner, 0, 1) };
 }
 #[repr(C)]
 pub struct Cleanup {
@@ -473,7 +457,7 @@ fn cleanup(owner: u32) -> Cleanup {
         }
         if s.records == 0 {
             assert_eq!(
-                unsafe { m::r4os_rust_semaphore_owner_mutate(owners(), CAP, owner, 0, 2) },
+                unsafe { m::r4os_rust_semaphore_owner_mutate(owners(), owner, 0, 2) },
                 0
             );
             return result;
@@ -493,7 +477,7 @@ fn cleanup(owner: u32) -> Cleanup {
             let _g = RuntimeGuard::acquire();
             let mut r = ptr::null_mut();
             assert_eq!(
-                unsafe { m::r4os_rust_semaphore_owner_first(owners(), CAP, owner, &mut r) },
+                unsafe { m::r4os_rust_semaphore_owner_first(owners(), owner, &mut r) },
                 0
             );
             if r.is_null() {
@@ -508,7 +492,7 @@ fn cleanup(owner: u32) -> Cleanup {
         result.released += 1;
     }
     let _g = RuntimeGuard::acquire();
-    if unsafe { m::r4os_rust_semaphore_owner_mutate(owners(), CAP, owner, 0, 2) } != 0 {
+    if unsafe { m::r4os_rust_semaphore_owner_mutate(owners(), owner, 0, 2) } != 0 {
         result.quiesced = false
     }
     result
@@ -519,4 +503,26 @@ fn cleanup(owner: u32) -> Cleanup {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_semaphore_cleanup(owner: u32, out: *mut Cleanup) {
     unsafe { ptr::write(out, cleanup(owner)) };
+}
+
+impl Empty for m::Owner {
+    const EMPTY: Self = m::Owner {
+        stats: m::Stats {
+            epoch: 0,
+            records: 0,
+            private: 0,
+            creates: 0,
+            create_failures: 0,
+            destroys: 0,
+            destroy_failures: 0,
+            pending_creates: 0,
+            pending_destroys: 0,
+            acquires: 0,
+            closing: false,
+        },
+        tree: Tree {
+            root: ptr::null_mut(),
+            xorshift: 0,
+        },
+    };
 }

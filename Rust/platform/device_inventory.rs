@@ -204,7 +204,6 @@ use crate::{
     platform::{acpi, cpu, irq, pci_inventory},
 };
 use core::{mem::MaybeUninit, ptr};
-const MAX_RECORDS: usize = 128;
 const MAX_ADAPTERS: usize = 8;
 const WITH_DRIVER: u8 = 0;
 const WITHOUT_DRIVER: u8 = 1;
@@ -442,7 +441,8 @@ impl Record {
     }
 }
 struct Snapshot {
-    records: [Record; MAX_RECORDS],
+    selected: Record,
+    bus_counts: Counts,
     count: usize,
     with_driver: u32,
     without_driver: u32,
@@ -452,7 +452,7 @@ struct Snapshot {
     xhci_note: [u8; 256],
     // Driver registry snapshots copy names; retain each copy at this exact
     // stationary snapshot address until all public records have been emitted.
-    driver_names: [[u8; 32]; crate::driver::registry::MAX_DRIVERS],
+    driver_name: [u8; 32],
     // Only record() reads text bytes after collection; summary/counts consume
     // scalar classifications. Retain the requested protocol's text without
     // enlarging the existing 16-KB snapshot stack limit or allocating storage.
@@ -470,6 +470,11 @@ impl Snapshot {
             ptr::addr_of_mut!((*out).without_driver).write(0);
             ptr::addr_of_mut!((*out).unknown).write(0);
             ptr::addr_of_mut!((*out).truncated).write(false);
+            ptr::addr_of_mut!((*out).bus_counts).write(Counts {
+                drivers: 0,
+                protocols: 0,
+                displays: 0,
+            });
             ptr::addr_of_mut!((*out).requested_text_index).write(requested_text_index);
             ptr::addr_of_mut!((*out).network_notes)
                 .cast::<u8>()
@@ -480,20 +485,25 @@ impl Snapshot {
         }
     }
 }
-// Use raw access to the partially initialized record array until collection has
-// written each populated entry. No Snapshot reference spans a device callback.
+// Stream all counts and retain only the requested record. No inventory-sized
+// stack allocation or Snapshot reference spans a device callback.
 fn add(snapshot: *mut Snapshot, record: Record) {
     unsafe {
         let count = ptr::addr_of!((*snapshot).count).read();
-        if count == MAX_RECORDS {
-            ptr::addr_of_mut!((*snapshot).truncated).write(true);
+        if count == u32::MAX as usize {
+            (*snapshot).truncated = true;
             return;
         }
-        ptr::addr_of_mut!((*snapshot).records)
-            .cast::<Record>()
-            .add(count)
-            .write(record);
+        if count == (*snapshot).requested_text_index {
+            ptr::addr_of_mut!((*snapshot).selected).write(record);
+        }
         ptr::addr_of_mut!((*snapshot).count).write(count + 1);
+        match record.bus {
+            DRIVER => (*snapshot).bus_counts.drivers += 1,
+            PROTOCOL => (*snapshot).bus_counts.protocols += 1,
+            DISPLAY => (*snapshot).bus_counts.displays += 1,
+            _ => {}
+        }
         let counter = match record.binding {
             WITH_DRIVER => ptr::addr_of_mut!((*snapshot).with_driver),
             WITHOUT_DRIVER => ptr::addr_of_mut!((*snapshot).without_driver),
@@ -522,16 +532,17 @@ fn collect(snapshot: *mut Snapshot) {
         if matches!(entry.kind, 2 | 3 | 5) {
             continue;
         }
-        assert!(index < crate::driver::registry::MAX_DRIVERS && entry.name_len <= 32);
-        let name = unsafe {
-            let destination = ptr::addr_of_mut!((*snapshot).driver_names)
-                .cast::<[u8; 32]>()
-                .add(index)
-                .cast::<u8>();
-            ptr::copy_nonoverlapping(entry.name.as_ptr(), destination, 32);
-            Text {
-                pointer: destination,
-                bytes: entry.name_len,
+        assert!(entry.name_len <= 32);
+        let name = if unsafe { (*snapshot).count != (*snapshot).requested_text_index } {
+            Text::EMPTY
+        } else {
+            unsafe {
+                let destination = ptr::addr_of_mut!((*snapshot).driver_name).cast::<u8>();
+                ptr::copy_nonoverlapping(entry.name.as_ptr(), destination, 32);
+                Text {
+                    pointer: destination,
+                    bytes: entry.name_len,
+                }
             }
         };
         add(
@@ -1285,12 +1296,7 @@ pub unsafe extern "C" fn r4os_rust_device_inventory_record(
     if index as usize >= unsafe { (*snapshot).count } {
         return 0;
     }
-    let record = unsafe {
-        ptr::addr_of!((*snapshot).records)
-            .cast::<Record>()
-            .add(index as usize)
-            .read()
-    };
+    let record = unsafe { ptr::addr_of!((*snapshot).selected).read() };
     unsafe {
         out.write(contract::DeviceInventoryRecord {
             binding: record.binding,
@@ -1315,7 +1321,7 @@ pub unsafe extern "C" fn r4os_rust_device_inventory_record(
 }
 /// # Safety
 /// Exclusive aligned private count output; follows the identical full collection
-/// before counting the records retained within the128entry truncation boundary.
+/// and counts every selected bus without a fixed record boundary.
 #[unsafe(no_mangle)]
 #[inline(never)]
 pub unsafe extern "C" fn r4os_rust_device_inventory_counts(out: *mut Counts) {
@@ -1323,29 +1329,7 @@ pub unsafe extern "C" fn r4os_rust_device_inventory_counts(out: *mut Counts) {
     let snapshot = storage.as_mut_ptr();
     unsafe { Snapshot::initialize(snapshot, usize::MAX) };
     collect(snapshot);
-    let mut counts = Counts {
-        drivers: 0,
-        protocols: 0,
-        displays: 0,
-    };
-    for index in 0..unsafe { (*snapshot).count } {
-        let record = unsafe {
-            ptr::addr_of!((*snapshot).records)
-                .cast::<Record>()
-                .add(index)
-                .read()
-        };
-        if record.bus == DRIVER {
-            counts.drivers += 1;
-        }
-        if record.bus == PROTOCOL {
-            counts.protocols += 1;
-        }
-        if record.class_code == 3 {
-            counts.displays += 1;
-        }
-    }
-    unsafe { out.write(counts) };
+    unsafe { out.write(ptr::addr_of!((*snapshot).bus_counts).read()) };
 }
 const _: () = {
     assert!(core::mem::size_of::<Text>() == 16);
@@ -1571,7 +1555,7 @@ unsafe fn inventory_scalar(operation: u8, argument: u64) -> u64 {
             )
         }
         4 => block::r4os_rust_block_registry_query(2, 4) as u64,
-        5 => crate::driver::registry::MAX_DRIVERS as u64,
+        5 => crate::driver::registry::capacity() as u64,
         6 => crate::driver::protocol_registry::MAX_PROTOCOLS as u64,
         7 => u64::from(adapters::r4os_rust_net_adapter_has_device(
             (argument >> 16) as u16,

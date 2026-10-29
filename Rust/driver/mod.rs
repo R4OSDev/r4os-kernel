@@ -39,3 +39,6 @@ pub mod work;
 pub mod work_queue;
 
 pub(crate) mod api_callbacks;
+
+pub(crate) mod owner_storage;
+pub(crate) mod owner_table;

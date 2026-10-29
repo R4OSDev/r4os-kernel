@@ -1,5 +1,9 @@
 //! Dedicated R4D threads: task/FPU construction, exact callback lifetime,
 //! wait leases, synchronous self-abort and confirmed retirement/free.
+use crate::driver::{
+    owner_storage,
+    owner_table::{Empty, Rows, Table},
+};
 use crate::{
     arch::{callback_abort as abort, percpu, runtime::RuntimeGuard},
     contract as a,
@@ -27,39 +31,16 @@ use core::{
     mem::{MaybeUninit, size_of},
     ptr,
 };
-const CAP: usize = crate::driver::registry::MAX_DRIVERS;
 #[repr(C)]
 struct State {
-    owners: [m::Owner; CAP],
+    owners: Table<m::Owner>,
     next_handle: u64,
 }
 struct Storage(UnsafeCell<State>);
 // SAFETY: canonical metadata and enrollment use the existing runtime owner.
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new(State {
-    owners: [const {
-        m::Owner {
-            stats: m::Stats {
-                epoch: 0,
-                records: 0,
-                active: 0,
-                completed: 0,
-                private: 0,
-                starts: 0,
-                start_failures: 0,
-                releases: 0,
-                release_failures: 0,
-                pending_creates: 0,
-                pending_releases: 0,
-                leases: 0,
-                closing: false,
-            },
-            tree: Tree {
-                root: ptr::null_mut(),
-                xorshift: 0,
-            },
-        }
-    }; CAP],
+    owners: Table::new(),
     next_handle: 1,
 }));
 #[repr(C)]
@@ -83,8 +64,14 @@ struct Record {
     header: m::Record,
     payload: Payload,
 }
-fn owners() -> *mut m::Owner {
-    unsafe { ptr::addr_of_mut!((*STATE.0.get()).owners).cast() }
+fn owner_table() -> *mut Table<m::Owner> {
+    unsafe { ptr::addr_of_mut!((*STATE.0.get()).owners) }
+}
+fn owners() -> Rows<m::Owner> {
+    Rows::resident(owner_table())
+}
+pub(crate) fn prepare(owner: u32) -> bool {
+    owner != 0 && owner_storage::runtime(owner_table(), owner as usize - 1)
 }
 fn code(c: u8) -> i32 {
     match c {
@@ -127,7 +114,7 @@ unsafe extern "C" {
 }
 fn snapshot(owner: u32) -> Result<m::Stats, i32> {
     let mut out = MaybeUninit::uninit();
-    let c = unsafe { m::r4os_rust_thread_owner_stats(owners(), CAP, owner, out.as_mut_ptr()) };
+    let c = unsafe { m::r4os_rust_thread_owner_stats(owners(), owner, out.as_mut_ptr()) };
     if c == 0 {
         Ok(unsafe { out.assume_init() })
     } else {
@@ -136,7 +123,7 @@ fn snapshot(owner: u32) -> Result<m::Stats, i32> {
 }
 fn record(owner: u32, handle: u64, op: u8) -> Result<*mut Record, i32> {
     let mut out = ptr::null_mut();
-    let c = unsafe { m::r4os_rust_thread_owner_lookup(owners(), CAP, owner, handle, op, &mut out) };
+    let c = unsafe { m::r4os_rust_thread_owner_lookup(owners(), owner, handle, op, &mut out) };
     if c == 0 { Ok(out.cast()) } else { Err(code(c)) }
 }
 fn public_record(owner: u32, handle: u64) -> Result<*mut Record, i32> {
@@ -172,9 +159,7 @@ fn current_record() -> *mut Record {
 fn stopping(r: *mut Record) -> bool {
     let mut value = false;
     assert_eq!(
-        unsafe {
-            m::r4os_rust_thread_owner_record(owners(), CAP, r.cast(), 4, false, 0, &mut value)
-        },
+        unsafe { m::r4os_rust_thread_owner_record(owners(), r.cast(), 4, false, 0, &mut value) },
         0
     );
     value
@@ -183,15 +168,7 @@ fn record_effect(r: *mut Record, op: u8, created: bool, result: i32) -> bool {
     let mut value = false;
     assert_eq!(
         unsafe {
-            m::r4os_rust_thread_owner_record(
-                owners(),
-                CAP,
-                r.cast(),
-                op,
-                created,
-                result,
-                &mut value,
-            )
+            m::r4os_rust_thread_owner_record(owners(), r.cast(), op, created, result, &mut value)
         },
         0
     );
@@ -217,8 +194,11 @@ fn cancel_wait(r: *mut Record) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_thread_bind(owner: u32, epoch: u64) -> bool {
+    if !prepare(owner) {
+        return false;
+    }
     let _g = RuntimeGuard::acquire();
-    unsafe { m::r4os_rust_thread_owner_mutate(owners(), CAP, owner, epoch, 0) == 0 }
+    unsafe { m::r4os_rust_thread_owner_mutate(owners(), owner, epoch, 0) == 0 }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_thread_discard(owner: u32, epoch: u64) -> bool {
@@ -228,8 +208,8 @@ pub extern "C" fn r4os_rust_driver_thread_discard(owner: u32, epoch: u64) -> boo
         return false;
     }
     unsafe {
-        m::r4os_rust_thread_owner_mutate(owners(), CAP, owner, 0, 1);
-        m::r4os_rust_thread_owner_mutate(owners(), CAP, owner, 0, 2) == 0
+        m::r4os_rust_thread_owner_mutate(owners(), owner, 0, 1);
+        m::r4os_rust_thread_owner_mutate(owners(), owner, 0, 2) == 0
     }
 }
 #[unsafe(no_mangle)]
@@ -342,7 +322,6 @@ pub unsafe extern "C" fn r4os_rust_driver_thread_start(
         let c = unsafe {
             m::r4os_rust_thread_owner_begin(
                 owners(),
-                CAP,
                 ptr::addr_of_mut!((*STATE.0.get()).next_handle),
                 owner,
                 create.as_mut_ptr(),
@@ -357,7 +336,7 @@ pub unsafe extern "C" fn r4os_rust_driver_thread_start(
     if memory.is_null() {
         let _g = RuntimeGuard::acquire();
         assert_eq!(
-            unsafe { m::r4os_rust_thread_owner_abort(owners(), CAP, &mut create) },
+            unsafe { m::r4os_rust_thread_owner_abort(owners(), &mut create) },
             0
         );
         return a::driver_thread_error_memory;
@@ -406,7 +385,7 @@ pub unsafe extern "C" fn r4os_rust_driver_thread_start(
     {
         let _g = RuntimeGuard::acquire();
         assert_eq!(
-            unsafe { m::r4os_rust_thread_owner_adopt(owners(), CAP, &mut create, r.cast()) },
+            unsafe { m::r4os_rust_thread_owner_adopt(owners(), &mut create, r.cast()) },
             0
         )
     }
@@ -786,7 +765,7 @@ fn remove(owner: u32, handle: u64, allow_private: bool) -> i32 {
             return a::driver_thread_error_self_join;
         }
         let c = unsafe {
-            m::r4os_rust_thread_owner_remove(owners(), CAP, owner, handle, ticket.as_mut_ptr())
+            m::r4os_rust_thread_owner_remove(owners(), owner, handle, ticket.as_mut_ptr())
         };
         if c != 0 {
             return code(c);
@@ -799,7 +778,6 @@ fn remove(owner: u32, handle: u64, allow_private: bool) -> i32 {
         unsafe {
             m::r4os_rust_thread_owner_finish_remove(
                 owners(),
-                CAP,
                 &mut ticket,
                 result == a::driver_thread_ok,
             )
@@ -819,7 +797,7 @@ pub extern "C" fn r4os_rust_driver_thread_stop_existing(owner: u32) {
     loop {
         let _g = RuntimeGuard::acquire();
         let mut r = ptr::null_mut();
-        if unsafe { m::r4os_rust_thread_owner_after(owners(), CAP, owner, cursor, &mut r) } != 0
+        if unsafe { m::r4os_rust_thread_owner_after(owners(), owner, cursor, &mut r) } != 0
             || r.is_null()
         {
             return;
@@ -840,7 +818,7 @@ pub extern "C" fn r4os_rust_driver_thread_stop_existing(owner: u32) {
 pub extern "C" fn r4os_rust_driver_thread_close(owner: u32) {
     {
         let _g = RuntimeGuard::acquire();
-        unsafe { m::r4os_rust_thread_owner_mutate(owners(), CAP, owner, 0, 1) };
+        unsafe { m::r4os_rust_thread_owner_mutate(owners(), owner, 0, 1) };
     }
     r4os_rust_driver_thread_stop_existing(owner)
 }
@@ -882,7 +860,7 @@ fn cleanup(owner: u32) -> Cleanup {
         }
         if s.records == 0 {
             assert_eq!(
-                unsafe { m::r4os_rust_thread_owner_mutate(owners(), CAP, owner, 0, 2) },
+                unsafe { m::r4os_rust_thread_owner_mutate(owners(), owner, 0, 2) },
                 0
             );
             return result;
@@ -903,7 +881,7 @@ fn cleanup(owner: u32) -> Cleanup {
             let _g = RuntimeGuard::acquire();
             let mut r = ptr::null_mut();
             assert_eq!(
-                unsafe { m::r4os_rust_thread_owner_after(owners(), CAP, owner, 0, &mut r) },
+                unsafe { m::r4os_rust_thread_owner_after(owners(), owner, 0, &mut r) },
                 0
             );
             if r.is_null() {
@@ -934,7 +912,7 @@ fn cleanup(owner: u32) -> Cleanup {
         result.released += 1;
     }
     let _g = RuntimeGuard::acquire();
-    if unsafe { m::r4os_rust_thread_owner_mutate(owners(), CAP, owner, 0, 2) } != 0 {
+    if unsafe { m::r4os_rust_thread_owner_mutate(owners(), owner, 0, 2) } != 0 {
         result.quiesced = false
     }
     result
@@ -1001,3 +979,27 @@ unsafe extern "C" fn thread_main() {
 const _: () = {
     assert!(core::mem::offset_of!(Record, payload) == 80);
 };
+
+impl Empty for m::Owner {
+    const EMPTY: Self = m::Owner {
+        stats: m::Stats {
+            epoch: 0,
+            records: 0,
+            active: 0,
+            completed: 0,
+            private: 0,
+            starts: 0,
+            start_failures: 0,
+            releases: 0,
+            release_failures: 0,
+            pending_creates: 0,
+            pending_releases: 0,
+            leases: 0,
+            closing: false,
+        },
+        tree: Tree {
+            root: ptr::null_mut(),
+            xorshift: 0,
+        },
+    };
+}

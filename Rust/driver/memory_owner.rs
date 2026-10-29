@@ -1,5 +1,6 @@
 //! R4D resident CPU allocation metadata. Actual heap allocation/free occurs
 //! outside the runtime owner; successful free never dereferences its record.
+use crate::driver::owner_table::Rows;
 use crate::driver::treap::{Node, Tree};
 use core::{mem::size_of, ptr};
 #[repr(C)]
@@ -85,26 +86,25 @@ const _: () = {
     assert!(size_of::<Owner>() == 112);
 };
 // 1 Invalid, 2 Owner, 3 Stale, 4 Closed, 5 Busy, 6 Exhausted, 7 Overflow.
-unsafe fn slot<'a>(owners: *mut Owner, capacity: usize, id: u32) -> Result<&'a mut Owner, u8> {
-    if id == 0 || id as usize > capacity {
+unsafe fn slot<'a>(rows: Rows<Owner>, id: u32) -> Result<&'a mut Owner, u8> {
+    if id == 0 {
         return Err(2);
     }
-    Ok(unsafe { &mut *owners.add((id - 1) as usize) })
+    let row = unsafe { rows.get((id - 1) as usize) };
+    if row.is_null() {
+        return Err(2);
+    }
+    Ok(unsafe { &mut *row })
 }
-unsafe fn current<'a>(owners: *mut Owner, capacity: usize, id: u32) -> Result<&'a mut Owner, u8> {
-    let entry = unsafe { slot(owners, capacity, id) }?;
+unsafe fn current<'a>(rows: Rows<Owner>, id: u32) -> Result<&'a mut Owner, u8> {
+    let entry = unsafe { slot(rows, id) }?;
     if entry.stats.epoch == 0 {
         return Err(3);
     }
     Ok(entry)
 }
-unsafe fn matching<'a>(
-    owners: *mut Owner,
-    capacity: usize,
-    id: u32,
-    epoch: u64,
-) -> Result<&'a mut Owner, u8> {
-    let entry = unsafe { current(owners, capacity, id) }?;
+unsafe fn matching<'a>(rows: Rows<Owner>, id: u32, epoch: u64) -> Result<&'a mut Owner, u8> {
+    let entry = unsafe { current(rows, id) }?;
     if entry.stats.epoch != epoch {
         return Err(3);
     }
@@ -148,8 +148,7 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_layout(
 /// driver owner. Backend callbacks preserve that owner and exact record lifetime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_memory_mutate(
-    owners: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     operation: u8,
     id: u32,
     epoch: u64,
@@ -160,7 +159,7 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_mutate(
                 if epoch == 0 {
                     return Err(1);
                 }
-                let e = unsafe { slot(owners, cap, id) }?;
+                let e = unsafe { slot(rows, id) }?;
                 if e.stats.epoch != 0 {
                     if e.stats.epoch != epoch {
                         return Err(5);
@@ -179,12 +178,12 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_mutate(
                 };
             }
             1 => {
-                if let Ok(e) = unsafe { current(owners, cap, id) } {
+                if let Ok(e) = unsafe { current(rows, id) } {
                     e.stats.closing = true
                 }
             }
             2 => {
-                let e = unsafe { slot(owners, cap, id) }?;
+                let e = unsafe { slot(rows, id) }?;
                 if e.stats.epoch == 0 {
                     return Ok(());
                 }
@@ -208,13 +207,12 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_mutate(
 /// driver owner. Backend callbacks preserve that owner and exact record lifetime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_memory_snapshot(
-    owners: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     id: u32,
     out: *mut Stats,
 ) -> u8 {
     status((|| {
-        let e = unsafe { current(owners, cap, id) }?;
+        let e = unsafe { current(rows, id) }?;
         unsafe { ptr::write(out, e.stats) };
         Ok(())
     })())
@@ -224,15 +222,14 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_snapshot(
 /// driver owner. Backend callbacks preserve that owner and exact record lifetime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_memory_begin(
-    owners: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     next: *mut u64,
     id: u32,
     layout: *const Layout,
     out: *mut Create,
 ) -> u8 {
     status((|| {
-        let e = unsafe { current(owners, cap, id) }?;
+        let e = unsafe { current(rows, id) }?;
         if e.stats.closing {
             return Err(4);
         }
@@ -266,8 +263,7 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_begin(
 /// driver owner. Backend callbacks preserve that owner and exact record lifetime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_memory_abort(
-    owners: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     create: *mut Create,
 ) -> u8 {
     status((|| {
@@ -275,7 +271,7 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_abort(
         if !c.active {
             return Err(3);
         }
-        let e = unsafe { matching(owners, cap, c.owner, c.epoch) }?;
+        let e = unsafe { matching(rows, c.owner, c.epoch) }?;
         assert!(e.stats.pending_creates != 0);
         e.stats.pending_creates -= 1;
         e.stats.allocation_failures = e.stats.allocation_failures.saturating_add(1);
@@ -288,8 +284,7 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_abort(
 /// driver owner. Backend callbacks preserve that owner and exact record lifetime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_memory_adopt(
-    owners: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     create: *mut Create,
     backing: *mut u8,
     length: usize,
@@ -300,7 +295,7 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_adopt(
         if !c.active {
             return Err(3);
         }
-        let e = unsafe { matching(owners, cap, c.owner, c.epoch) }?;
+        let e = unsafe { matching(rows, c.owner, c.epoch) }?;
         let l = c.layout;
         assert!(length == l.heap_bytes && (backing as usize).is_multiple_of(l.alignment as usize));
         let r = backing.cast::<Record>();
@@ -344,8 +339,7 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_adopt(
     })())
 }
 unsafe fn begin_release(
-    owners: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     id: u32,
     handle: u64,
     out: *mut Release,
@@ -353,7 +347,7 @@ unsafe fn begin_release(
     if handle == 0 {
         return Err(1);
     }
-    let e = unsafe { current(owners, cap, id) }?;
+    let e = unsafe { current(rows, id) }?;
     if e.stats.pending_releases == u32::MAX {
         return Err(5);
     }
@@ -387,21 +381,19 @@ unsafe fn begin_release(
 /// driver owner. Backend callbacks preserve that owner and exact record lifetime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_memory_release(
-    owners: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     id: u32,
     handle: u64,
     out: *mut Release,
 ) -> u8 {
-    status(unsafe { begin_release(owners, cap, id, handle, out) })
+    status(unsafe { begin_release(rows, id, handle, out) })
 }
 /// # Safety
 /// Aligned private C records are resident and exclusive under the enclosing
 /// driver owner. Backend callbacks preserve that owner and exact record lifetime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_memory_finish_release(
-    owners: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     release: *mut Release,
     success: bool,
 ) -> u8 {
@@ -410,7 +402,7 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_finish_release(
         if !r.active {
             return Err(3);
         }
-        let e = unsafe { matching(owners, cap, r.owner, r.epoch) }?;
+        let e = unsafe { matching(rows, r.owner, r.epoch) }?;
         assert!(e.stats.pending_releases != 0);
         e.stats.pending_releases -= 1;
         if success {
@@ -438,14 +430,13 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_finish_release(
 /// driver owner. Backend callbacks preserve that owner and exact record lifetime.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_memory_cleanup(
-    owners: *mut Owner,
-    cap: usize,
+    rows: Rows<Owner>,
     id: u32,
     out: *mut Release,
     present: *mut bool,
 ) -> u8 {
     status((|| {
-        let e = unsafe { current(owners, cap, id) }?;
+        let e = unsafe { current(rows, id) }?;
         if !e.stats.closing || e.stats.pending_creates != 0 || e.stats.pending_releases != 0 {
             return Err(5);
         }
@@ -455,6 +446,6 @@ pub unsafe extern "C" fn r4os_rust_driver_memory_cleanup(
             return Ok(());
         }
         let key = unsafe { (*node).key };
-        unsafe { begin_release(owners, cap, id, key, out) }
+        unsafe { begin_release(rows, id, key, out) }
     })())
 }

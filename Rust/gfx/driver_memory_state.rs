@@ -2,6 +2,7 @@
 //! Resident intrusive nodes retain self/state addresses through page walks;
 //! metadata lookup never allocates, walks pages or invokes device callbacks.
 use super::types::{Error, Owner};
+use crate::driver::owner_table::Rows;
 use crate::{
     contract as a,
     driver::treap::{Node, Tree},
@@ -66,8 +67,7 @@ impl Default for Device {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct View {
-    pub epochs: *mut Epoch,
-    pub capacity: usize,
+    pub epochs: Rows<Epoch>,
     pub devices: *mut Tree,
     pub identity: usize,
 }
@@ -101,8 +101,8 @@ impl View {
         if id == 0 {
             return ptr::null_mut();
         }
-        for i in 0..self.capacity {
-            let e = unsafe { self.epochs.add(i) };
+        for i in 0..unsafe { self.epochs.len() } {
+            let e = unsafe { self.epochs.get(i) };
             if unsafe { ptr::addr_of!((*e).identity.id).read() } == id {
                 return e;
             }
@@ -121,8 +121,8 @@ impl View {
             if id == 0 || generation == 0 || !self.find(u64::from(id)).is_null() {
                 return false;
             }
-            for i in 0..self.capacity {
-                let e = self.epochs.add(i);
+            for i in 0..self.epochs.len() {
+                let e = self.epochs.get(i);
                 if (*e).identity.id == 0 {
                     e.write(Epoch {
                         identity: Owner {
@@ -412,9 +412,8 @@ const _: () = {
     assert!(core::mem::offset_of!(Device, owner) == 56);
     assert!(core::mem::offset_of!(Device, descriptor) == 80);
     assert!(core::mem::offset_of!(Device, busy) == 160);
-    assert!(size_of::<View>() == 32);
+    assert!(size_of::<View>() == 24);
     assert!(core::mem::offset_of!(View, epochs) == 0);
-    assert!(core::mem::offset_of!(View, capacity) == 8);
-    assert!(core::mem::offset_of!(View, devices) == 16);
-    assert!(core::mem::offset_of!(View, identity) == 24);
+    assert!(core::mem::offset_of!(View, devices) == 8);
+    assert!(core::mem::offset_of!(View, identity) == 16);
 };

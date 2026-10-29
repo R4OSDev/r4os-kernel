@@ -9,7 +9,11 @@ use crate::{
     arch::runtime,
     boot::info,
     contract as a,
-    driver::{mmio_windows as windows, registry::MAX_DRIVERS, treap::Tree},
+    driver::{
+        mmio_windows as windows, owner_storage,
+        owner_table::{Empty, Rows, Table},
+        treap::Tree,
+    },
     memory::{heap, paging},
     platform::cpu,
     sched::scheduler,
@@ -36,12 +40,15 @@ const EMPTY_EPOCH: model::Epoch = model::Epoch {
     mmio_pending: false,
     devices: 0,
 };
+impl Empty for model::Epoch {
+    const EMPTY: Self = EMPTY_EPOCH;
+}
 struct State {
-    epochs: [model::Epoch; MAX_DRIVERS],
+    epochs: Table<model::Epoch>,
     devices: Tree,
 }
 static STATE: Cell<State> = Cell(UnsafeCell::new(State {
-    epochs: [EMPTY_EPOCH; MAX_DRIVERS],
+    epochs: Table::new(),
     devices: Tree {
         root: ptr::null_mut(),
         xorshift: 0,
@@ -51,8 +58,7 @@ unsafe fn state() -> model::View {
     unsafe {
         let s = STATE.0.get();
         model::View {
-            epochs: ptr::addr_of_mut!((*s).epochs).cast(),
-            capacity: MAX_DRIVERS,
+            epochs: Rows::resident(ptr::addr_of_mut!((*s).epochs)),
             devices: ptr::addr_of_mut!((*s).devices),
             identity: s.addr(),
         }
@@ -81,6 +87,15 @@ impl Drop for Lifecycle {
     }
 }
 pub fn bind(id: u32, generation: u64) -> bool {
+    if id == 0
+        || !owner_storage::ensure(
+            unsafe { ptr::addr_of_mut!((*STATE.0.get()).epochs) },
+            id as usize - 1,
+            Lifecycle::acquire,
+        )
+    {
+        return false;
+    }
     let _owner = Lifecycle::acquire();
     unsafe { state().bind(id, generation) }
 }

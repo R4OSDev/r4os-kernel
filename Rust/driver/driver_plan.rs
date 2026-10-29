@@ -1,8 +1,8 @@
 //! Original boot load plan, directives, accounting and optional driver results.
 //! Only metadata access holds Runtime; no state reference spans R4D or display.
 use crate::{arch::runtime, driver::registry};
+use alloc::vec::Vec;
 use core::{cell::UnsafeCell, ffi::c_void, mem, ptr, slice};
-pub const MAX_PLAN: usize = 12;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Summary {
@@ -71,15 +71,11 @@ impl Planned {
     };
 }
 struct State {
-    plan: [Planned; MAX_PLAN],
-    count: usize,
     summary: Summary,
 }
 struct Shared(UnsafeCell<State>);
 unsafe impl Sync for Shared {}
 static STATE: Shared = Shared(UnsafeCell::new(State {
-    plan: [Planned::EMPTY; MAX_PLAN],
-    count: 0,
     summary: Summary::EMPTY,
 }));
 
@@ -131,20 +127,11 @@ unsafe fn ensure(config: *const c_void) {
         unsafe { begin(config) };
     }
 }
-unsafe fn add(config: *const c_void, name: &[u8]) {
+unsafe fn add(config: *const c_void, name: &[u8], plan: &mut Vec<Planned>) {
     if name.is_empty() {
         change(|s| {
             s.summary.skipped += 1;
             s.summary.name_invalid += 1;
-            s.summary.warnings += 1;
-        });
-        return;
-    }
-    if change(|s| s.count) >= MAX_PLAN {
-        effect(3, name, 0);
-        change(|s| {
-            s.summary.skipped += 1;
-            s.summary.capacity_limited += 1;
             s.summary.warnings += 1;
         });
         return;
@@ -159,7 +146,9 @@ unsafe fn add(config: *const c_void, name: &[u8]) {
             return;
         }
     }
-    if change(|s| (0..s.count).any(|i| s.plan[i].name[..s.plan[i].len].eq_ignore_ascii_case(name)))
+    if plan
+        .iter()
+        .any(|p| p.name[..p.len].eq_ignore_ascii_case(name))
     {
         effect(5, name, 0);
         change(|s| {
@@ -168,16 +157,13 @@ unsafe fn add(config: *const c_void, name: &[u8]) {
         });
         return;
     }
-    change(|s| {
-        let target = &mut s.plan[s.count];
-        let len = name.len().min(23);
-        for (output, input) in target.name[..len].iter_mut().zip(&name[..len]) {
-            *output = input.to_ascii_uppercase();
-        }
-        target.name[len] = 0;
-        target.len = len;
-        s.count += 1;
-    });
+    let mut target = Planned::EMPTY;
+    let len = name.len().min(23);
+    for (output, input) in target.name[..len].iter_mut().zip(&name[..len]) {
+        *output = input.to_ascii_uppercase();
+    }
+    target.len = len;
+    plan.push(target);
 }
 fn record(result: u8) {
     change(|s| match result {
@@ -252,7 +238,18 @@ pub unsafe extern "C" fn r4os_rust_driver_plan_control(operation: u8, config: *c
             0 => begin(config),
             1 => {
                 ensure(config);
-                change(|s| s.count = 0);
+                let requested = input(config, 0, 0) as usize;
+                let mut plan = Vec::new();
+                if input(config, 6, 0) != 0 || plan.try_reserve_exact(requested).is_err() {
+                    effect(3, b"metadata-memory", 0);
+                    change(|s| {
+                        s.summary.skipped += requested;
+                        s.summary.capacity_limited += requested.max(1);
+                        s.summary.load_failed += requested;
+                        s.summary.warnings += 1;
+                    });
+                    return;
+                }
                 effect(0, b"", 0);
                 if input(config, 2, 0) != 0 {
                     effect(1, b"", 0);
@@ -261,19 +258,18 @@ pub unsafe extern "C" fn r4os_rust_driver_plan_control(operation: u8, config: *c
                     effect(2, b"", 0);
                 }
                 for i in 0..input(config, 0, 0) as usize {
-                    add(config, name(config, 4, i));
+                    add(config, name(config, 4, i), &mut plan);
                 }
                 let count = change(|s| {
-                    s.summary.selected = s.count;
-                    s.count
+                    s.summary.selected = plan.len();
+                    plan.len()
                 });
                 effect(
                     6,
                     b"",
                     u32::try_from(count).expect("Driver plan count exceeds u32"),
                 );
-                for i in 0..count {
-                    let planned = change(|s| s.plan[i]);
+                for planned in plan {
                     load(&planned.name[..planned.len]);
                 }
                 let after = registry::r4os_rust_driver_registry_count();
@@ -329,6 +325,7 @@ unsafe fn driver_plan_config(
             1 => (*c).disabled_count as u64,
             2 => u64::from((*c).auto_acpi),
             3 => u64::from((*c).auto_pci),
+            6 => u64::from((*c).driver_storage_failed),
             4 | 5 => {
                 let v = if operation == 4 {
                     crate::boot::config::driver_name(index)

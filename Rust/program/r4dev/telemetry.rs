@@ -159,7 +159,7 @@ pub unsafe extern "C" fn r4os_rust_r4dev_performance_driver_work(
     selected: u32,
     out: *mut c::ProgramDriverWorkPerformanceInfo,
 ) -> i32 {
-    if selected > work::OWNER_CAPACITY {
+    if selected != 0 && crate::driver::registry::get(selected as usize - 1).is_none() {
         unsafe {
             out.write(c::ProgramDriverWorkPerformanceInfo {
                 selected_owner: selected,

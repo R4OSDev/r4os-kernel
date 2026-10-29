@@ -1,6 +1,6 @@
 //! Exact existing owner/epoch resource handles, under DriverApi's wait-spanning
 //! owner admission. These C records own no file lease, path or backing buffer.
-use crate::{contract, driver::registry::MAX_DRIVERS};
+use crate::{contract, driver::owner_table::Rows};
 use core::{mem, ptr};
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -21,24 +21,20 @@ impl Binding {
 #[repr(C)]
 pub struct State {
     pub next_epoch: u64,
-    pub bindings: [Binding; MAX_DRIVERS],
+    pub bindings: Rows<Binding>,
 }
 const _: () = {
     assert!(mem::size_of::<Binding>() == 24);
     assert!(mem::offset_of!(Binding, module_generation) == 16);
-    assert!(mem::size_of::<State>() == 776);
+    assert!(mem::size_of::<State>() == 16);
     assert!(mem::offset_of!(State, bindings) == 8);
 };
 unsafe fn current(state: *const State, owner: u32) -> Result<*const Binding, u8> {
-    if owner == 0 || owner as usize > MAX_DRIVERS {
+    if owner == 0 {
         return Err(1);
     }
-    let binding = unsafe {
-        ptr::addr_of!((*state).bindings)
-            .cast::<Binding>()
-            .add(owner as usize - 1)
-    };
-    if unsafe { (*binding).epoch == 0 || (*binding).closing } {
+    let binding = unsafe { (*state).bindings.get(owner as usize - 1).cast_const() };
+    if binding.is_null() || unsafe { (*binding).epoch == 0 || (*binding).closing } {
         return Err(3);
     }
     Ok(binding)
@@ -57,14 +53,13 @@ pub unsafe extern "C" fn r4os_rust_resource_state_mutate(
 ) -> u8 {
     match operation {
         0 => {
-            if owner == 0 || owner as usize > MAX_DRIVERS || generation == 0 {
+            if owner == 0 || generation == 0 {
                 return 1;
             }
-            let binding = unsafe {
-                ptr::addr_of_mut!((*state).bindings)
-                    .cast::<Binding>()
-                    .add(owner as usize - 1)
-            };
+            let binding = unsafe { (*state).bindings.get(owner as usize - 1) };
+            if binding.is_null() {
+                return 4;
+            }
             if unsafe { (*binding).epoch != 0 } {
                 return 2;
             }
@@ -83,12 +78,11 @@ pub unsafe extern "C" fn r4os_rust_resource_state_mutate(
             }
         }
         1 | 2 => {
-            if owner != 0 && owner as usize <= MAX_DRIVERS {
-                let binding = unsafe {
-                    ptr::addr_of_mut!((*state).bindings)
-                        .cast::<Binding>()
-                        .add(owner as usize - 1)
-                };
+            if owner != 0 {
+                let binding = unsafe { (*state).bindings.get(owner as usize - 1) };
+                if binding.is_null() {
+                    return 0;
+                }
                 if operation == 1 {
                     unsafe { (*binding).closing = true };
                 } else {

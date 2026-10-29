@@ -1,5 +1,9 @@
 //! Canonical R4D CPU allocation owner. Runtime admission protects metadata;
 //! actual heap I/O has only an exact task unwind token, never a metadata lock.
+use crate::driver::{
+    owner_storage,
+    owner_table::{Empty, Rows, Table},
+};
 use crate::{
     arch::runtime::RuntimeGuard,
     contract as a,
@@ -12,43 +16,26 @@ use core::{
     mem::{MaybeUninit, size_of},
     ptr,
 };
-const CAP: usize = crate::driver::registry::MAX_DRIVERS;
 #[repr(C)]
 struct State {
-    owners: [m::Owner; CAP],
+    owners: Table<m::Owner>,
     next_handle: u64,
 }
 struct Storage(UnsafeCell<State>);
 // SAFETY: all metadata mutation uses the existing scheduler runtime owner.
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new(State {
-    owners: [const {
-        m::Owner {
-            stats: m::Stats {
-                epoch: 0,
-                allocations: 0,
-                bytes: 0,
-                backing_bytes: 0,
-                peak_bytes: 0,
-                private_allocations: 0,
-                allocation_calls: 0,
-                allocation_failures: 0,
-                releases: 0,
-                release_failures: 0,
-                pending_creates: 0,
-                pending_releases: 0,
-                closing: false,
-            },
-            tree: Tree {
-                root: ptr::null_mut(),
-                xorshift: 0,
-            },
-        }
-    }; CAP],
+    owners: Table::new(),
     next_handle: 1,
 }));
-fn owners() -> *mut m::Owner {
-    unsafe { ptr::addr_of_mut!((*STATE.0.get()).owners).cast() }
+fn owner_table() -> *mut Table<m::Owner> {
+    unsafe { ptr::addr_of_mut!((*STATE.0.get()).owners) }
+}
+fn owners() -> Rows<m::Owner> {
+    Rows::resident(owner_table())
+}
+pub(crate) fn prepare(owner: u32) -> bool {
+    owner != 0 && owner_storage::runtime(owner_table(), owner as usize - 1)
 }
 fn code(value: u8) -> i32 {
     match value {
@@ -87,18 +74,21 @@ unsafe fn valid<T>(output: *const T) -> bool {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_heap_bind(owner: u32, epoch: u64) -> bool {
+    if !prepare(owner) {
+        return false;
+    }
     let _g = RuntimeGuard::acquire();
-    unsafe { m::r4os_rust_driver_memory_mutate(owners(), CAP, 0, owner, epoch) == 0 }
+    unsafe { m::r4os_rust_driver_memory_mutate(owners(), 0, owner, epoch) == 0 }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_heap_close(owner: u32) {
     let _g = RuntimeGuard::acquire();
-    unsafe { m::r4os_rust_driver_memory_mutate(owners(), CAP, 1, owner, 0) };
+    unsafe { m::r4os_rust_driver_memory_mutate(owners(), 1, owner, 0) };
 }
 fn snapshot(owner: u32) -> Result<m::Stats, i32> {
     let _g = RuntimeGuard::acquire();
     let mut s = MaybeUninit::uninit();
-    let c = unsafe { m::r4os_rust_driver_memory_snapshot(owners(), CAP, owner, s.as_mut_ptr()) };
+    let c = unsafe { m::r4os_rust_driver_memory_snapshot(owners(), owner, s.as_mut_ptr()) };
     if c != 0 {
         return Err(code(c));
     }
@@ -146,7 +136,6 @@ pub unsafe extern "C" fn r4os_rust_driver_heap_allocate(
         let c = unsafe {
             m::r4os_rust_driver_memory_begin(
                 owners(),
-                CAP,
                 ptr::addr_of_mut!((*STATE.0.get()).next_handle),
                 owner,
                 &layout,
@@ -162,7 +151,7 @@ pub unsafe extern "C" fn r4os_rust_driver_heap_allocate(
     if backing.is_null() {
         let _g = RuntimeGuard::acquire();
         assert_eq!(
-            unsafe { m::r4os_rust_driver_memory_abort(owners(), CAP, &mut create) },
+            unsafe { m::r4os_rust_driver_memory_abort(owners(), &mut create) },
             0
         );
         return a::driver_heap_error_memory;
@@ -174,7 +163,6 @@ pub unsafe extern "C" fn r4os_rust_driver_heap_allocate(
             unsafe {
                 m::r4os_rust_driver_memory_adopt(
                     owners(),
-                    CAP,
                     &mut create,
                     backing,
                     layout.heap_bytes,
@@ -207,7 +195,7 @@ fn release_backing(ticket: &mut m::Release) -> i32 {
         unsafe { heap::r4os_rust_heap_free(ticket.record.cast(), ticket.heap_bytes) } == 0;
     let _g = RuntimeGuard::acquire();
     assert_eq!(
-        unsafe { m::r4os_rust_driver_memory_finish_release(owners(), CAP, ticket, released) },
+        unsafe { m::r4os_rust_driver_memory_finish_release(owners(), ticket, released) },
         0
     );
     if released {
@@ -225,7 +213,7 @@ pub extern "C" fn r4os_rust_driver_heap_release(owner: u32, handle: u64) -> i32 
     {
         let _g = RuntimeGuard::acquire();
         let c = unsafe {
-            m::r4os_rust_driver_memory_release(owners(), CAP, owner, handle, ticket.as_mut_ptr())
+            m::r4os_rust_driver_memory_release(owners(), owner, handle, ticket.as_mut_ptr())
         };
         if c != 0 {
             return code(c);
@@ -307,7 +295,6 @@ fn cleanup(owner: u32) -> Cleanup {
             let c = unsafe {
                 m::r4os_rust_driver_memory_cleanup(
                     owners(),
-                    CAP,
                     owner,
                     ticket.as_mut_ptr(),
                     &mut present,
@@ -331,7 +318,7 @@ fn cleanup(owner: u32) -> Cleanup {
         result.bytes += bytes;
     }
     let _g = RuntimeGuard::acquire();
-    if unsafe { m::r4os_rust_driver_memory_mutate(owners(), CAP, 2, owner, 0) } != 0 {
+    if unsafe { m::r4os_rust_driver_memory_mutate(owners(), 2, owner, 0) } != 0 {
         result.quiesced = false
     }
     result
@@ -342,4 +329,28 @@ fn cleanup(owner: u32) -> Cleanup {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_heap_cleanup(owner: u32, out: *mut Cleanup) {
     unsafe { ptr::write(out, cleanup(owner)) };
+}
+
+impl Empty for m::Owner {
+    const EMPTY: Self = m::Owner {
+        stats: m::Stats {
+            epoch: 0,
+            allocations: 0,
+            bytes: 0,
+            backing_bytes: 0,
+            peak_bytes: 0,
+            private_allocations: 0,
+            allocation_calls: 0,
+            allocation_failures: 0,
+            releases: 0,
+            release_failures: 0,
+            pending_creates: 0,
+            pending_releases: 0,
+            closing: false,
+        },
+        tree: Tree {
+            root: ptr::null_mut(),
+            xorshift: 0,
+        },
+    };
 }
