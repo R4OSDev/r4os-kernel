@@ -225,6 +225,7 @@ pub unsafe extern "C" fn r4os_rust_driver_synth(name: *const u8, d: *const a::Sy
                 render_pcm: validation::r4os_rust_driver_synth_pcm(d),
                 external: true,
             },
+            admission::r4os_rust_driver_api_runtime_owner(false),
         )
     }
 }

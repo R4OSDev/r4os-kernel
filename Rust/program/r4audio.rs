@@ -35,7 +35,12 @@ pub unsafe extern "C" fn r4os_rust_r4audio_set_volume(stream_id: u32, fixed_volu
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4audio_sid_acquire() -> i32 {
-    unsafe { audio::sid_acquire() }
+    unsafe {
+        let Some(owner) = super::domain_api::audio_owner() else {
+            return crate::contract::service_api_result_invalid;
+        };
+        audio::sid_acquire_for_owner(owner)
+    }
 }
 /// # Safety
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
@@ -45,13 +50,23 @@ pub unsafe extern "C" fn r4os_rust_r4audio_sid_write_register(
     register: u8,
     value: u8,
 ) -> i32 {
-    unsafe { audio::sid_write_register(handle, register, value) }
+    unsafe {
+        let Some(owner) = super::domain_api::audio_owner() else {
+            return crate::contract::service_api_result_invalid;
+        };
+        audio::sid_write_register_for_owner(owner, handle, register, value)
+    }
 }
 /// # Safety
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4audio_sid_release(handle: u32) -> i32 {
-    unsafe { audio::sid_release(handle) }
+    unsafe {
+        let Some(owner) = super::domain_api::audio_owner() else {
+            return crate::contract::service_api_result_invalid;
+        };
+        audio::sid_release_for_owner(owner, handle)
+    }
 }
 /// # Safety
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
@@ -62,13 +77,23 @@ pub unsafe extern "C" fn r4os_rust_r4audio_sid_load_data(
     data_ptr: *const u8,
     byte_count: u32,
 ) -> i32 {
-    unsafe { audio::sid_load_data(handle, load_addr, data_ptr, byte_count) }
+    unsafe {
+        let Some(owner) = super::domain_api::audio_owner() else {
+            return crate::contract::service_api_result_invalid;
+        };
+        audio::sid_load_data_for_owner(owner, handle, load_addr, data_ptr, byte_count)
+    }
 }
 /// # Safety
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4audio_sid_init(handle: u32, init_addr: u16, song: u16) -> i32 {
-    unsafe { audio::sid_init(handle, init_addr, song) }
+    unsafe {
+        let Some(owner) = super::domain_api::audio_owner() else {
+            return crate::contract::service_api_result_invalid;
+        };
+        audio::sid_init_for_owner(owner, handle, init_addr, song)
+    }
 }
 /// # Safety
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
@@ -78,13 +103,23 @@ pub unsafe extern "C" fn r4os_rust_r4audio_sid_play_frame(
     play_addr: u16,
     frame_hz: u16,
 ) -> i32 {
-    unsafe { audio::sid_play_frame(handle, play_addr, frame_hz) }
+    unsafe {
+        let Some(owner) = super::domain_api::audio_owner() else {
+            return crate::contract::service_api_result_invalid;
+        };
+        audio::sid_play_frame_for_owner(owner, handle, play_addr, frame_hz)
+    }
 }
 /// # Safety
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4audio_sid_stop(handle: u32) -> i32 {
-    unsafe { audio::sid_stop(handle) }
+    unsafe {
+        let Some(owner) = super::domain_api::audio_owner() else {
+            return crate::contract::service_api_result_invalid;
+        };
+        audio::sid_stop_for_owner(owner, handle)
+    }
 }
 /// # Safety
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
@@ -96,7 +131,12 @@ pub unsafe extern "C" fn r4os_rust_r4audio_sid_model_name() -> *const u8 {
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4audio_midi_open_synth(backend: *const u8) -> i32 {
-    unsafe { audio::midi_open_synth(backend) }
+    unsafe {
+        let Some(owner) = super::domain_api::audio_owner() else {
+            return crate::contract::service_api_result_invalid;
+        };
+        audio::midi_open_synth_for_owner(owner, backend)
+    }
 }
 /// # Safety
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
@@ -108,13 +148,23 @@ pub unsafe extern "C" fn r4os_rust_r4audio_midi_send(
     data1: u8,
     data2: u8,
 ) -> i32 {
-    unsafe { audio::midi_send(handle, channel, status, data1, data2) }
+    unsafe {
+        let Some(owner) = super::domain_api::audio_owner() else {
+            return crate::contract::service_api_result_invalid;
+        };
+        audio::midi_send_for_owner(owner, handle, channel, status, data1, data2)
+    }
 }
 /// # Safety
 /// Original R4AUDIO caller retains readable PCM/name spans until return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4audio_midi_close(handle: u32) -> i32 {
-    unsafe { audio::midi_close(handle) }
+    unsafe {
+        let Some(owner) = super::domain_api::audio_owner() else {
+            return crate::contract::service_api_result_invalid;
+        };
+        audio::midi_close_for_owner(owner, handle)
+    }
 }
 /// # Safety
 /// Original R4AUDIO caller retains readable PCM/name spans until return.

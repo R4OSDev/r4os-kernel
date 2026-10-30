@@ -5,6 +5,14 @@ use super::context;
 use crate::contract as c;
 use core::ptr;
 
+pub(super) unsafe fn audio_owner() -> Option<crate::audio::mixer::Owner> {
+    let handle = unsafe { context::handle()? };
+    Some(crate::audio::mixer::Owner {
+        instance_id: handle.instance_id,
+        generation: handle.generation,
+    })
+}
+
 /// # Safety
 /// Original resident canonical input/output buffers and exact program execution
 /// lifetime; the existing lower owner retains its admission/ACK contract.

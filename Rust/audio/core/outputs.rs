@@ -571,7 +571,7 @@ pub(super) unsafe fn write_active_pcm_owned(
     }
 }
 
-pub(super) unsafe fn finish_sid_output() -> i32 {
+pub(super) unsafe fn finish_synth_output(source: SynthSource) -> i32 {
     unsafe {
         // Avoid touching hardware for other real producers. Check again
         // after output admission because a PCM Open may win that lease.
@@ -579,7 +579,12 @@ pub(super) unsafe fn finish_sid_output() -> i32 {
             let Some(_streams) = StreamLock::acquire() else {
                 return BUSY;
             };
-            if open_stream_count() != 0 || g!(midi_acquired) {
+            if open_stream_count() != 0
+                || match source {
+                    SynthSource::Sid => midi_producing(),
+                    SynthSource::Midi => sid_producing(),
+                }
+            {
                 return 0;
             }
         }
@@ -590,11 +595,20 @@ pub(super) unsafe fn finish_sid_output() -> i32 {
             let Some(_streams) = StreamLock::acquire() else {
                 return BUSY;
             };
-            if open_stream_count() != 0 || g!(midi_acquired) {
+            if open_stream_count() != 0
+                || match source {
+                    SynthSource::Sid => midi_producing(),
+                    SynthSource::Midi => sid_producing(),
+                }
+            {
                 return 0;
             }
         }
-        if OUTPUT_REVISION.load(Ordering::Relaxed) != g!(sid_stop_revision) {
+        let revision = match source {
+            SynthSource::Sid => g!(sid_stop_revision),
+            SynthSource::Midi => g!(midi_stop_revision),
+        };
+        if OUTPUT_REVISION.load(Ordering::Relaxed) != revision {
             return 0;
         }
         let Some(slot) = g!(active_audio_slot) else {
@@ -615,14 +629,21 @@ pub(super) unsafe fn finish_sid_output() -> i32 {
                 0
             },
         };
-        if let Some(previous) = g!(sid_stop_target) {
+        let previous = match source {
+            SynthSource::Sid => g!(sid_stop_target),
+            SynthSource::Midi => g!(midi_stop_target),
+        };
+        if let Some(previous) = previous {
             if previous != target {
                 // Selection/unregister or another completed output end has
                 // already retired this exact target. Never idle its successor.
                 return 0;
             }
         } else {
-            g!(sid_stop_target) = Some(target);
+            match source {
+                SynthSource::Sid => g!(sid_stop_target) = Some(target),
+                SynthSource::Midi => g!(midi_stop_target) = Some(target),
+            }
         }
         idle_active_pcm_owned()
     }

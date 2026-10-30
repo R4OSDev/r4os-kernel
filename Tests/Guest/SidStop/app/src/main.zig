@@ -140,8 +140,17 @@ const Probe = struct {
         if (!self.controls(.{})) return false;
         const finished = self.audio.sidStop(1);
         const after = self.snapshot() orelse return false;
-        self.report("SID52 SOURCE first={d} second={d} final={d} registrations={d} register_result={d} private_calls={d} private_acks={d} idle_acks={d}", .{ first, second, finished, replacement.synth_registrations - before.synth_registrations, replacement.replace_result, after.sid_stop_calls - before.sid_stop_calls, after.sid_stop_acks - before.sid_stop_acks, after.idle_acks - before.idle_acks });
-        return first == a.service_api_result_busy and second == a.service_api_result_busy and finished == 0 and replacement.replace_result == 0 and replacement.synth_registrations == before.synth_registrations + 1 and after.sid_stop_calls == before.sid_stop_calls + 2 and after.sid_stop_acks == before.sid_stop_acks + 2 and after.idle_acks == before.idle_acks + 1;
+        const released = self.audio.sidRelease(1);
+        if (!self.controls(.{ .replace_requested = 1 })) return false;
+        _ = self.dev.performanceSummary() orelse return false;
+        const renewed = self.snapshot() orelse return false;
+        const acquired = self.audio.sidAcquire();
+        const played = self.play();
+        const stopped = self.audio.sidStop(1);
+        const closed = self.audio.sidRelease(1);
+        const final = self.snapshot() orelse return false;
+        self.report("SID52 SOURCE first={d} second={d} final={d} live_registrations={d} live_result={d} private_calls={d} private_acks={d} idle_acks={d} release={d} renewed_result={d} renewed_registrations={d} acquire={d} play={d} stop={d} close={d} final_private_acks={d} final_idle_acks={d}", .{ first, second, finished, replacement.synth_registrations - before.synth_registrations, replacement.replace_result, after.sid_stop_calls - before.sid_stop_calls, after.sid_stop_acks - before.sid_stop_acks, after.idle_acks - before.idle_acks, released, renewed.replace_result, renewed.synth_registrations - before.synth_registrations, acquired, played, stopped, closed, final.sid_stop_acks - before.sid_stop_acks, final.idle_acks - before.idle_acks });
+        return first == a.service_api_result_busy and second == a.service_api_result_busy and finished == 0 and replacement.replace_result == a.service_api_result_busy and replacement.synth_registrations == before.synth_registrations and after.sid_stop_calls == before.sid_stop_calls + 1 and after.sid_stop_acks == before.sid_stop_acks + 1 and after.idle_acks == before.idle_acks + 1 and released == 0 and renewed.replace_result == 0 and renewed.synth_registrations == before.synth_registrations + 1 and acquired == 1 and played == 0 and stopped == 0 and closed == 0 and final.sid_stop_acks == before.sid_stop_acks + 2 and final.idle_acks == before.idle_acks + 2;
     }
     fn last(self: *const Probe, failure: bool, resume_source: bool) bool {
         if (!self.controls(.{})) return false;

@@ -347,10 +347,14 @@ unsafe fn program_reap_action(
                 program_generation: handle.generation,
                 ..Default::default()
             }),
-            9 => crate::audio::core::close_streams_for_owner(crate::audio::mixer::Owner {
-                instance_id: handle.instance_id,
-                generation: handle.generation,
-            }),
+            9 => {
+                let owner = crate::audio::mixer::Owner {
+                    instance_id: handle.instance_id,
+                    generation: handle.generation,
+                };
+                crate::audio::core::close_synths_for_owner(owner)
+                    && crate::audio::core::close_streams_for_owner(owner)
+            }
             10 => crate::program::instance_storage::detach(
                 core::ptr::addr_of_mut!((*slot).instance),
                 node,

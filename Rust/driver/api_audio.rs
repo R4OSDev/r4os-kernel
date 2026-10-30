@@ -256,7 +256,7 @@ pub extern "C" fn r4os_rust_driver_audio_closing(owner: u32, closing: bool) -> b
             return false;
         }
     }
-    true
+    unsafe { audio::set_synth_driver_closing(owner, closing) }
 }
 #[repr(C)]
 pub struct Cleanup {
@@ -290,6 +290,9 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_cleanup(owner: u32, out: *mut Cl
         }
         unsafe { (*STATE.0.get())[i] = Record::EMPTY };
         result.removed += 1;
+    }
+    if !unsafe { audio::unregister_synth_driver(owner) } {
+        result.failed = true;
     }
     unsafe { ptr::write(out, result) };
 }

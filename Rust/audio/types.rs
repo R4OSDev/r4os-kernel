@@ -404,6 +404,9 @@ impl AudioBackend {
 }
 pub struct SynthEngine {
     pub registered: bool,
+    pub closing: bool,
+    pub driver_owner: u32,
+    pub generation: u64,
     pub name: [u8; 32],
     pub name_len: usize,
     pub config: SynthRegistration,
@@ -416,6 +419,9 @@ pub struct SynthEngine {
 impl SynthEngine {
     pub const EMPTY: Self = Self {
         registered: false,
+        closing: false,
+        driver_owner: 0,
+        generation: 0,
         name: [0; 32],
         name_len: 0,
         config: SynthRegistration {

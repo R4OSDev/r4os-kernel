@@ -5,10 +5,6 @@ fn sid_resumed() {
     SID_PHASE.store(SID_RUNNING, Ordering::Release);
 }
 
-pub(super) unsafe fn sid_producing() -> bool {
-    unsafe { g!(sid_acquired) && SID_PHASE.load(Ordering::Acquire) == SID_RUNNING }
-}
-
 pub(crate) unsafe fn configure_sid_model(model: &[u8]) {
     unsafe {
         g!(sid_model_option) = Span {
@@ -21,10 +17,14 @@ pub(crate) unsafe fn configure_sid_model(model: &[u8]) {
 
 pub(crate) unsafe fn apply_configured_sid_model() -> i32 {
     unsafe {
+        let Some(_execution) = sessions::Execution::acquire(SynthSource::Sid) else {
+            return BUSY;
+        };
         if let Some(p) = sid_engine() {
             let config = (*p).config;
             if let Some(set_model) = config.sid_model {
-                g!(sid_last_result) = set_model(config.context, sid_model_id());
+                g!(sid_last_result) =
+                    sessions::callback(p, || set_model(config.context, sid_model_id()));
                 return g!(sid_last_result);
             }
         }
@@ -50,7 +50,7 @@ pub(crate) unsafe fn sid_acquire() -> i32 {
         if g!(sid_acquired) {
             return -2;
         }
-        let result = acquire(c.context);
+        let result = sessions::callback(p, || acquire(c.context));
         g!(sid_last_result) = result;
         if result > 0 {
             g!(sid_acquired) = true;
@@ -75,7 +75,9 @@ pub(crate) unsafe fn sid_write_register(handle: u32, register: u8, value: u8) ->
         g!(sid_last_register) = register;
         g!(sid_last_value) = value;
         g!(sid_write_count) += 1;
-        g!(sid_last_result) = write(c.context, handle, register as u32, value as u32);
+        g!(sid_last_result) = sessions::callback(p, || {
+            write(c.context, handle, register as u32, value as u32)
+        });
         if g!(sid_last_result) == 0 {
             sid_resumed();
         }
@@ -93,10 +95,16 @@ pub(crate) unsafe fn sid_release(handle: u32) -> i32 {
         if handle != 1 || !g!(sid_acquired) {
             return -1;
         }
-        g!(sid_last_result) = release(c.context, handle);
-        g!(sid_acquired) = false;
-        g!(sid_pcm_pending_len) = 0;
-        sid_resumed();
+        let stopped = sid_stop(handle);
+        if stopped != 0 {
+            return stopped;
+        }
+        g!(sid_last_result) = sessions::callback(p, || release(c.context, handle));
+        if g!(sid_last_result) == 0 {
+            g!(sid_acquired) = false;
+            g!(sid_pcm_pending_len) = 0;
+            sid_resumed();
+        }
         g!(sid_last_result)
     }
 }
@@ -117,7 +125,9 @@ pub(crate) unsafe fn sid_load_data(
         if byte_count == 0 || byte_count > 65_536 {
             return -2;
         }
-        g!(sid_last_result) = load(c.context, handle, load_addr as u32, data, byte_count);
+        g!(sid_last_result) = sessions::callback(p, || {
+            load(c.context, handle, load_addr as u32, data, byte_count)
+        });
         if g!(sid_last_result) == 0 {
             sid_resumed();
             byte_count.try_into().unwrap()
@@ -135,7 +145,8 @@ pub(crate) unsafe fn sid_init(handle: u32, init_addr: u16, song: u16) -> i32 {
         if handle != 1 || !g!(sid_acquired) {
             return -1;
         }
-        g!(sid_last_result) = init(c.context, handle, init_addr as u32, song as u32);
+        g!(sid_last_result) =
+            sessions::callback(p, || init(c.context, handle, init_addr as u32, song as u32));
         if g!(sid_last_result) == 0 {
             sid_resumed();
         }
@@ -155,6 +166,9 @@ pub(crate) unsafe fn sid_play_frame(handle: u32, play_addr: u16, frame_hz: u16) 
         if g!(sid_pcm_pending_len) != 0 {
             return flush_pending_sid_pcm();
         }
+        let Some(callback) = sessions::Callback::enter(p) else {
+            return BUSY;
+        };
         g!(sid_last_result) = play(c.context, handle, play_addr as u32, frame_hz as u32);
         if g!(sid_last_result) != 0 {
             return g!(sid_last_result);
@@ -178,6 +192,7 @@ pub(crate) unsafe fn sid_play_frame(handle: u32, play_addr: u16, frame_hz: u16) 
         g!(sid_pcm_pending_len) = rendered as u32;
         g!(sid_pcm_writes) = g!(sid_pcm_writes).wrapping_add(1);
         (*p).renders = (*p).renders.wrapping_add(1);
+        drop(callback);
         flush_pending_sid_pcm()
     }
 }
@@ -196,7 +211,7 @@ pub(crate) unsafe fn sid_stop(handle: u32) -> i32 {
         }
         if SID_PHASE.load(Ordering::Acquire) == SID_RUNNING {
             let revision = OUTPUT_REVISION.load(Ordering::Acquire);
-            g!(sid_last_result) = stop(c.context);
+            g!(sid_last_result) = sessions::callback(p, || stop(c.context));
             if g!(sid_last_result) != 0 {
                 // The private source has not acknowledged Stop. Its pending
                 // rendered PCM and the shared output still belong to it.
@@ -208,7 +223,7 @@ pub(crate) unsafe fn sid_stop(handle: u32) -> i32 {
             g!(sid_stop_revision) = revision;
             SID_PHASE.store(SID_QUIET, Ordering::Release);
         }
-        g!(sid_last_result) = finish_sid_output();
+        g!(sid_last_result) = finish_synth_output(SynthSource::Sid);
         if g!(sid_last_result) == 0 {
             SID_PHASE.store(SID_STOPPED, Ordering::Release);
         }
@@ -306,14 +321,26 @@ pub(crate) unsafe fn midi_close(handle: u32) -> i32 {
         if handle != 1 || !g!(midi_acquired) {
             return -1;
         }
-        let stopped = stop_active_midi();
-        if let Some(slot) = g!(active_midi_synth_slot) {
-            (*synth(slot)).pcm_pending_len = 0;
+        if MIDI_PHASE.load(Ordering::Acquire) == SID_RUNNING {
+            let revision = OUTPUT_REVISION.load(Ordering::Acquire);
+            let stopped = stop_active_midi();
+            if stopped != 0 {
+                return stopped;
+            }
+            if let Some(slot) = g!(active_midi_synth_slot) {
+                (*synth(slot)).pcm_pending_len = 0;
+            }
+            g!(midi_stop_target) = None;
+            g!(midi_stop_revision) = revision;
+            MIDI_PHASE.store(SID_QUIET, Ordering::Release);
+        }
+        let ended = finish_synth_output(SynthSource::Midi);
+        if ended != 0 {
+            return ended;
         }
         g!(active_midi_synth_slot) = None;
         g!(midi_acquired) = false;
-        stop_pcm_if_no_streams();
-        stopped
+        0
     }
 }
 
@@ -328,7 +355,7 @@ pub(crate) unsafe fn opl3_reset() -> i32 {
         };
         let c = (*synth(slot)).config;
         let Some(reset) = c.opl3_reset else { return -3 };
-        reset(c.context)
+        sessions::callback(synth(slot), || reset(c.context))
     }
 }
 
@@ -342,7 +369,7 @@ pub(crate) unsafe fn opl3_write_register(bank: u8, reg: u8, value: u8) -> i32 {
         };
         let c = (*synth(slot)).config;
         let Some(write) = c.opl3_write else { return -3 };
-        write(c.context, bank, reg, value)
+        sessions::callback(synth(slot), || write(c.context, bank, reg, value))
     }
 }
 
@@ -363,7 +390,7 @@ pub(crate) unsafe fn opl3_stop() -> i32 {
         let p = synth(slot);
         let c = (*p).config;
         if let Some(stop) = c.stop {
-            let result = stop(c.context);
+            let result = sessions::callback(p, || stop(c.context));
             if result >= 0 {
                 (*p).stops += 1;
             }
@@ -487,9 +514,10 @@ pub(super) unsafe fn send_active_midi(channel: u8, status: u8, data1: u8, data2:
         let p = synth(slot);
         let c = (*p).config;
         if let Some(send) = c.send {
-            let result = send(c.context, channel, status, data1, data2);
+            let result = sessions::callback(p, || send(c.context, channel, status, data1, data2));
             if result >= 0 {
                 (*p).sends = (*p).sends.wrapping_add(1);
+                MIDI_PHASE.store(SID_RUNNING, Ordering::Release);
             }
             return result;
         }
@@ -506,7 +534,7 @@ pub(super) unsafe fn stop_active_midi() -> i32 {
         let p = synth(slot);
         let c = (*p).config;
         if let Some(stop) = c.stop {
-            let result = stop(c.context);
+            let result = sessions::callback(p, || stop(c.context));
             if result >= 0 {
                 (*p).stops = (*p).stops.wrapping_add(1);
             }
@@ -531,14 +559,16 @@ pub(super) unsafe fn render_synth_pcm(slot: usize, requested: u32) -> i32 {
             return NO_ENDPOINT;
         };
         let capacity = requested * pcm::TARGET_FRAME_BYTES as u32;
-        let rendered = render(
-            c.context,
-            ptr::addr_of_mut!((*p).pcm_pending).cast(),
-            capacity,
-            DEFAULT_RATE,
-            DEFAULT_CHANNELS,
-            FORMAT_S16LE,
-        );
+        let rendered = sessions::callback(p, || {
+            render(
+                c.context,
+                ptr::addr_of_mut!((*p).pcm_pending).cast(),
+                capacity,
+                DEFAULT_RATE,
+                DEFAULT_CHANNELS,
+                FORMAT_S16LE,
+            )
+        });
         if rendered < 0 {
             return rendered;
         }
@@ -550,6 +580,9 @@ pub(super) unsafe fn render_synth_pcm(slot: usize, requested: u32) -> i32 {
         }
         (*p).pcm_pending_len = rendered as u32;
         (*p).renders = (*p).renders.wrapping_add(1);
+        if g!(midi_acquired) && g!(active_midi_synth_slot) == Some(slot) {
+            MIDI_PHASE.store(SID_RUNNING, Ordering::Release);
+        }
         flush_pending_synth_pcm(p)
     }
 }
@@ -576,32 +609,52 @@ pub(super) unsafe fn flush_pending_synth_pcm(p: *mut SynthEngine) -> i32 {
 pub(crate) unsafe fn register_external_synth_engine_z(
     name: *const u8,
     config: SynthRegistration,
+    driver_owner: u32,
 ) -> i32 {
     unsafe {
+        if driver_owner == 0 {
+            return INVALID;
+        }
         let mut buf = [0; MAX_NAME];
         let Some(name) = copy_z(name, &mut buf) else {
             return -1;
         };
-        if register_synth_internal(name, config) {
-            0
-        } else {
-            -2
-        }
+        register_synth_internal(name, config, driver_owner)
     }
 }
 
-pub(super) unsafe fn register_synth_internal(name: &[u8], config: SynthRegistration) -> bool {
+pub(super) unsafe fn register_synth_internal(
+    name: &[u8],
+    config: SynthRegistration,
+    driver_owner: u32,
+) -> i32 {
     unsafe {
+        let Some(_sid) = sessions::Execution::acquire(SynthSource::Sid) else {
+            return BUSY;
+        };
+        let Some(_midi) = sessions::Execution::acquire(SynthSource::Midi) else {
+            return BUSY;
+        };
         let Some(slot) = find_synth(name).or_else(|| free_synth_slot()) else {
             boot(b"[AUDIO][WARN] synth engine registry full\r\n");
-            return false;
+            return -2;
         };
         let p = synth(slot);
+        if (*p).closing || sessions::retained(slot) {
+            return BUSY;
+        }
+        let generation = g!(next_synth_generation);
+        let Some(next) = generation.checked_add(1) else {
+            return -2;
+        };
+        g!(next_synth_generation) = next;
         let sends = (*p).sends;
         let renders = (*p).renders;
         let stops = (*p).stops;
         p.write(SynthEngine::EMPTY);
         (*p).registered = true;
+        (*p).driver_owner = driver_owner;
+        (*p).generation = generation;
         (*p).config = config;
         (*p).sends = sends;
         (*p).renders = renders;
@@ -624,7 +677,8 @@ pub(super) unsafe fn register_synth_internal(name: &[u8], config: SynthRegistrat
         boot(slice::from_raw_parts(ptr::addr_of!((*p).name).cast(), len));
         boot(b" external");
         boot(b" [OK]\r\n");
-        true
+        SYNTH_REGISTERED.fetch_or(1 << slot, Ordering::Release);
+        0
     }
 }
 
@@ -646,7 +700,11 @@ pub(super) unsafe fn find_synth(name: &[u8]) -> Option<usize> {
 }
 
 pub(super) unsafe fn sid_engine() -> Option<*mut SynthEngine> {
-    unsafe { find_synth(b"SID").map(|i| synth(i)) }
+    unsafe {
+        find_synth(b"SID")
+            .filter(|&i| !(*synth(i)).closing)
+            .map(|i| synth(i))
+    }
 }
 
 pub(super) unsafe fn sid_model_id() -> u32 {
@@ -685,7 +743,7 @@ pub(super) unsafe fn find_renderable_synth() -> Option<usize> {
 pub(super) unsafe fn synth_can_render_midi(slot: usize) -> bool {
     unsafe {
         let c = (*synth(slot)).config;
-        c.flags & 1 != 0 && (c.send.is_some()) && c.render_pcm.is_some()
+        !(*synth(slot)).closing && c.flags & 1 != 0 && (c.send.is_some()) && c.render_pcm.is_some()
     }
 }
 

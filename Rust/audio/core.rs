@@ -14,7 +14,7 @@ use crate::{
     platform::{clocksource, timer},
     sched::{
         scheduler, sync_locks, sync_objects,
-        sync_types::{Event, Mutex, Semaphore, Text, WaitQueue},
+        sync_types::{Event, Mutex, Semaphore, Text, UnwindGuard, WaitQueue},
         task::task_api,
         task_context,
     },
@@ -51,6 +51,7 @@ struct State {
     next_stream_id: u32,
     next_stream_generation: u64,
     next_backend_generation: u64,
+    next_synth_generation: u64,
     playback_ledger: playback::Ledger<MAX_STREAMS, 64>,
     playback_position: playback::Position,
     playback_valid: bool,
@@ -75,12 +76,16 @@ struct State {
     backend_write_max_ticks: u64,
     backend_write_last_ticks: u64,
     sid_acquired: bool,
+    sid_session: sessions::Session,
     sid_stop_target: Option<SidOutputTarget>,
     sid_stop_revision: u64,
     sid_write_count: u64,
     sid_last_register: u8,
     sid_last_value: u8,
     midi_acquired: bool,
+    midi_session: sessions::Session,
+    midi_stop_target: Option<SidOutputTarget>,
+    midi_stop_revision: u64,
     midi_send_count: u64,
     midi_last_channel: u8,
     midi_last_status: u8,
@@ -121,6 +126,7 @@ static STATE: Resident<State> = Resident(UnsafeCell::new(State {
     next_stream_id: 1,
     next_stream_generation: 1,
     next_backend_generation: 1,
+    next_synth_generation: 1,
     playback_ledger: playback::Ledger::EMPTY,
     playback_position: playback::Position {
         epoch: playback::Epoch {
@@ -153,12 +159,16 @@ static STATE: Resident<State> = Resident(UnsafeCell::new(State {
     backend_write_max_ticks: 0,
     backend_write_last_ticks: 0,
     sid_acquired: false,
+    sid_session: sessions::Session::EMPTY,
     sid_stop_target: None,
     sid_stop_revision: 1,
     sid_write_count: 0,
     sid_last_register: 0,
     sid_last_value: 0,
     midi_acquired: false,
+    midi_session: sessions::Session::EMPTY,
+    midi_stop_target: None,
+    midi_stop_revision: 1,
     midi_send_count: 0,
     midi_last_channel: 0,
     midi_last_status: 0,
@@ -241,6 +251,15 @@ const SID_QUIET: u8 = 1;
 const SID_STOPPED: u8 = 2;
 // Stream Close must distinguish an acquired handle from a producing SID.
 static SID_PHASE: AtomicU8 = AtomicU8::new(SID_RUNNING);
+static SID_ACTIVE: AtomicU8 = AtomicU8::new(0);
+static MIDI_ACTIVE: AtomicU8 = AtomicU8::new(0);
+static MIDI_PHASE: AtomicU8 = AtomicU8::new(SID_RUNNING);
+static SYNTH_REGISTERED: AtomicU8 = AtomicU8::new(0);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SynthSource {
+    Sid,
+    Midi,
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SidOutputTarget {
     backend: u64,
@@ -408,6 +427,15 @@ pub(crate) unsafe fn init() {
         OUTPUT_OWNER.store(0, Ordering::Relaxed);
         OUTPUT_PRESENT.store(0, Ordering::Relaxed);
         SID_PHASE.store(SID_RUNNING, Ordering::Relaxed);
+        SID_ACTIVE.store(0, Ordering::Relaxed);
+        MIDI_ACTIVE.store(0, Ordering::Relaxed);
+        MIDI_PHASE.store(SID_RUNNING, Ordering::Relaxed);
+        SYNTH_REGISTERED.store(0, Ordering::Relaxed);
+        g!(sid_session) = sessions::Session::EMPTY;
+        g!(midi_session) = sessions::Session::EMPTY;
+        g!(midi_stop_target) = None;
+        g!(midi_stop_revision) = 1;
+        g!(next_synth_generation) = 1;
         g!(sid_stop_target) = None;
         OUTPUT_REVISION.store(1, Ordering::Relaxed);
         g!(sid_stop_revision) = 1;
@@ -608,11 +636,7 @@ pub(crate) unsafe fn performance_summary() -> PerformanceSummary {
                 }
             }
         }
-        for i in 0..MAX_SYNTH_ENGINES {
-            if (*synth(i)).registered {
-                out.registered_synths += 1;
-            }
-        }
+        out.registered_synths = SYNTH_REGISTERED.load(Ordering::Acquire).count_ones();
         out
     }
 }
@@ -625,10 +649,11 @@ unsafe fn audio_log(text: *const u8, len: usize) {
 mod outputs;
 mod playback_progress;
 mod progress;
+mod sessions;
 mod streams;
 mod synths;
 use outputs::{
-    active_output_present, finish_sid_output, idle_active_pcm_owned, register_mixer_backend,
+    active_output_present, finish_synth_output, idle_active_pcm_owned, register_mixer_backend,
     write_active_pcm, write_active_pcm_owned,
 };
 pub(crate) use outputs::{
@@ -644,16 +669,20 @@ use playback_progress::{
 pub(crate) use playback_progress::{set_stream_expectation_for_owner, stream_progress_for_owner};
 use progress::schedule_progress;
 pub(crate) use progress::start_progress_worker;
-use streams::stop_pcm_if_no_streams;
+pub(crate) use sessions::{
+    close_synths_for_owner, midi_close_for_owner, midi_open_synth_for_owner, midi_send_for_owner,
+    opl3_render_block, opl3_reset, opl3_stop, opl3_write_register, set_synth_driver_closing,
+    sid_acquire_for_owner, sid_init_for_owner, sid_load_data_for_owner, sid_play_frame_for_owner,
+    sid_release_for_owner, sid_stop_for_owner, sid_write_register_for_owner,
+    unregister_synth_driver,
+};
+use sessions::{midi_producing, sid_producing};
 pub(crate) use streams::{
     close_stream, close_stream_for_owner, close_stream_progress_for_owner, close_streams_for_owner,
     open_stream, open_stream_for_owner, set_volume, set_volume_for_owner, write_stream,
     write_stream_for_owner,
 };
-use synths::sid_producing;
 pub(crate) use synths::{
-    apply_configured_sid_model, configure_sid_model, midi_close, midi_open_synth, midi_send,
-    opl3_render_block, opl3_reset, opl3_stop, opl3_write_register,
-    register_external_synth_engine_z, sid_acquire, sid_init, sid_load_data, sid_model_name_z,
-    sid_play_frame, sid_release, sid_stop, sid_write_register,
+    apply_configured_sid_model, configure_sid_model, register_external_synth_engine_z,
+    sid_model_name_z,
 };

@@ -462,7 +462,7 @@ pub(super) unsafe fn stop_closing_streams_locked(closing_count: u32) -> i32 {
 
 unsafe fn stop_closing_and_observe_locked(closing_count: u32, observe: bool) -> (i32, bool) {
     unsafe {
-        if open_stream_count() != closing_count || sid_producing() || g!(midi_acquired) {
+        if open_stream_count() != closing_count || sid_producing() || midi_producing() {
             return (0, false);
         }
         unlock();
@@ -471,7 +471,7 @@ unsafe fn stop_closing_and_observe_locked(closing_count: u32, observe: bool) -> 
             return (BUSY, false);
         };
         relock();
-        if open_stream_count() != closing_count || sid_producing() || g!(midi_acquired) {
+        if open_stream_count() != closing_count || sid_producing() || midi_producing() {
             return (0, false);
         }
         unlock();
@@ -748,19 +748,5 @@ unsafe fn pump_output_owned(goal: PumpGoal) -> i32 {
             }
         }
         if goal_drained(goal) { 0 } else { BUSY }
-    }
-}
-
-pub(super) unsafe fn stop_pcm_if_no_streams() {
-    unsafe {
-        let Some(_output) = OutputGuard::acquire(false) else {
-            return;
-        };
-        relock();
-        let empty = open_stream_count() == 0;
-        unlock();
-        if empty {
-            idle_active_pcm_owned();
-        }
     }
 }

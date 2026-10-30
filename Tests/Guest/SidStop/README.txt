@@ -19,7 +19,8 @@ Run C:\TEMP\P52APP.R4X followed by one mode per process:
  E: same with real callback error -66 rather than Busy;
  N: invalid register preserves ACK, accepted register creates new private work;
  O: real output selection retires old output before a pending Stop retry;
- R: actual same-config SID provider replacement invalidates the private ACK;
+ R: live same-config replacement is refused; after release a new source has
+    its own private Stop/Idle acknowledgements (0.88.53 provider lifetime);
  M: real MIDI-rendered PCM with zero ordinary streams continues after SID Stop.
 Each process must exit0 and print one detailed callback observation and result=PASS.
 The shared case opens both low-level R4AUDIO and materialized R4SYS/AUDSVC streams.
@@ -37,3 +38,10 @@ checks. Kernel427 must pass them, alongside the separate real HDA/SID/SYNTHD and
 parallel raw/AUDSVC PCM qualification. Preserve full source/binary/readback hashes,
 original negative receipts and actual process exit. Normal product builds do not
 compile or install these fixtures; test media must be shut down and removed.
+
+0.88.53 deliberately strengthens R: a live session retains its exact provider,
+including while a completed private Stop still awaits common Idle. Replacement
+must return Busy and preserve the original single ACK. After real release it
+must succeed, and the new registration needs its own completed Stop/Idle. The
+original 0.88.52 v0.1.0 binaries and receipts remain unchanged in that release's
+archive; this maintained v0.1.1 app expresses the later lifetime contract.

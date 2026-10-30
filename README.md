@@ -22,6 +22,17 @@ output revisions prevent an old Stop retry from idling a successor output.
 There is no new public API, periodic sampler, worker or hardware owner.
 `Tests/Guest/SidStop` builds explicit native callback/stream regressions outside
 normal images; their frozen binaries fail eight checks on426 and pass on427.
+
+Kernel428 binds exclusive SID/MIDI sessions to full process generations and
+exact synth registration generations. Reaper action9 finishes only its own
+session before PCM cleanup. Separate try-only SID and MIDI/OPL3 execution owners
+retain provider callbacks; active sessions veto driver closing/unregister/unload.
+Stop, common Idle and private Release errors retain their actual obligations.
+MIDI Close preserves a still-producing SID source. Public ABI layouts, the
+explicit internal KERNEL owner and global OPL3 register use remain unchanged.
+`Tests/Guest/SynthSessions` reproduces real process exit/kill/stack-guard recovery,
+threads, callback failures and a separately scoped private R4D lifecycle bridge.
+The normal product contains no bridge include/call or extra periodic observer.
 Physical HDA/queued-PCM/last-Close evidence and its limits are in the workspace
 `Docs/Audio/README.txt` release0.88.52 entry.
 
