@@ -175,7 +175,7 @@ fn enqueue() -> Result<Option<Prepared>, u32> {
             }
             for slot in &TASKS[..3] {
                 (*registry::core(slot.load(Ordering::Acquire))).cpu_affinity_bound = false;
-                crate::sched::task::balance::note_ready_publication();
+                crate::sched::task::balance::note_ready_publication(slot.load(Ordering::Acquire));
             }
             Ok(Some((before, source_load, target_loads)))
         })()

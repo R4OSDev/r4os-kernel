@@ -1296,7 +1296,7 @@ pub(crate) unsafe fn rank_changed(
 // caller re-notifies within that same runtime admission. Reuse that functional
 // time snapshot for wake cooldowns rather than publishing the global clock again.
 pub(crate) fn notify_ready(task: Task) {
-    unsafe { super::task::balance::note_ready_publication() };
+    unsafe { super::task::balance::note_ready_publication(task.cast()) };
     let item = view(task);
     let target = item.home_cpu;
     let moved = balance_wake(target, item.ready_since_tick);

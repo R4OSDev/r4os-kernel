@@ -30,7 +30,7 @@ fn launch() -> Result<Option<[u32; COUNT]>, ()> {
             // Only these exact owned, unstarted descriptors lose their temporary
             // diagnostic pin; their real SMP admission/FPU/ledger remain intact.
             (*c).cpu_affinity_bound = false;
-            crate::sched::task::balance::note_ready_publication();
+            crate::sched::task::balance::note_ready_publication(t);
             (*c).home_cpu_bound = false;
             if !tasks::start(t) {
                 return Err(());

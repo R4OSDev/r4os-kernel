@@ -13,7 +13,9 @@ use core::cell::UnsafeCell;
 // history only; it is not the system Task capacity or a cleanup shortcut.
 // 0.87.30 adds 31 exact Mutex-chain receipts to the 104-task scheduler
 // profile; the combined profile also retains Sync/FPU/DriverWork receipts.
-const SESSION_RECORDS: usize = 192;
+// 0.88.61 retains13 additional exact static-donor/churn receipts; the full
+// combined profile now needs195. This remains diagnostic history only.
+const SESSION_RECORDS: usize = 208;
 struct Cell(UnsafeCell<Ledger<SESSION_RECORDS>>);
 // Exclusive gate -> BSP controller -> DONE acquire -> original caller.
 unsafe impl Sync for Cell {}
@@ -33,6 +35,13 @@ pub(crate) fn create_on_cpu(name: &'static [u8], entry: Entry, role: Role, cpu: 
 }
 pub(crate) fn finish_task(t: *mut Task, kill: bool) -> bool {
     unsafe { (&mut *LEDGER.0.get()).finish_task(t, kill) }
+}
+pub(crate) fn republish_unstarted_ready(t: *mut Task) -> bool {
+    assert!(
+        live(),
+        "diagnostic queue publication outside admitted session"
+    );
+    unsafe { (&*LEDGER.0.get()).republish_unstarted_ready(t) }
 }
 pub(crate) fn finish(id: u32, generation: u64, kill: bool) -> Option<bool> {
     unsafe { (&mut *LEDGER.0.get()).finish(id, generation, kill) }

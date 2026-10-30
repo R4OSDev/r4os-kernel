@@ -4,6 +4,7 @@ mod cooldown;
 mod occupied;
 mod placement;
 mod single;
+mod static_donors;
 use super::{fpu, helpers};
 use crate::{
     arch::{percpu, runtime::RuntimeGuard},
@@ -180,7 +181,7 @@ fn release(source: u32) -> bool {
             if i == 2 {
                 for p in &TASKS[..3] {
                     (*registry::core(p.load(Ordering::Acquire))).cpu_affinity_bound = false;
-                    crate::sched::task::balance::note_ready_publication();
+                    crate::sched::task::balance::note_ready_publication(p.load(Ordering::Acquire));
                 }
             }
             sync_objects::r4os_rust_sync_event(event(i), 0, 0);
@@ -315,5 +316,10 @@ fn many() -> bool {
     valid && clean
 }
 pub(super) fn run() -> bool {
-    many() && single::run() && placement::run() && occupied::run() && cooldown::run()
+    many()
+        && single::run()
+        && placement::run()
+        && occupied::run()
+        && cooldown::run()
+        && static_donors::run()
 }

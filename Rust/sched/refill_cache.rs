@@ -48,9 +48,10 @@ impl Cache {
 
 /// Consecutive visits through a donor's shared bounded cursor. Every target
 /// contributes to the same traversal. No early partial prefix can prove that
-/// the whole donor excludes a CPU. Queue/policy/membership changes reset it.
+/// the whole donor excludes a CPU. Only that donor's queue/static-policy
+/// revision and CPU membership reset it; foreign Ready churn is irrelevant.
 pub(crate) struct Summary {
-    key: Option<(u64, u64, u64)>,
+    key: Option<(u64, u64)>,
     visited: usize,
     possible: u64,
     complete: Option<u64>,
@@ -64,8 +65,8 @@ impl Summary {
         complete: None,
     };
 
-    pub fn begin(&mut self, registry: u64, ready: u64, online: u64) {
-        let key = (registry, ready, online);
+    pub fn begin(&mut self, donor_revision: u64, online: u64) {
+        let key = (donor_revision, online);
         if self.key != Some(key) {
             self.key = Some(key);
             self.visited = 0;
@@ -188,7 +189,7 @@ mod tests {
     #[test]
     fn shared_bounded_visits_cannot_hide_a_ninth_cpu_allowed_candidate() {
         let mut summary = Summary::EMPTY;
-        summary.begin(1, 2, 15);
+        summary.begin(2, 15);
         for _ in 0..8 {
             summary.visit(0, 9);
         }
@@ -196,14 +197,14 @@ mod tests {
         summary.visit(1 << 2, 9);
         assert!(summary.excludes(1));
         assert!(!summary.excludes(2));
-        summary.begin(1, 3, 15);
+        summary.begin(3, 15);
         assert!(!summary.excludes(1));
     }
 
     #[test]
     fn many_fixed_tasks_converge_without_a_longer_pull_or_per_target_scan() {
         let mut summary = Summary::EMPTY;
-        summary.begin(1, 2, 15);
+        summary.begin(2, 15);
         // Eight separate bounded visits, potentially from different targets.
         for _ in 0..8 {
             for _ in 0..8 {
@@ -211,7 +212,61 @@ mod tests {
             }
         }
         assert!(summary.excludes(0) && summary.excludes(63));
-        summary.begin(2, 2, 15);
+        summary.begin(3, 15);
         assert!(!summary.excludes(0));
+    }
+
+    #[test]
+    fn foreign_ready_churn_preserves_partial_and_complete_static_donor_traversal() {
+        let mut summary = Summary::EMPTY;
+        let mut cache = Cache::EMPTY;
+        for turn in 0..32 {
+            // The global cache still notices real foreign workload/current
+            // changes. They cannot discard the unchanged donor's mask scan.
+            let key = Key {
+                ready: KEY.ready + turn,
+                ..KEY
+            };
+            cache.begin(key);
+            assert!(!cache.skip(1));
+            summary.begin(7, key.online);
+            for _ in 0..8 {
+                summary.visit(0, 12);
+            }
+            if turn == 0 {
+                assert!(!summary.excludes(2));
+            } else {
+                assert!(summary.excludes(2));
+                cache.rejected(1, true, false, true);
+                assert!(cache.skip(1));
+            }
+        }
+    }
+
+    #[test]
+    fn local_policy_or_membership_change_restarts_partial_and_complete_masks() {
+        for visits in [8, 12] {
+            for changed in [(8, 15), (7, 7)] {
+                let mut summary = Summary::EMPTY;
+                summary.begin(7, 15);
+                for _ in 0..visits {
+                    summary.visit(0, 12);
+                }
+                summary.begin(changed.0, changed.1);
+                assert!(!summary.excludes(2));
+                // A newly allowed ninth task must not disappear behind a
+                // cached all-bound prefix or a formerly completed zero mask.
+                for _ in 0..8 {
+                    summary.visit(0, 12);
+                }
+                assert!(!summary.excludes(2));
+                summary.visit(1 << 2, 12);
+                for _ in 9..12 {
+                    summary.visit(0, 12);
+                }
+                assert!(!summary.excludes(2));
+                assert!(summary.excludes(1));
+            }
+        }
     }
 }

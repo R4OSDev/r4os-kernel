@@ -62,6 +62,9 @@ pub struct ReadyQueue {
     pub ranks: [Index; ROLE_COUNT],
     pub warning_cursor: *mut Task,
     pub balance_cursor: *mut Task,
+    // Only this donor's Ready membership/static transfer policy. Global
+    // registry/Ready revisions continue to protect the separate load cache.
+    pub transfer_revision: u64,
     pub transfer_summary: crate::sched::refill_cache::Summary,
 }
 impl ReadyQueue {
@@ -80,6 +83,7 @@ impl ReadyQueue {
         }; ROLE_COUNT],
         warning_cursor: null_mut(),
         balance_cursor: null_mut(),
+        transfer_revision: 1,
         transfer_summary: crate::sched::refill_cache::Summary::EMPTY,
     };
 }
@@ -225,6 +229,16 @@ pub(super) unsafe fn bump_epoch() {
         if (*raw()).epoch == 0 {
             (*raw()).epoch = 1;
         }
+    }
+}
+
+/// # Safety
+/// Runtime retains this exact donor queue. No pointer is kept in its summary;
+/// both actual membership and in-place static-policy publication use this edge.
+pub(super) unsafe fn publish_ready_change(queue: *mut ReadyQueue) {
+    unsafe {
+        (*queue).transfer_revision = (*queue).transfer_revision.wrapping_add(1);
+        (*raw()).ready_revision = (*raw()).ready_revision.wrapping_add(1);
     }
 }
 pub(super) unsafe fn contains(task: *const Task) -> bool {
@@ -597,7 +611,7 @@ pub(super) unsafe fn append_ready(task: *mut Task) {
         }
         (*q).count += 1;
         (*q).dispatch_counts[dispatch_rank(task) as usize] += 1;
-        (*raw()).ready_revision = (*raw()).ready_revision.wrapping_add(1);
+        publish_ready_change(q);
     }
 }
 pub(super) unsafe fn unlink_ready(task: *mut Task) {
@@ -639,7 +653,7 @@ pub(super) unsafe fn unlink_ready(task: *mut Task) {
         (*c).ready_prev = null_mut();
         (*c).ready_next = null_mut();
         (*c).ready_linked = false;
-        (*raw()).ready_revision = (*raw()).ready_revision.wrapping_add(1);
+        publish_ready_change(q);
         if (*q).count != 0 {
             (*q).count -= 1;
         }

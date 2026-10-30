@@ -978,13 +978,25 @@ pub unsafe extern "C" fn r4os_rust_task_set_field(task: *mut c_void, field: u8, 
                 (*c).running_cpu = value as u8;
             }
             27 => {
-                (*c).smp_eligible = value != 0;
+                let parallel = value != 0;
+                if (*c).smp_eligible != parallel {
+                    (*c).smp_eligible = parallel;
+                    if (*c).ready_linked {
+                        super::balance::note_ready_publication(task.cast());
+                    }
+                }
             }
             28 => {
                 (*c).smp_r4x_work = value != 0;
             }
             29 => {
-                (*c).cpu_idle = value != 0;
+                let idle = value != 0;
+                if (*c).cpu_idle != idle {
+                    (*c).cpu_idle = idle;
+                    if (*c).ready_linked {
+                        super::balance::note_ready_publication(task.cast());
+                    }
+                }
                 registry::refresh_current_work(task.cast());
             }
             31 => {

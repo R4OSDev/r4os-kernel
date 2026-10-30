@@ -94,6 +94,34 @@ impl<const MAX: usize> Ledger<MAX> {
         }
         t
     }
+    /// Explicit native queue-publication probe only. The resident ledger must
+    /// retain this exact unstarted generation; no arbitrary/physical current
+    /// descriptor or foreign owner's queue node can be supplied.
+    pub(crate) fn republish_unstarted_ready(&self, t: *mut Task) -> bool {
+        let Some(record) = self.records[..self.count]
+            .iter()
+            .find(|r| r.task == t && !r.done && !r.retained)
+        else {
+            return false;
+        };
+        let _runtime = RuntimeGuard::acquire();
+        unsafe {
+            if t.is_null() || registry::find_identity(record.id, record.generation) != t {
+                return false;
+            }
+            let c = registry::core(t);
+            if !(*c).ready_linked
+                || (*c).switches_in != 0
+                || (*c).pin_count == 0
+                || !super::balance::saved_continuation(t, false)
+            {
+                return false;
+            }
+            registry::unlink_ready(t);
+            registry::append_ready(t);
+            true
+        }
+    }
     pub(crate) fn finish_task(&mut self, t: *mut Task, kill: bool) -> bool {
         if t.is_null() {
             return false;

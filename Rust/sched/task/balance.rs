@@ -17,9 +17,15 @@ pub(crate) unsafe fn search_revisions() -> (u64, u64) {
 /// # Safety
 /// Existing Ready/policy publication under Runtime, including a re-notify
 /// after temporary affinity release without changing FIFO linkage.
-pub(crate) unsafe fn note_ready_publication() {
+pub(crate) unsafe fn note_ready_publication(task: *mut Task) {
     unsafe {
-        (*registry::raw()).ready_revision = (*registry::raw()).ready_revision.wrapping_add(1);
+        if !task.is_null() && (*registry::core(task)).ready_linked {
+            registry::publish_ready_change(registry::queue(u32::from(
+                (*registry::core(task)).home_cpu,
+            )));
+        } else {
+            (*registry::raw()).ready_revision = (*registry::raw()).ready_revision.wrapping_add(1);
+        }
     }
 }
 
@@ -213,11 +219,7 @@ pub(crate) unsafe fn prepare(
     unsafe {
         let q = registry::queue(source);
         let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
-        (*q).transfer_summary.begin(
-            (*registry::raw()).epoch,
-            (*registry::raw()).ready_revision,
-            online,
-        );
+        (*q).transfer_summary.begin((*q).transfer_revision, online);
         if (*q).transfer_summary.excludes(target) {
             return None;
         }

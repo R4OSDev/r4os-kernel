@@ -158,7 +158,7 @@ fn release(source: u32, capacity: &mut Capacity) -> Result<Option<(u32, u64)>, (
         // Only this owned diagnostic child loses its temporary pin. Exercise
         // the production Ready notification, including pending and exact IPI.
         (*c).cpu_affinity_bound = false;
-        crate::sched::task::balance::note_ready_publication();
+        crate::sched::task::balance::note_ready_publication(t);
         scheduler::notify_ready(t.cast());
         let target = u32::from((*c).home_cpu);
         let target_core = domains[target as usize].core;

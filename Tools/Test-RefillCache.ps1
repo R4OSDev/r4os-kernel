@@ -19,7 +19,7 @@ try{
  if($LASTEXITCODE -ne 0){throw 'Actual Ready donor cache did not compile.'}
  & $executable --test-threads=1
  if($LASTEXITCODE -ne 0){throw 'Actual Ready donor cache checks failed.'}
- Write-Output (@{status='pass';owner_cases=8;source_sha256=(Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()}|ConvertTo-Json -Compress)
+ Write-Output (@{status='pass';owner_cases=10;source_sha256=(Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()}|ConvertTo-Json -Compress)
 }finally{
  if(Test-Path -LiteralPath $work){Remove-Item -LiteralPath $work -Recurse -Force}
 }
