@@ -283,6 +283,26 @@ pub fn init(base: u64, number: u8, min_tick: u16, legacy: bool) -> Status {
     }
     value.counter = main_counter();
     EXTENSION.store(value.counter & u64::from(u32::MAX), Ordering::Release);
+    // LAPIC calibration/startup uses raw samples of at most 10 ms; event
+    // handoff has a 50 ms raw timeout. Admit a narrow reference with room
+    // for those complete intervals before its half-wrap ambiguity.
+    if !value.has(COUNTER64)
+        && value.frequency_hz != 0
+        && math::counter32_observation_ticks(
+            value.frequency_hz,
+            math::Rate {
+                numerator: 20,
+                denominator: 1,
+            },
+        )
+        .is_none()
+    {
+        value = disable(value);
+        value.reason = 17;
+        publish(value);
+        log(value);
+        return value;
+    }
     if advances(value) {
         value.reason = 4;
     } else {
@@ -331,8 +351,11 @@ fn periodic(hz: u32, log_status: bool) -> bool {
     value.flags &= !ONE_SHOT;
     let mut config = read(0x100) & !(INT_LEVEL | INT_ENABLE | PERIODIC | TIMER32 | ROUTE | FSB);
     config |= PERIODIC | SET_ACCUMULATOR;
+    if value.has(TIMER64) && !value.has(COUNTER64) {
+        config |= TIMER32;
+    }
     write(0x100, config);
-    let mask = if value.has(TIMER64) {
+    let mask = if value.has(COUNTER64) && value.has(TIMER64) {
         u64::MAX
     } else {
         u64::from(u32::MAX)
@@ -397,7 +420,7 @@ fn arm(ticks: u64, hz: u32) -> u64 {
         return 0;
     }
     let wanted = ticks.max(1);
-    let limit = if value.has(TIMER64) {
+    let limit = if value.has(COUNTER64) && value.has(TIMER64) {
         0x3fff_ffff_ffff_ffff
     } else {
         0x7fff_ffff
@@ -410,9 +433,12 @@ fn arm(ticks: u64, hz: u32) -> u64 {
     }
     let mut config = read(0x100)
         & !(INT_LEVEL | INT_ENABLE | PERIODIC | SET_ACCUMULATOR | TIMER32 | ROUTE | FSB);
+    if value.has(TIMER64) && !value.has(COUNTER64) {
+        config |= TIMER32;
+    }
     write(0x100, config);
     write(0x20, 1);
-    let mask = if value.has(TIMER64) {
+    let mask = if value.has(COUNTER64) && value.has(TIMER64) {
         u64::MAX
     } else {
         u64::from(u32::MAX)
@@ -548,6 +574,7 @@ pub fn reason_name(code: u8) -> &'static [u8] {
         14 => b"HPET comparator 0 one-shot armed",
         15 => b"HPET comparator 0 one-shot disarmed",
         16 => b"HPET main counter enabled, comparator interrupts disabled",
+        17 => b"32-bit HPET cannot qualify bounded reference intervals",
         _ => panic!("Invalid hpet diagnostic code"),
     }
 }
@@ -605,6 +632,7 @@ unsafe fn hpet_log(status: *const Status) {
         14 => b"HPET comparator 0 one-shot armed",
         15 => b"HPET comparator 0 one-shot disarmed",
         16 => b"HPET main counter enabled, comparator interrupts disabled",
+        17 => b"32-bit HPET cannot qualify bounded reference intervals",
         _ => unreachable!(),
     });
     puts(b"\r\n");

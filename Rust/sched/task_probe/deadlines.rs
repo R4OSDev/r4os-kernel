@@ -2,7 +2,7 @@
 use super::{helpers::*, state::*, workers};
 use crate::{
     arch::{hpet, lapic, runtime},
-    platform::{timer, timer_arm::Stamp},
+    platform::{clock_math, clocksource, timer, timer_arm::Stamp},
     sched::{
         scheduler,
         task::task_types::{Role, State, Task},
@@ -10,6 +10,14 @@ use crate::{
 };
 use core::ptr;
 const TIMER_OBJECT: u64 = 0x5449_4d45_5741_4954;
+fn maintenance_required() -> Result<bool, ()> {
+    let event = timer::event_info();
+    clocksource::hpet_observation_interval(clock_math::Rate {
+        numerator: event.frequency_numerator,
+        denominator: event.frequency_denominator,
+    })
+    .map(|window| window.is_some())
+}
 fn physical_stamp() -> Option<Stamp> {
     match timer::active_backend() {
         1 => hpet::idle_arm_stamp(),
@@ -18,32 +26,55 @@ fn physical_stamp() -> Option<Stamp> {
     }
 }
 // Caller holds the existing diagnostic Runtime and preemption boundary.
-unsafe fn retention_turns() -> (bool, bool, bool, bool) {
+unsafe fn retention_turns() -> (bool, bool, bool, bool, bool) {
     unsafe {
+        let maintenance = match maintenance_required() {
+            Ok(value) => value,
+            Err(()) => return (false, false, false, false, false),
+        };
         let mut ok = timer::r4os_rust_timer_control(12, u64::MAX - 1, 0) != 0;
         let long = timer::deadline_stats();
         (*raw()).deadline_checkpointed =
             long.armed_deadline != u64::MAX && long.armed_deadline < u64::MAX - 1;
         let finite_stamp = physical_stamp();
-        let finite_width_known = timer::active_backend() != 1 || hpet::idle_counter_wide();
+        let finite_width_known =
+            !maintenance && (timer::active_backend() != 1 || hpet::idle_counter_wide());
         for _ in 0..4 {
             ok = (timer::r4os_rust_timer_control(12, u64::MAX - 1, 0) != 0) && ok;
         }
-        let retained_finite = !finite_width_known
-            || finite_stamp.is_some()
-                && physical_stamp() == finite_stamp
-                && timer::deadline_stats().one_shot_arms == long.one_shot_arms;
+        let finite_after = timer::deadline_stats();
+        let retained_finite = if maintenance {
+            finite_after.armed_deadline != u64::MAX
+                && finite_after.armed_deadline > timer::tick_count()
+        } else {
+            !finite_width_known
+                || finite_stamp.is_some()
+                    && physical_stamp() == finite_stamp
+                    && finite_after.one_shot_arms == long.one_shot_arms
+        };
         ok = (timer::r4os_rust_timer_control(13, 0, 0) != 0) && ok;
         // Preserve the original long-arm cancellation oracle above. This
-        // separate empty turn proves actual disarm identity without telemetry.
+        // separate logical-empty turn proves the required physical checkpoint
+        // for a narrow reference, otherwise the original disarm identity.
         ok = (timer::r4os_rust_timer_control(12, u64::MAX, 0) != 0) && ok;
         let empty_stamp = physical_stamp();
         for _ in 0..4 {
             ok = (timer::r4os_rust_timer_control(12, u64::MAX, 0) != 0) && ok;
         }
-        let retained_empty = empty_stamp.is_some() && physical_stamp() == empty_stamp;
+        let retained_empty = if maintenance {
+            let empty = timer::deadline_stats();
+            empty.armed_deadline != u64::MAX && empty.armed_deadline > timer::tick_count()
+        } else {
+            empty_stamp.is_some() && physical_stamp() == empty_stamp
+        };
         ok = (timer::r4os_rust_timer_control(13, 0, 0) != 0) && ok;
-        (ok, retained_finite, retained_empty, finite_width_known)
+        (
+            ok,
+            retained_finite,
+            retained_empty,
+            finite_width_known,
+            maintenance,
+        )
     }
 }
 
@@ -55,7 +86,16 @@ pub unsafe fn probe() -> bool {
         }
         let flags = runtime::save_runtime();
         scheduler::r4os_rust_scheduler_control(6, 0, 0);
-        let (mut ok, retained_finite, retained_empty, finite_width_known) = retention_turns();
+        let maintenance = maintenance_required();
+        if maintenance != Ok(false) {
+            scheduler::r4os_rust_scheduler_control(7, 0, 0);
+            runtime::restore_runtime(flags);
+            // Required reference-maintenance IRQs are not an isolated raw
+            // TSC IRQ-count workload. Keep that original oracle for wide
+            // hardware; narrow references use actual scheduler sleep/wake.
+            return maintenance == Ok(true) && retained_idle();
+        }
+        let (mut ok, retained_finite, retained_empty, finite_width_known, _) = retention_turns();
         let start = now();
         let long_deadline = timer::r4os_rust_timer_control(6, start, LONG_TICKS);
         let early = timer::r4os_rust_timer_control(6, start, EARLY_TICKS);
@@ -184,7 +224,8 @@ pub unsafe fn retained_idle() -> bool {
         }
         let flags = runtime::save_runtime();
         scheduler::r4os_rust_scheduler_control(6, 0, 0);
-        let (ok, finite, empty, width) = retention_turns();
+        let (ok, finite, empty, width, maintenance) = retention_turns();
+        let maintenance_irqs = maintenance.then(|| timer::r4os_rust_timer_control(16, 0, 0));
         scheduler::r4os_rust_scheduler_control(7, 0, 0);
         runtime::restore_runtime(flags);
         let start = now();
@@ -214,6 +255,19 @@ pub unsafe fn retained_idle() -> bool {
             dec(start.saturating_add(EARLY_TICKS));
             puts(b"\r\n");
             return false;
+        }
+        if maintenance {
+            (*raw()).deadline_elapsed = elapsed;
+            (*raw()).deadline_total_irqs = after.timer_irqs - before.timer_irqs;
+            (*raw()).deadline_irqs =
+                timer::r4os_rust_timer_control(16, 0, 0) - maintenance_irqs.unwrap_or(0);
+            (*raw()).deadline_lateness = after.last_lateness_ticks;
+            puts(b"TIMER08865 maintenance PASS logical-empty=physical-checkpoint backend=");
+            dec(u64::from(timer::active_backend()));
+            puts(
+                b" checkpoint=finite sleep=real cancellation=preserved scope=idle-maintenance\r\n",
+            );
+            return true;
         }
         puts(b"TIMER08864 retained PASS finite=");
         puts(if width {

@@ -212,6 +212,110 @@ pub fn extend_counter32(published: u64, low: u32) -> u64 {
     }
     candidate
 }
+
+/// A quarter-wrap observation interval, expressed in actual event ticks.
+/// Two complete ticks leave room for rounding; no missing wrap is inferred.
+pub(crate) fn counter32_observation_ticks(frequency_hz: u64, event: Rate) -> Option<u64> {
+    if frequency_hz == 0 || event.numerator == 0 || event.denominator == 0 {
+        return None;
+    }
+    let ticks = ((1u128 << 30) * u128::from(event.numerator))
+        / (u128::from(frequency_hz) * u128::from(event.denominator));
+    u64::try_from(ticks).ok().filter(|ticks| *ticks >= 2)
+}
+
+#[cfg(test)]
+mod counter32_tests {
+    use super::*;
+
+    #[test]
+    fn observation_uses_actual_frequency_and_event_rate() {
+        let event = Rate {
+            numerator: 1000,
+            denominator: 1,
+        };
+        for (hz, ticks) in [
+            (10_000_000, 107374),
+            (100_000_000, 10737),
+            (1_000_000_000, 1073),
+        ] {
+            assert_eq!(counter32_observation_ticks(hz, event), Some(ticks));
+        }
+        assert_eq!(
+            counter32_observation_ticks(
+                100_000_000,
+                Rate {
+                    numerator: 1_193_182,
+                    denominator: 1193
+                }
+            ),
+            Some(10739)
+        );
+    }
+
+    #[test]
+    fn unknown_or_insufficient_observation_cadence_is_unqualified() {
+        for (hz, rate) in [
+            (
+                0,
+                Rate {
+                    numerator: 1000,
+                    denominator: 1,
+                },
+            ),
+            (
+                100_000_000,
+                Rate {
+                    numerator: 0,
+                    denominator: 1,
+                },
+            ),
+            (
+                100_000_000,
+                Rate {
+                    numerator: 1000,
+                    denominator: 0,
+                },
+            ),
+            (
+                1_000_000_000_000,
+                Rate {
+                    numerator: 1000,
+                    denominator: 1,
+                },
+            ),
+            (
+                u64::MAX,
+                Rate {
+                    numerator: u64::MAX,
+                    denominator: u64::MAX,
+                },
+            ),
+        ] {
+            assert_eq!(counter32_observation_ticks(hz, rate), None);
+        }
+    }
+
+    #[test]
+    fn delivered_observations_preserve_half_full_and_multiple_wraps() {
+        let mut actual = 256u64;
+        let mut observed = actual;
+        for _ in 0..37 {
+            actual += (1 << 30) - 1;
+            observed = extend_counter32(observed, actual as u32);
+            assert_eq!(observed, actual);
+        }
+        assert!(actual > 9 * (1u64 << 32));
+    }
+
+    #[test]
+    fn unobserved_long_gaps_are_not_a_reconstruction_oracle() {
+        for elapsed in [(1u64 << 31) + 1, (1u64 << 32) + 100, 3 * (1u64 << 32) + 100] {
+            let actual = 256 + elapsed;
+            assert_ne!(extend_counter32(256, actual as u32), actual);
+        }
+    }
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_clock_math(operation: u8, a: u64, b: u64, c: u64) -> u64 {
     match operation {

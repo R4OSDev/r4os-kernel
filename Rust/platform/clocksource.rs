@@ -354,6 +354,26 @@ pub fn attach_hpet(prior: u64) {
         }
         return;
     }
+    let event = super::timer::event_info();
+    if status.flags & 16 == 0
+        && math::counter32_observation_ticks(
+            status.frequency_hz,
+            math::Rate {
+                numerator: event.frequency_numerator,
+                denominator: event.frequency_denominator,
+            },
+        )
+        .is_none()
+    {
+        // One-time BSP attachment precedes modern event handoff. Without
+        // a sufficient periodic foundation, no persistent narrow reference
+        // or SMP correlation is admitted. Keep the real periodic clock.
+        HPET_CONFIGURED.store(false, Ordering::Release);
+        TSC_CALIBRATED.store(false, Ordering::Release);
+        reason(10);
+        activate(0);
+        return;
+    }
     HPET_HZ.store(status.frequency_hz, Ordering::Release);
     let scale = math::FixedScale::init_floor(math::NANOSECONDS_PER_SECOND, status.frequency_hz);
     HPET_SCALE.set(scale);
@@ -412,6 +432,23 @@ pub fn attach_hpet(prior: u64) {
     REGISTERED.fetch_or(1, Ordering::AcqRel);
     activate(2);
     now_nanoseconds();
+}
+/// BSP boot/Runtime owner only. A configured narrow reference must remain
+/// observable even while another hardware source supplies monotonic time.
+pub(crate) fn hpet_observation_interval(event: math::Rate) -> Result<Option<u64>, ()> {
+    if !HPET_CONFIGURED.load(Ordering::Acquire) || hpet::idle_counter_wide() {
+        return Ok(None);
+    }
+    math::counter32_observation_ticks(HPET_HZ.load(Ordering::Acquire), event)
+        .map(Some)
+        .ok_or(())
+}
+/// Called at real BSP timer admission, including PIT/LAPIC events. This is
+/// functional counter extension, not a watchdog or measurement sample.
+pub(crate) fn observe_hpet_reference() {
+    if HPET_CONFIGURED.load(Ordering::Acquire) && !hpet::idle_counter_wide() {
+        hpet::extended_counter();
+    }
 }
 fn adjusted_tsc() -> u64 {
     let raw = read_tsc();
@@ -759,6 +796,7 @@ pub(crate) fn fallback_name(reason: u32) -> &'static [u8] {
         7 => b"tsc-discontinuity",
         8 => b"hpet-unavailable",
         9 => b"isolated-deadline-boot-check",
+        10 => b"hpet32-observation-cadence-unqualified",
         _ => unreachable!(),
     }
 }

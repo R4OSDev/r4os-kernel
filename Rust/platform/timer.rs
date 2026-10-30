@@ -261,6 +261,25 @@ pub fn init_pit(requested: u32) {
     INITIALIZED.store(true, Ordering::Release);
 }
 fn switch_backend(backend: u32, requested: u32) -> bool {
+    let hz = if requested == 0 {
+        pit::DEFAULT_HZ
+    } else {
+        requested
+    };
+    let periodic = math::Rate {
+        numerator: u64::from(hz),
+        denominator: 1,
+    };
+    let fallback = math::Rate {
+        numerator: u64::from(pit::BASE_HZ),
+        denominator: u64::from((pit::BASE_HZ / hz).clamp(1, 0xffff)),
+    };
+    if clocksource::now_nanoseconds().is_none()
+        || clocksource::hpet_observation_interval(periodic).is_err()
+        || clocksource::hpet_observation_interval(fallback).is_err()
+    {
+        return false;
+    }
     clear_idle_arm();
     let ready = match backend {
         1 => hpet::r4os_rust_hpet_control(6, 0, requested) != 0,
@@ -318,6 +337,7 @@ fn on_irq() -> u64 {
         }
         _ => panic!("Invalid IRQ timer backend"),
     }
+    clocksource::observe_hpet_reference();
     let count = IRQ_COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if count & 0x3ff == 0 {
         clocksource::periodic_validate();
@@ -374,7 +394,17 @@ fn enter_idle(requested: u64) -> bool {
     if !DEADLINE_ENABLED.load(Ordering::Acquire) || active_backend() == 0 {
         return false;
     }
+    clocksource::observe_hpet_reference();
     let now = tick_count();
+    let event = event_info();
+    let requested = match clocksource::hpet_observation_interval(math::Rate {
+        numerator: event.frequency_numerator,
+        denominator: event.frequency_denominator,
+    }) {
+        Ok(Some(ticks)) => requested.min(math::finite_deadline(now, ticks)),
+        Ok(None) => requested,
+        Err(()) => return false,
+    };
     if MODE.load(Ordering::Acquire) == 0 {
         let ready = match active_backend() {
             1 => hpet::r4os_rust_hpet_control(8, 0, frequency()) != 0,
