@@ -165,9 +165,33 @@ fn recursive_mutex() -> bool {
         let exact = (*mutex()).owner == id
             && (*mutex()).owner_generation == generation
             && (*mutex()).depth == 2;
-        let mut summary = core::mem::MaybeUninit::uninit();
-        super::sync_stats::r4os_rust_sync_lock_summary(summary.as_mut_ptr());
-        let summary = summary.assume_init();
+        let (summary, wait, admission_exact, lock_admissions) = {
+            // Exclusive Runtime with IF=0 makes its owner-only nested counter
+            // exact here. Passive stats reads add no admission themselves.
+            let _runtime = runtime::RuntimeGuard::acquire();
+            // Uniprocessor boot deliberately leaves the global owner disabled.
+            let expected_lock = u64::from(runtime::enabled());
+            let mut before = runtime::Stats::default();
+            runtime::r4os_rust_runtime_stats(&mut before);
+            let mut wait = core::mem::MaybeUninit::uninit();
+            super::sync_stats::r4os_rust_sync_wait_summary(wait.as_mut_ptr());
+            let mut after_wait = runtime::Stats::default();
+            runtime::r4os_rust_runtime_stats(&mut after_wait);
+            let mut summary = core::mem::MaybeUninit::uninit();
+            super::sync_stats::r4os_rust_sync_lock_summary(summary.as_mut_ptr());
+            let mut after_lock = runtime::Stats::default();
+            runtime::r4os_rust_runtime_stats(&mut after_lock);
+            (
+                summary.assume_init(),
+                wait.assume_init(),
+                after_wait.nested_acquisitions == before.nested_acquisitions
+                    && after_lock.nested_acquisitions
+                        == after_wait.nested_acquisitions.wrapping_add(expected_lock),
+                after_lock
+                    .nested_acquisitions
+                    .wrapping_sub(after_wait.nested_acquisitions),
+            )
+        };
         let depth_exact = summary.current_depth == initial_depth + 1
             && (*core).held_lock_count == initial_depth + 1;
         let detail_exact = if crate::build_config::config::ENABLE_METRICS {
@@ -183,8 +207,9 @@ fn recursive_mutex() -> bool {
         };
         let first = !recursive || sync_locks::r4os_rust_sync_mutex(mutex(), 2, 0);
         let last = sync_locks::r4os_rust_sync_mutex(mutex(), 2, 0);
-        recursive
+        let ok = recursive
             && exact
+            && admission_exact
             && depth_exact
             && detail_exact
             && first
@@ -194,7 +219,15 @@ fn recursive_mutex() -> bool {
             && (*mutex()).depth == 0
             && (*mutex()).queue.core.count == 0
             && (*mutex()).donation_rank == 255
-            && (*core).held_lock_count == initial_depth
+            && (*core).held_lock_count == initial_depth;
+        if ok {
+            puts(b"SYNCCHECK08863 snapshot PASS wait-admission=0 lock-admission=");
+            crate::boot::log_route::dec(lock_admissions);
+            puts(b" depth=preserved observed-waits=");
+            crate::boot::log_route::dec(wait.queue_waits);
+            puts(b"\r\n");
+        }
+        ok
     }
 }
 

@@ -66,9 +66,10 @@ pub(super) fn lock_change(f: impl FnOnce(&mut LockSummary)) {
 }
 /// # Safety
 /// Output points to exclusive aligned resident C summary storage.
+/// Only static atomics are read. Independent Relaxed fields are observational,
+/// including retained offline shards; no Runtime owner or completion is implied.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_sync_wait_summary(out: *mut WaitSummary) {
-    let flags = runtime::save_runtime();
     let values = WAIT.snapshot();
     let wait_value = |metric: WaitMetric| values[metric as usize];
     let value = WaitSummary {
@@ -86,7 +87,6 @@ pub unsafe extern "C" fn r4os_rust_sync_wait_summary(out: *mut WaitSummary) {
         directed_fifo_bypasses: wait_value(WaitMetric::DirectedFifoBypasses),
     };
     unsafe { out.write(value) };
-    runtime::restore_runtime(flags);
 }
 /// # Safety
 /// Output points to exclusive aligned resident C summary storage. Task reads
