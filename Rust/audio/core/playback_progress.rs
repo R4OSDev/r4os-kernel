@@ -1,6 +1,6 @@
 //! Cursor attribution under the existing output permit and stream mutex.
 //! No task, codec access, unbounded history or caller pointer is retained here.
-use super::streams::stream_by_owner;
+use super::streams::{stream_by_owner, stream_window_fits};
 use super::*;
 
 // Promises are stream metadata, independent of a foreign backend callback.
@@ -217,6 +217,16 @@ pub(crate) unsafe fn set_stream_expectation_for_owner(
             }
             if (*p).transaction {
                 return BUSY;
+            }
+            if value.flags != 0
+                && !stream_window_fits(
+                    (*p).rate,
+                    (*p).channels,
+                    (*p).format,
+                    value.high_water_frames as usize,
+                )
+            {
+                return INVALID;
             }
             (*p).low_water_frames = value.low_water_frames;
             (*p).high_water_frames = value.high_water_frames;

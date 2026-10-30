@@ -387,11 +387,24 @@ pub(crate) unsafe fn set_volume_for_owner(owner: Owner, id: u32, volume: u32) ->
 }
 
 pub(super) fn valid_stream_format(rate: u32, channels: u16, format: u16) -> bool {
-    rate != 0
-        && rate <= 192000
-        && channels != 0
-        && channels <= 2
-        && (format == FORMAT_S16LE || format == FORMAT_U8)
+    rate <= 192000
+        && stream_window_fits(rate, channels, format, RING_BYTES / pcm::TARGET_FRAME_BYTES)
+}
+
+pub(super) fn stream_window_fits(
+    rate: u32,
+    channels: u16,
+    format: u16,
+    canonical_frames: usize,
+) -> bool {
+    let Some(frame_bytes) = pcm::source_frame_bytes(channels, format) else {
+        return false;
+    };
+    // Admission consumes complete source frames. Even an empty window must
+    // fit one frame's canonical expansion for every retained resampler phase;
+    // a smaller first output does not make later chunks progress-capable.
+    let minimum = pcm::output_frame_count(frame_bytes, rate, channels, format);
+    minimum != 0 && minimum <= canonical_frames
 }
 
 pub(super) unsafe fn free_stream_slot() -> Option<usize> {
