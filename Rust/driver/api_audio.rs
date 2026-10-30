@@ -78,6 +78,51 @@ impl Drop for Callback {
 fn puts(bytes: &[u8]) {
     unsafe { log::r4os_rust_bootlog_write(bytes.as_ptr(), bytes.len()) }
 }
+
+/// # Safety
+/// The R4D supplies its resident epoch callback for its own registered backend.
+/// The Core output permit authenticates the exact context and retains the
+/// registration through every subsequent synchronous callback.
+pub(crate) unsafe extern "C" fn register_output_epoch(
+    name: *const u8,
+    callback: a::AudioOutputEpochFn,
+) -> i32 {
+    let owner = admission::r4os_rust_driver_api_owner_scalar(0);
+    let bytes = unsafe { text(name) };
+    let found = (0..8).find(|&i| {
+        let r = unsafe { ptr::read(ptr::addr_of!((*STATE.0.get())[i])) };
+        r.used && r.owner == owner && bytes == &r.name[..r.name_len]
+    });
+    let Some(index) = found else {
+        return a::service_api_result_invalid;
+    };
+    let context = unsafe { ptr::addr_of_mut!((*STATE.0.get())[index]).cast::<c_void>() };
+    unsafe {
+        audio::register_external_audio_epoch(
+            bytes,
+            context,
+            crate::audio::types::OutputEpochBinding {
+                callback,
+                query: output_epoch,
+            },
+        )
+    }
+}
+
+unsafe extern "C" fn output_epoch(
+    raw: *mut c_void,
+    callback: a::AudioOutputEpochFn,
+    out: *mut a::AudioOutputEpoch,
+) -> i32 {
+    let Some(r) = (unsafe { record(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return a::service_api_result_busy;
+    };
+    let descriptor = unsafe { ptr::read(r.descriptor) };
+    unsafe { callback(descriptor.context as u64, out) }
+}
 unsafe fn text<'a>(name: *const u8) -> &'a [u8] {
     let mut n = 0;
     while n < 512 && unsafe { *name.add(n) } != 0 {

@@ -280,6 +280,7 @@ pub(super) fn template() -> DriverApi {
         dma_sync_range_for_cpu: Some(super::api_callbacks::driver_dma_sync_range_for_cpu),
         driver_work_submit_owned: Some(super::api_callbacks::driver_driver_work_submit_owned),
         serial_query: Some(crate::serial::driver_query),
+        register_audio_output_epoch: Some(crate::driver::api_audio::register_output_epoch),
         log_info: super::api_callbacks::driver_log_info,
         log_warn: super::api_callbacks::driver_log_warn,
         log_error: super::api_callbacks::driver_log_error,

@@ -49,6 +49,9 @@ pub(crate) unsafe fn register_external_audio_outputs(
         if (*p).closing {
             return false;
         }
+        if !advance_output_registry() {
+            return false;
+        }
         (*p).outputs = Some(outputs);
         (*p).idle = idle;
         g!(initial_output_pending) = true;
@@ -161,6 +164,188 @@ pub(crate) unsafe fn audio_output_info(index: u32, out: *mut a::AudioOutputInfo)
             }
         }
         out.write(a::AudioOutputInfo::default());
+        0
+    }
+}
+
+/// The output permit owns registry membership, callbacks and registration
+/// lifetime for this entire synchronous copy. Provider owners independently
+/// serialize their rows; real epochs detect changes between those calls.
+pub(crate) unsafe fn audio_output_catalog(
+    outputs: *mut a::AudioOutputInfo,
+    capacity: u32,
+    out: *mut a::AudioOutputCatalog,
+) -> i32 {
+    unsafe {
+        const LIMIT: usize = MAX_AUDIO_BACKENDS * 32;
+        if outputs.is_null()
+            || out.is_null()
+            || capacity < LIMIT as u32
+            || !(outputs as usize).is_multiple_of(align_of::<a::AudioOutputInfo>())
+            || !(out as usize).is_multiple_of(align_of::<a::AudioOutputCatalog>())
+            || (*out).version != 1
+            || (*out).size < size_of::<a::AudioOutputCatalog>() as u32
+        {
+            return INVALID;
+        }
+        let Some(rows_bytes) = (capacity as usize).checked_mul(size_of::<a::AudioOutputInfo>())
+        else {
+            return INVALID;
+        };
+        let Some(rows_end) = (outputs as usize).checked_add(rows_bytes) else {
+            return INVALID;
+        };
+        let Some(info_end) = (out as usize).checked_add((*out).size as usize) else {
+            return INVALID;
+        };
+        if (outputs as usize) < info_end && (out as usize) < rows_end {
+            return INVALID;
+        }
+        let Some(_output) = OutputGuard::acquire(false) else {
+            return BUSY;
+        };
+        let mut catalog = a::AudioOutputCatalog {
+            registry_generation: g!(output_registry_generation),
+            active_registration: g!(active_audio_slot).map_or(0, |slot| {
+                let p = backend(slot);
+                if (*p).registered && !(*p).closing && (*p).config.write.is_some() {
+                    (*p).generation
+                } else {
+                    0
+                }
+            }),
+            ..Default::default()
+        };
+        for provider in &mut catalog.providers {
+            provider.active_index = 0;
+        }
+        let mut slots = [0; MAX_AUDIO_BACKENDS];
+        for slot in 0..MAX_AUDIO_BACKENDS {
+            let p = backend(slot);
+            if !(*p).registered || (*p).closing || (*p).config.write.is_none() {
+                continue;
+            }
+            let Some(extension) = (*p).outputs else {
+                return a::err_no_fn;
+            };
+            let Some(binding) = (*p).output_epoch else {
+                return a::err_no_fn;
+            };
+            let mut epoch = a::AudioOutputEpoch::default();
+            let result = (binding.query)((*p).config.context, binding.callback, &mut epoch);
+            if result != 1 {
+                return if result < 0 { result } else { INVALID };
+            }
+            if !valid_output_epoch(&epoch) {
+                return INVALID;
+            }
+            let i = catalog.provider_count as usize;
+            slots[i] = slot;
+            catalog.providers[i] = a::AudioOutputProviderEpoch {
+                registration: (*p).generation,
+                generation: epoch.generation,
+                count: epoch.count,
+                active_index: epoch.active_index,
+            };
+            catalog.provider_count += 1;
+            for local in 0..epoch.count {
+                let row = outputs.add(catalog.count as usize);
+                row.write(a::AudioOutputInfo::default());
+                let result = (extension.query)((*p).config.context as u64, local, row);
+                if result != 1 {
+                    return if result < 0 { result } else { BUSY };
+                }
+                if !valid_output_record(&*row) {
+                    return INVALID;
+                }
+                (*row).flags &= !a::audio_output_flag_active;
+                if g!(active_audio_slot) == Some(slot) && epoch.active_index == local as i32 {
+                    (*row).flags |= a::audio_output_flag_active;
+                }
+                catalog.count += 1;
+            }
+            if epoch.count < 32 {
+                let mut end = a::AudioOutputInfo::default();
+                let result = (extension.query)((*p).config.context as u64, epoch.count, &mut end);
+                if result != 0 {
+                    return if result < 0 { result } else { BUSY };
+                }
+            }
+        }
+        // There is no retry, persistent second catalog, callback lease or
+        // caller reference beyond this call. A changed provider invalidates
+        // the entire scratch prefix, including already copied other providers.
+        for (i, &slot) in slots[..catalog.provider_count as usize].iter().enumerate() {
+            let p = backend(slot);
+            let binding = (*p).output_epoch.unwrap();
+            let mut epoch = a::AudioOutputEpoch::default();
+            let result = (binding.query)((*p).config.context, binding.callback, &mut epoch);
+            if result != 1 {
+                return if result < 0 { result } else { INVALID };
+            }
+            if !valid_output_epoch(&epoch) {
+                return INVALID;
+            }
+            let before = &catalog.providers[i];
+            if before.generation != epoch.generation
+                || before.count != epoch.count
+                || before.active_index != epoch.active_index
+            {
+                return BUSY;
+            }
+        }
+        out.write(catalog);
+        1
+    }
+}
+
+fn valid_output_epoch(epoch: &a::AudioOutputEpoch) -> bool {
+    epoch.version == 1
+        && epoch.size == size_of::<a::AudioOutputEpoch>() as u32
+        && epoch.generation != 0
+        && epoch.count <= 32
+        && epoch.active_index >= -1
+        && (epoch.active_index == -1 || (epoch.active_index as u32) < epoch.count)
+}
+fn valid_output_record(row: &a::AudioOutputInfo) -> bool {
+    row.version == 1
+        && row.size == size_of::<a::AudioOutputInfo>() as u32
+        && row.id.contains(&0)
+        && row.name.contains(&0)
+}
+
+unsafe fn advance_output_registry() -> bool {
+    unsafe {
+        let Some(next) = g!(output_registry_generation).checked_add(1) else {
+            return false;
+        };
+        g!(output_registry_generation) = next;
+        true
+    }
+}
+
+pub(crate) unsafe fn register_external_audio_epoch(
+    name: &[u8],
+    context: *mut c_void,
+    binding: OutputEpochBinding,
+) -> i32 {
+    unsafe {
+        let Some(_output) = OutputGuard::acquire(true) else {
+            return BUSY;
+        };
+        let Some(slot) = find_backend(name) else {
+            return INVALID;
+        };
+        let p = backend(slot);
+        if (*p).closing
+            || (*p).config.context != context
+            || (*p).outputs.is_none()
+            || (*p).output_epoch.is_some()
+            || !advance_output_registry()
+        {
+            return INVALID;
+        }
+        (*p).output_epoch = Some(binding);
         0
     }
 }
@@ -306,6 +491,9 @@ pub(crate) unsafe fn unregister_audio_backend_by_name(name: &[u8]) -> i32 {
                 return result;
             }
         }
+        if !advance_output_registry() {
+            return INVALID;
+        }
         backend(slot).write(AudioBackend::EMPTY);
         if was_active {
             g!(active_audio_slot) = None;
@@ -338,6 +526,9 @@ pub(crate) unsafe fn set_audio_backend_closing(name: &[u8], closing: bool) -> bo
             return false;
         };
         let p = backend(slot);
+        if (*p).closing != closing && !advance_output_registry() {
+            return false;
+        }
         (*p).closing = closing;
         if g!(active_audio_slot) == Some(slot) {
             let c = (*p).config;
@@ -469,6 +660,9 @@ pub(super) unsafe fn register_audio_backend_internal(
         let Some(next) = generation.checked_add(1) else {
             return false;
         };
+        if !advance_output_registry() {
+            return false;
+        }
         g!(next_backend_generation) = next;
         p.write(AudioBackend::EMPTY);
         (*p).generation = generation;

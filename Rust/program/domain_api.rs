@@ -41,6 +41,17 @@ pub unsafe extern "C" fn r4os_rust_program_domain_audio_output_info(
 }
 
 /// # Safety
+/// Writable disjoint canonical caller buffers remain resident until return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_program_domain_audio_output_catalog(
+    outputs: *mut c::AudioOutputInfo,
+    capacity: u32,
+    out: *mut c::AudioOutputCatalog,
+) -> i32 {
+    unsafe { crate::audio::core::audio_output_catalog(outputs, capacity, out) }
+}
+
+/// # Safety
 /// `out` is a writable canonical record for the admitted program invocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_program_domain_audio_stream_progress(

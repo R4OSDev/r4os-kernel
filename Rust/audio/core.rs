@@ -51,6 +51,7 @@ struct State {
     next_stream_id: u32,
     next_stream_generation: u64,
     next_backend_generation: u64,
+    output_registry_generation: u64,
     next_synth_generation: u64,
     playback_ledger: playback::Ledger<MAX_STREAMS, 64>,
     playback_position: playback::Position,
@@ -126,6 +127,7 @@ static STATE: Resident<State> = Resident(UnsafeCell::new(State {
     next_stream_id: 1,
     next_stream_generation: 1,
     next_backend_generation: 1,
+    output_registry_generation: 1,
     next_synth_generation: 1,
     playback_ledger: playback::Ledger::EMPTY,
     playback_position: playback::Position {
@@ -658,10 +660,10 @@ use outputs::{
 };
 pub(crate) use outputs::{
     audio_backend_active, audio_backend_family_status, audio_backend_has_output,
-    audio_backend_registered, audio_output_info, audio_select_output,
-    register_external_audio_backend_z, register_external_audio_outputs,
-    register_external_audio_playback, register_mixer_backend_z, set_audio_backend_closing,
-    unregister_audio_backend_by_name, unregister_audio_backend_z,
+    audio_backend_registered, audio_output_catalog, audio_output_info, audio_select_output,
+    register_external_audio_backend_z, register_external_audio_epoch,
+    register_external_audio_outputs, register_external_audio_playback, register_mixer_backend_z,
+    set_audio_backend_closing, unregister_audio_backend_by_name, unregister_audio_backend_z,
 };
 use playback_progress::{
     refresh_playback_owned, snapshot_stream_progress, write_mixed_tracked_owned,

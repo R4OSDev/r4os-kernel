@@ -360,6 +360,12 @@ impl NamedBackend {
         pointer: ptr::null(),
     };
 }
+#[derive(Clone, Copy)]
+pub struct OutputEpochBinding {
+    pub callback: a::AudioOutputEpochFn,
+    pub query:
+        unsafe extern "C" fn(*mut c_void, a::AudioOutputEpochFn, *mut a::AudioOutputEpoch) -> i32,
+}
 pub struct AudioBackend {
     pub registered: bool,
     pub active: bool,
@@ -369,6 +375,7 @@ pub struct AudioBackend {
     pub config: BackendRegistration,
     pub idle: Option<StopPcmCtxFn>,
     pub outputs: Option<a::AudioOutputExtension>,
+    pub output_epoch: Option<OutputEpochBinding>,
     pub generation: u64,
     pub tracked_write: Option<TrackedWriteCtxFn>,
     pub playback: Option<PlaybackCtxFn>,
@@ -396,6 +403,7 @@ impl AudioBackend {
         },
         idle: None,
         outputs: None,
+        output_epoch: None,
         generation: 0,
         tracked_write: None,
         playback: None,
