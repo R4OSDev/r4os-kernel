@@ -16,6 +16,7 @@ static BUCKETS: [Bucket; 64] = [const {
         epoch: AtomicU64::new(1),
     }
 }; 64];
+static RECEIVERS: dispatch::ReceiverHints = dispatch::ReceiverHints::new();
 fn bucket(handle: u32) -> &'static Bucket {
     &BUCKETS[handle as usize % BUCKETS.len()]
 }
@@ -24,7 +25,22 @@ pub(super) enum Step {
     Done(i32),
 }
 pub(super) fn epoch(handle: u32) -> u64 {
-    bucket(handle).epoch.load(Ordering::Acquire)
+    bucket(handle).epoch.load(Ordering::SeqCst)
+}
+pub(super) fn enroll(slot: usize) -> bool {
+    RECEIVERS.enroll(slot)
+}
+pub(super) fn withdraw(slot: usize) -> bool {
+    RECEIVERS.withdraw(slot)
+}
+unsafe fn signal(slot: usize) {
+    unsafe {
+        sync_objects::r4os_rust_sync_event(
+            ptr::addr_of_mut!((*state()).workers[dispatch::WIDTH + slot].event),
+            0,
+            0,
+        );
+    }
 }
 pub(super) unsafe fn interested(req: *mut Request) {
     unsafe {
@@ -65,14 +81,35 @@ pub(super) fn changed(handle: u32) {
     if bucket.interest.load(Ordering::Acquire) == 0 {
         return;
     }
-    bucket.epoch.fetch_add(1, Ordering::AcqRel);
+    bucket.epoch.fetch_add(1, Ordering::SeqCst);
+    if let Some(slot) = RECEIVERS.reserve(1) {
+        unsafe { signal(slot) };
+    }
+}
+/// Async owner held. A notified receiver has rechecked the actual Requests;
+/// fan out only for other currently retryable detached continuations. Queued
+/// first attempts retain their existing independent Lane wake credits.
+pub(super) unsafe fn wake_pending() {
     unsafe {
-        for i in dispatch::WIDTH..WORKERS {
-            sync_objects::r4os_rust_sync_event(
-                ptr::addr_of_mut!((*state()).workers[i].event),
-                0,
-                0,
-            );
+        let now = timer::tick_count();
+        let mut demand = 0;
+        for i in 0..CAPACITY {
+            let req = ptr::addr_of!((*state()).requests[i]);
+            if (*req).used
+                && (*req).kind == Kind::Service
+                && (*req).state == 2
+                && (*req).task_id == 0
+                && !(*req).cancel_requested
+                && ((*req).service_epoch != epoch((*req).service_handle) || expired(req, now))
+            {
+                demand += 1;
+                if demand == dispatch::WIDTH {
+                    break;
+                }
+            }
+        }
+        while let Some(slot) = RECEIVERS.reserve(demand) {
+            signal(slot);
         }
     }
 }

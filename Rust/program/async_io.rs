@@ -469,6 +469,9 @@ unsafe fn ensure_workers(service: bool) -> bool {
             if (*worker).task_id == 0 {
                 // A reused slot is reached only after exact Task retirement.
                 (*state()).lanes[usize::from(service)].withdraw(index % dispatch::WIDTH);
+                if service {
+                    service::withdraw(index % dispatch::WIDTH);
+                }
                 sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker).event), 1, 0);
                 let name = b"r4x-async-io";
                 let request = task_api::CreateRequest {
@@ -619,6 +622,7 @@ unsafe extern "C" fn worker_main() {
                 drop(guard);
                 threads::exit_task();
             }
+            let notified = (*worker).service && service::enroll(slot);
             let req = take_request(worker);
             if req.is_null() {
                 (*state()).lanes[lane].park(slot);
@@ -630,6 +634,12 @@ unsafe extern "C" fn worker_main() {
                 drop(guard);
                 sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker).event), 2, timeout);
                 continue;
+            }
+            if (*worker).service {
+                let during_check = service::withdraw(slot);
+                if notified || during_check {
+                    service::wake_pending();
+                }
             }
             let observation = crate::sched::worker_observation::begin(
                 if (*worker).service {
@@ -1256,6 +1266,10 @@ unsafe fn retire(value: Claim) -> bool {
             }
             (*worker).retiring = true;
             (*state()).lanes[usize::from((*worker).service)].withdraw(i % dispatch::WIDTH);
+            if (*worker).service {
+                service::withdraw(i % dispatch::WIDTH);
+                service::wake_pending();
+            }
             wake_workers((*worker).service);
             target = worker;
             break;
@@ -1895,8 +1909,9 @@ unsafe fn clear_service(req: *mut Request, id: u32) {
         (*req).service_request_id = 0;
     }
 }
-/// Endpoint notifications never acquire the Async mutex. The four resident
-/// AUTO Events plus a generation bridge physical wait and continuation release.
+/// Endpoint notifications never acquire the Async mutex. Coalesced resident
+/// receiver enrollment, bucket epochs and AUTO Events bridge the final check,
+/// physical wait and continuation release. No Task/Request pointer is published.
 pub(crate) fn service_changed(handle: u32) {
     service::changed(handle);
 }
