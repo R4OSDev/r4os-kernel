@@ -68,6 +68,7 @@ pub fn format_flag(format: u16) -> Option<u32> {
 }
 /// # Safety
 /// Callback identity/context and the copied optional fixed limit are live for the call.
+#[cfg(test)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_audio_contract(
     op: u32,

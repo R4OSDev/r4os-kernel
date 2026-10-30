@@ -119,42 +119,6 @@ impl Store {
         changed
     }
 }
-/// # Safety
-/// Exact initialized route store is serialized by the receiver/display owner.
-/// Inputs readable and operation-specific outputs exclusive; no callbacks/I/O.
-#[unsafe(no_mangle)]
-#[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn r4os_rust_display_audio_routes(
-    op: u32,
-    store: *mut Store,
-    input: *const a::GfxAudioRoute,
-    location: u32,
-    device: u32,
-    index: u32,
-    generation: u64,
-    sequence: u64,
-    out: *mut a::GfxAudioRoute,
-) -> i32 {
-    match op {
-        0 => match unsafe { (&mut *store).publish(&*input) } {
-            Ok(()) => 0,
-            Err(error) => error as i32,
-        },
-        1 => {
-            let Some(value) = unsafe { &*store }.query(location, device, index) else {
-                return 0;
-            };
-            unsafe { out.write(value) };
-            1
-        }
-        2 => {
-            unsafe { &mut *store }.invalidate(generation, sequence);
-            0
-        }
-        3 => i32::from(unsafe { &mut *store }.erase(generation)),
-        _ => panic!("receiver audio route operation"),
-    }
-}
 const _: () = {
     assert!(size_of::<Store>() == 11264 && core::mem::align_of::<Store>() == 8);
 };

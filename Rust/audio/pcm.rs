@@ -1,4 +1,5 @@
 //! Original integer PCM conversion and exact streaming phase/tail contract.
+#[cfg(test)]
 use core::slice;
 pub const TARGET_RATE: u32 = 48_000;
 pub const TARGET_CHANNELS: u16 = 2;
@@ -127,6 +128,7 @@ pub(crate) unsafe fn take_direct_chunk<'a>(
         )
     }
 }
+#[cfg(test)]
 pub(crate) unsafe fn convert_to_stereo_s16(
     input: &[u8],
     rate: u32,
@@ -368,8 +370,9 @@ fn clamp_i16(value: i64) -> i16 {
         value.try_into().unwrap()
     }
 }
-// Diagnostic callers borrow this exact resident work record without a shadow
-// copy; the productive core never passes diagnostic counters.
+// Retained host test facades borrow this work record. The normal kernel has
+// no global counter export; productive callers pass no diagnostic counter.
+#[cfg(test)]
 #[unsafe(no_mangle)]
 pub static mut r4os_rust_audio_pcm_work: Work = Work {
     sample_reads: 0,
@@ -377,11 +380,13 @@ pub static mut r4os_rust_audio_pcm_work: Work = Work {
     interpolations: 0,
     direct_bytes: 0,
 };
+#[cfg(test)]
 #[repr(C)]
 pub struct Span {
     pub pointer: *const u8,
     pub len: usize,
 }
+#[cfg(test)]
 #[repr(C)]
 pub struct Args {
     pub state: *mut ResamplerState,
@@ -398,6 +403,7 @@ pub struct Args {
 }
 /// # Safety
 /// The private facade supplies exact fixed records and live bounded spans.
+#[cfg(test)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_audio_pcm(op: u32, args: *const Args) -> usize {
     unsafe {
@@ -482,9 +488,10 @@ pub unsafe extern "C" fn r4os_rust_audio_pcm(op: u32, args: *const Args) -> usiz
 const _: () = {
     assert!(size_of::<ResamplerState>() == 32);
     assert!(align_of::<ResamplerState>() == 8);
+    assert!(core::mem::offset_of!(ResamplerState, previous) == 20);
 };
 
+#[cfg(test)]
 const _: () = {
     assert!(size_of::<Args>() == 72);
-    assert!(core::mem::offset_of!(ResamplerState, previous) == 20);
 };

@@ -191,12 +191,14 @@ pub(crate) unsafe fn write_s16(output: &mut [u8], offset: usize, sample: i16, wo
         output[offset + 1] = b[1];
     }
 }
+#[cfg(test)]
 #[unsafe(no_mangle)]
 pub static mut r4os_rust_audio_mixer_work: Work = Work {
     accumulations: 0,
     sample_writes: 0,
     direct_bytes: 0,
 };
+#[cfg(test)]
 #[repr(C)]
 pub struct Args {
     pub ring: *mut u8,
@@ -216,6 +218,7 @@ pub struct Args {
 }
 /// # Safety
 /// Private facade records carry the original bounded caller-owned ring spans.
+#[cfg(test)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_audio_mixer(op: u32, args: *const Args) -> i64 {
     unsafe {
@@ -297,9 +300,13 @@ pub unsafe extern "C" fn r4os_rust_audio_mixer(op: u32, args: *const Args) -> i6
 }
 
 const _: () = {
-    assert!(size_of::<Args>() == 112);
     assert!(size_of::<Owner>() == 16);
     assert!(core::mem::offset_of!(Owner, generation) == 8);
     assert!(size_of::<Source>() == 32);
+};
+
+#[cfg(test)]
+const _: () = {
+    assert!(size_of::<Args>() == 112);
     assert!(core::mem::offset_of!(Args, reader) == 104);
 };
