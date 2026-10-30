@@ -49,7 +49,7 @@ unsafe fn exact_pair(running: *mut Descriptor, ready: *mut Descriptor) -> bool {
 // Consume it through the normal Scheduler owner before the causal baseline.
 // Since0.87.34 the lower-rank bystander itself no longer requests a remote IPI.
 fn consume_nonurgent(running: Task) {
-    if !urgent(running) {
+    if !urgent(running, &mut AudioPass::new()) {
         assert!(!preempt_pending(false));
     }
 }

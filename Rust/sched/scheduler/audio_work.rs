@@ -165,3 +165,135 @@ impl Policy {
         self.owed = true;
     }
 }
+
+/// A copied decision scope inside one uninterrupted Runtime admission. The
+/// caller ends this value's lifetime before releasing Runtime or switching.
+/// Only a positive identity lookup is reused; time flags and descriptor
+/// generation/role/state/CPU validation remain fresh at every decision.
+pub(crate) struct Pass<T: Copy> {
+    policy: Option<Policy>,
+    worker: Option<(Identity, T)>,
+    sampled: bool,
+    changed: bool,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct Reading<T> {
+    pub worker: Option<T>,
+    pub eligible: bool,
+    pub protected: bool,
+    pub giveback: bool,
+}
+impl<T> Reading<T> {
+    const EMPTY: Self = Self {
+        worker: None,
+        eligible: false,
+        protected: false,
+        giveback: false,
+    };
+}
+impl<T: Copy> Pass<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            policy: None,
+            worker: None,
+            sampled: false,
+            changed: false,
+        }
+    }
+    pub(crate) fn sample(
+        &mut self,
+        now: u64,
+        mailbox: &Mailbox,
+        initial: impl FnOnce() -> Policy,
+        mut resolve: impl FnMut(Identity) -> Option<T>,
+        mut valid: impl FnMut(T, Identity) -> bool,
+    ) -> Reading<T> {
+        if self.policy.is_none() {
+            self.policy = Some(initial());
+        }
+        // A validated cached descriptor needs no repeated registry search.
+        // The final sequence load still bounds the exact decision; a changed
+        // or busy producer must refresh/decline before any promotion escapes.
+        if self.sampled && self.worker.is_some() {
+            let value = self.evaluate(now, &mut resolve, &mut valid);
+            if mailbox.still_current(self.policy.unwrap().seen) {
+                return value;
+            }
+        }
+        let policy = self.policy.as_mut().unwrap();
+        match mailbox.read_after(policy.seen) {
+            Update::Busy => {
+                self.sampled = false;
+                return Reading::EMPTY;
+            }
+            Update::Changed(sequence, hint) => {
+                if self.worker.is_some_and(|(key, _)| key != hint.worker) {
+                    self.worker = None;
+                }
+                policy.adopt(sequence, hint);
+                self.changed = true;
+            }
+            Update::Unchanged => {}
+        }
+        let value = self.evaluate(now, &mut resolve, &mut valid);
+        // Like the original path, an inactive/missing/invalid worker needs
+        // no final mailbox load: no priority promotion escapes this decision.
+        // A later read still refreshes before it can return a cached worker.
+        if value.worker.is_none() {
+            self.sampled = true;
+            return value;
+        }
+        self.sampled = mailbox.still_current(self.policy.unwrap().seen);
+        if self.sampled { value } else { Reading::EMPTY }
+    }
+    fn evaluate(
+        &mut self,
+        now: u64,
+        resolve: &mut impl FnMut(Identity) -> Option<T>,
+        valid: &mut impl FnMut(T, Identity) -> bool,
+    ) -> Reading<T> {
+        let policy = self.policy.unwrap();
+        let eligible = policy.eligible(now);
+        let protected = policy.protected(now);
+        let giveback = policy.giveback(now);
+        if !eligible && !protected && !giveback {
+            return Reading::EMPTY;
+        }
+        let identity = policy.hint.worker;
+        if self.worker.is_some_and(|(key, _)| key != identity) {
+            self.worker = None;
+        }
+        let worker = if let Some((_, worker)) = self.worker {
+            worker
+        } else if let Some(worker) = resolve(identity) {
+            self.worker = Some((identity, worker));
+            worker
+        } else {
+            // An absent identity is not evidence for a later decision.
+            return Reading::EMPTY;
+        };
+        if !valid(worker, identity) {
+            self.worker = None;
+            return Reading::EMPTY;
+        }
+        Reading {
+            worker: Some(worker),
+            eligible,
+            protected,
+            giveback,
+        }
+    }
+    pub(crate) fn selected(&mut self, audio: bool, now: u64, burst: u64, period: u64) {
+        let policy = self.policy.as_mut().expect("sample before selection");
+        let before = (policy.until, policy.next_grant, policy.owed);
+        policy.selected(audio, now, burst, period);
+        self.changed |= before != (policy.until, policy.next_grant, policy.owed);
+    }
+    pub(crate) fn take_update(&mut self) -> Option<Policy> {
+        if core::mem::take(&mut self.changed) {
+            self.policy
+        } else {
+            None
+        }
+    }
+}

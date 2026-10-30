@@ -402,8 +402,8 @@ fn since(now: u64, then: u64) -> u64 {
         now - then
     }
 }
-fn urgent(running: Task) -> bool {
-    let audio = audio_candidate(tick());
+fn urgent(running: Task, pass: &mut AudioPass) -> bool {
+    let audio = audio_candidate_in(tick(), pass);
     if !audio.task.is_null() && view(running).dispatch_rank != 0 {
         if audio.task == running {
             if audio.giveback && ready_count() != 0 {
@@ -434,41 +434,45 @@ impl AudioCandidate {
         giveback: false,
     };
 }
-// Caller already retains Runtime. A producer never enters Runtime at its IRQ
-// publication; a busy/changed mailbox simply declines this promotion attempt.
+type AudioPass = audio_work::Pass<Task>;
+// This cold adapter is also used by the explicit native audio probe. Related
+// production decisions share one local Pass, ending before Runtime release.
 fn audio_candidate(now: u64) -> AudioCandidate {
+    audio_candidate_in(now, &mut AudioPass::new())
+}
+fn sync_audio_policy(pass: &mut AudioPass) {
+    if let Some(policy) = pass.take_update() {
+        change(|s| s.audio = policy);
+    }
+}
+fn audio_candidate_in(now: u64, pass: &mut AudioPass) -> AudioCandidate {
     if percpu::current_index() != 0 {
         return AudioCandidate::EMPTY;
     }
-    let mut policy = read(|s| s.audio);
-    match audio_work::MAILBOX.read_after(policy.seen) {
-        audio_work::Update::Busy => return AudioCandidate::EMPTY,
-        audio_work::Update::Changed(sequence, hint) => {
-            policy.adopt(sequence, hint);
-            change(|s| s.audio = policy);
-        }
-        audio_work::Update::Unchanged => {}
-    }
-    let eligible = policy.eligible(now);
-    let protected = policy.protected(now);
-    let giveback = policy.giveback(now);
-    if !eligible && !protected && !giveback {
-        return AudioCandidate::EMPTY;
-    }
-    let task =
-        unsafe { super::task::audio_worker(policy.hint.worker.id, policy.hint.worker.generation) };
-    if task.is_null() || !audio_work::MAILBOX.still_current(policy.seen) {
-        return AudioCandidate::EMPTY;
-    }
+    let value = pass.sample(
+        now,
+        &audio_work::MAILBOX,
+        || read(|s| s.audio),
+        |identity| {
+            let task =
+                unsafe { super::task::audio_worker_identity(identity.id, identity.generation) };
+            (!task.is_null()).then_some(task)
+        },
+        |task, identity| unsafe {
+            super::task::audio_worker_valid(task, identity.id, identity.generation)
+        },
+    );
+    sync_audio_policy(pass);
     AudioCandidate {
-        task,
-        eligible,
-        protected,
-        giveback,
+        task: value.worker.unwrap_or(ptr::null_mut()),
+        eligible: value.eligible,
+        protected: value.protected,
+        giveback: value.giveback,
     }
 }
-fn audio_preemption(running: Task, now: u64) -> bool {
-    let audio = audio_candidate(now);
+
+fn audio_preemption(running: Task, now: u64, pass: &mut AudioPass) -> bool {
+    let audio = audio_candidate_in(now, pass);
     let due = !audio.task.is_null()
         && view(running).dispatch_rank != 0
         && if audio.task == running {
@@ -687,7 +691,7 @@ fn record_overrun(ticks: u64, rank: u8) {
 fn record_deferred(ticks: u64) {
     change(|s| s.preemption_deferred_max_ticks = s.preemption_deferred_max_ticks.max(ticks));
 }
-fn refresh_pending(running: Task, rank_before_dispatch: u8) {
+fn refresh_pending(running: Task, rank_before_dispatch: u8, pass: &mut AudioPass) {
     // Dispatch accounting can exhaust the selected task's last boost before
     // it becomes current. Publish only that actual demotion; an unchanged
     // lower-rank FIFO pick retains its existing fairness policy.
@@ -699,10 +703,10 @@ fn refresh_pending(running: Task, rank_before_dispatch: u8) {
         );
     }
     if local().pending {
-        set_pending(urgent(running));
+        set_pending(urgent(running, pass));
     }
 }
-fn next_ready(force_priority: bool) -> Task {
+fn next_ready(force_priority: bool, pass: &mut AudioPass) -> Task {
     if !percpu::is_schedulable(percpu::current_index()) {
         return ptr::null_mut();
     }
@@ -714,7 +718,7 @@ fn next_ready(force_priority: bool) -> Task {
     change(|s| s.priority_selects = s.priority_selects.wrapping_add(1));
     let cpu = u64::from(percpu::current_index());
     let now = tick();
-    let audio = audio_candidate(now);
+    let audio = audio_candidate_in(now, pass);
     let audio_ready = !audio.task.is_null() && audio.eligible && view(audio.task).state == 1;
     // Current is not yet requeued. Its expired reservation therefore owes
     // the already Ready FIFO head a real opportunity, even after rank picks.
@@ -754,14 +758,13 @@ fn next_ready(force_priority: bool) -> Task {
         local_change(|s| s.fairness = pick.fairness);
     }
     if percpu::current_index() == 0 {
-        change(|s| {
-            s.audio.selected(
-                next == audio.task,
-                now,
-                (2 * pit::DEFAULT_HZ as u64 / 1000).max(1),
-                (10 * pit::DEFAULT_HZ as u64 / 1000).max(1),
-            )
-        });
+        pass.selected(
+            next == audio.task,
+            now,
+            (2 * pit::DEFAULT_HZ as u64 / 1000).max(1),
+            (10 * pit::DEFAULT_HZ as u64 / 1000).max(1),
+        );
+        sync_audio_policy(pass);
     }
     if pick.fifo {
         change(|s| s.priority_rr_picks = s.priority_rr_picks.wrapping_add(1));
@@ -873,63 +876,65 @@ pub fn yield_task() {
 // stack resuming as Running after the existing physical RSP/FPU handoff; the
 // finish-switch hook has already released Runtime. No Rust borrow spans it.
 fn yield_owned() -> bool {
-    change(|s| s.yield_count = s.yield_count.wrapping_add(1));
-    let now = tick();
-    preempt_disable();
-    let old = local().current;
-    if old.is_null() {
+    let (outgoing, incoming) = {
+        change(|s| s.yield_count = s.yield_count.wrapping_add(1));
+        let now = tick();
+        preempt_disable();
+        let old = local().current;
+        if old.is_null() {
+            preempt_enable();
+            return false;
+        }
+        if view(old).state == 2 {
+            restore_productive(old);
+        }
+        mutate(1, old, now, 0);
+        let departing = stage_placement(old, 1);
+        let mut pass = AudioPass::new();
+        let priority_wakeup = local().pending && urgent(old, &mut pass);
+        let selected = next_ready(priority_wakeup, &mut pass);
+        let next = if selected.is_null() {
+            set_pending(false);
+            if view(old).state == 2 && !departing {
+                preempt_enable();
+                return false;
+            }
+            let idle = local().idle;
+            if idle.is_null() {
+                assert!(!departing, "placement requires initialized idle");
+                preempt_enable();
+                return false;
+            }
+            idle
+        } else {
+            selected
+        };
+        if next == old {
+            mutate(0, old, 0, 0);
+            preempt_enable();
+            set_pending(false);
+            return false;
+        }
+        let old_view = view(old);
+        if old_view.state == 2 {
+            mutate(if old_view.cpu_idle { 3 } else { 2 }, old, now, 0);
+        } else {
+            mutate(4, old, 0, 0);
+        }
+        let rank_before_dispatch = view(next).dispatch_rank;
+        let latency = mutate(5, next, now, 0);
+        record_ready(next, latency);
+        mutate(0, next, 0, 0);
+        mutate(6, old, 0, 0);
+        mutate(7, next, 0, 0);
+        note_productive(next);
         preempt_enable();
-        return false;
-    }
-    if view(old).state == 2 {
-        restore_productive(old);
-    }
-    mutate(1, old, now, 0);
-    let departing = stage_placement(old, 1);
-    let priority_wakeup = local().pending && urgent(old);
-    let selected = next_ready(priority_wakeup);
-    let next = if selected.is_null() {
-        set_pending(false);
-        if view(old).state == 2 && !departing {
-            preempt_enable();
-            return false;
-        }
-        let idle = local().idle;
-        if idle.is_null() {
-            assert!(!departing, "placement requires initialized idle");
-            preempt_enable();
-            return false;
-        }
-        idle
-    } else {
-        selected
+        publish_current(next);
+        unsafe { task_context::bind(view(next).unwind_slot) };
+        refresh_pending(next, rank_before_dispatch, &mut pass);
+        require_switch(old);
+        (view(old).rsp_slot, view(next).rsp)
     };
-    if next == old {
-        mutate(0, old, 0, 0);
-        preempt_enable();
-        set_pending(false);
-        return false;
-    }
-    let old_view = view(old);
-    if old_view.state == 2 {
-        mutate(if old_view.cpu_idle { 3 } else { 2 }, old, now, 0);
-    } else {
-        mutate(4, old, 0, 0);
-    }
-    let rank_before_dispatch = view(next).dispatch_rank;
-    let latency = mutate(5, next, now, 0);
-    record_ready(next, latency);
-    mutate(0, next, 0, 0);
-    mutate(6, old, 0, 0);
-    mutate(7, next, 0, 0);
-    note_productive(next);
-    preempt_enable();
-    publish_current(next);
-    unsafe { task_context::bind(view(next).unwind_slot) };
-    refresh_pending(next, rank_before_dispatch);
-    require_switch(old);
-    let outgoing = view(old).rsp_slot;
-    let incoming = view(next).rsp;
     // No state reference or RAII owner spans this physical switch. Assembly
     // publishes outgoing RSP before releasing the unique runtime owner.
     unsafe { switch_context(outgoing, incoming) };
@@ -942,54 +947,56 @@ pub(crate) fn preempt_timer_from_irq(rip: u64) {
     preempt_irq(rip, true);
 }
 fn preempt_irq(rip: u64, timer: bool) {
-    if !enabled() {
-        return;
-    }
-    let now = tick();
-    let old = local().current;
-    if old.is_null() || view(old).state != 2 {
-        return;
-    }
-    let departing = stage_placement(old, 0);
-    let wakeup = local().pending && urgent(old);
-    let selected = next_ready(wakeup);
-    let next = if selected.is_null() && departing {
-        local().idle
-    } else {
-        selected
+    let (outgoing, incoming) = {
+        if !enabled() {
+            return;
+        }
+        let now = tick();
+        let old = local().current;
+        if old.is_null() || view(old).state != 2 {
+            return;
+        }
+        let departing = stage_placement(old, 0);
+        let mut pass = AudioPass::new();
+        let wakeup = local().pending && urgent(old, &mut pass);
+        let selected = next_ready(wakeup, &mut pass);
+        let next = if selected.is_null() && departing {
+            local().idle
+        } else {
+            selected
+        };
+        assert!(!departing || !next.is_null(), "placement requires idle");
+        if next.is_null() {
+            set_pending(false);
+            return;
+        }
+        if next == old {
+            mutate(0, old, 0, 0);
+            set_pending(false);
+            return;
+        }
+        if timer {
+            crate::sched::fpu_observation::timer_switch(rip);
+        }
+        mutate(if view(old).cpu_idle { 3 } else { 2 }, old, now, 0);
+        let rank_before_dispatch = view(next).dispatch_rank;
+        let latency = mutate(5, next, now, 0);
+        record_ready(next, latency);
+        mutate(0, next, 0, 0);
+        mutate(6, old, 0, 0);
+        mutate(7, next, 0, 0);
+        note_productive(next);
+        publish_current(next);
+        unsafe { task_context::bind(view(next).unwind_slot) };
+        if wakeup {
+            change(|s| {
+                s.wakeup_preemption_switch_count = s.wakeup_preemption_switch_count.wrapping_add(1)
+            });
+        }
+        refresh_pending(next, rank_before_dispatch, &mut pass);
+        require_switch(old);
+        (view(old).rsp_slot, view(next).rsp)
     };
-    assert!(!departing || !next.is_null(), "placement requires idle");
-    if next.is_null() {
-        set_pending(false);
-        return;
-    }
-    if next == old {
-        mutate(0, old, 0, 0);
-        set_pending(false);
-        return;
-    }
-    if timer {
-        crate::sched::fpu_observation::timer_switch(rip);
-    }
-    mutate(if view(old).cpu_idle { 3 } else { 2 }, old, now, 0);
-    let rank_before_dispatch = view(next).dispatch_rank;
-    let latency = mutate(5, next, now, 0);
-    record_ready(next, latency);
-    mutate(0, next, 0, 0);
-    mutate(6, old, 0, 0);
-    mutate(7, next, 0, 0);
-    note_productive(next);
-    publish_current(next);
-    unsafe { task_context::bind(view(next).unwind_slot) };
-    if wakeup {
-        change(|s| {
-            s.wakeup_preemption_switch_count = s.wakeup_preemption_switch_count.wrapping_add(1)
-        });
-    }
-    refresh_pending(next, rank_before_dispatch);
-    require_switch(old);
-    let outgoing = view(old).rsp_slot;
-    let incoming = view(next).rsp;
     unsafe { switch_context(outgoing, incoming) };
 }
 unsafe fn block_current(object: u64, timeout: u64, reason: *const u8, len: usize) -> Task {
@@ -1066,7 +1073,8 @@ pub(crate) unsafe fn park_blocked_owned(task: Task, flags: u64) {
                 let latency = mutate(5, task, tick(), 0);
                 record_ready(task, latency);
                 mutate(0, task, 0, 0);
-                refresh_pending(task, rank_before_dispatch);
+                let mut pass = AudioPass::new();
+                refresh_pending(task, rank_before_dispatch, &mut pass);
             }
             runtime::restore_runtime(flags);
             return;
@@ -1389,8 +1397,9 @@ fn defer_critical(task: Task, ticks: u64, preemptible: bool, rip: u64) -> bool {
     false
 }
 pub fn preempt_pending(preemptible: bool) -> bool {
+    let mut pass = AudioPass::new();
     if enabled() && !local().current.is_null() {
-        audio_preemption(local().current, tick());
+        audio_preemption(local().current, tick(), &mut pass);
     }
     if !local().pending || !enabled() {
         return false;
@@ -1399,7 +1408,7 @@ pub fn preempt_pending(preemptible: bool) -> bool {
     if running.is_null() || view(running).state != 2 {
         return false;
     }
-    if !urgent(running)
+    if !urgent(running, &mut pass)
         && !unsafe { thread_placement::pending(running.cast()) }
         && !(percpu::state(percpu::current_index()) == percpu::DRAINING && !view(running).cpu_idle)
     {
@@ -1450,8 +1459,12 @@ pub(crate) fn safe_reschedule() -> bool {
         runtime::restore_runtime(flags);
         return false;
     }
-    let priority =
-        audio_preemption(running, tick()) || placement || local().pending && urgent(running);
+    let priority = {
+        let mut pass = AudioPass::new();
+        audio_preemption(running, tick(), &mut pass)
+            || placement
+            || local().pending && urgent(running, &mut pass)
+    };
     if !priority {
         set_pending(false);
     }
@@ -1618,7 +1631,10 @@ fn timer_preemption(now: u64, preemptible: bool, rip: u64) -> bool {
         });
         return false;
     }
-    let priority = audio_preemption(running, now) || local().pending && urgent(running);
+    let priority = {
+        let mut pass = AudioPass::new();
+        audio_preemption(running, now, &mut pass) || local().pending && urgent(running, &mut pass)
+    };
     if local().pending && !priority {
         set_pending(false);
     }
