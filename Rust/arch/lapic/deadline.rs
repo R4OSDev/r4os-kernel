@@ -85,6 +85,7 @@ fn current(t: &Timer) -> bool {
 fn wr(t: &Timer, value: u64) -> bool {
     // The LAPIC owner authorizes this one architectural register and a full
     // finite TSC value (or the architectural disarm value), never an index API.
+    super::invalidate_arm();
     unsafe {
         safe_msr::write_exact(
             percpu::current_index(),
@@ -562,6 +563,29 @@ pub(super) fn idle_budget_us() -> Option<u64> {
         return None;
     }
     u64::try_from(u128::from(next - now) * 1_000_000 / u128::from(hz)).ok()
+}
+
+/// The caller holds local IF=0 and the exact LAPIC revision. Inspect the
+/// architectural register as well: an early IRQ may have consumed it already.
+pub(super) fn retains_idle_arm(finite: bool) -> bool {
+    let t = local();
+    if !current(t) {
+        return false;
+    }
+    let mode = t.mode.load(Ordering::Acquire);
+    let next = t.next.load(Ordering::Acquire);
+    if finite && mode != SINGLE || !finite && !matches!(mode, SINGLE | PAUSED) {
+        return false;
+    }
+    let cpu = percpu::current_index();
+    // This qualified owner authorizes only its architectural deadline MSR.
+    let actual = unsafe { safe_msr::read_exact(cpu, t.epoch.load(Ordering::Acquire), MSR) };
+    let valid = if finite {
+        next != 0 && actual == Ok(next) && next > super::read_tsc()
+    } else {
+        next == 0 && actual == Ok(0)
+    };
+    valid && current(t)
 }
 pub(super) fn timer_sample(cpu: u32) -> Option<(u64, u64, u64, u32, u32)> {
     let t = TIMERS.get(cpu as usize)?;

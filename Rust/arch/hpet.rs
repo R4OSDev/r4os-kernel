@@ -3,7 +3,10 @@
 use super::runtime::RuntimeGuard;
 use crate::{
     memory::{paging, phys},
-    platform::clock_math as math,
+    platform::{
+        clock_math as math,
+        timer_arm::{self, Revision, Stamp},
+    },
 };
 use core::{
     cell::UnsafeCell,
@@ -89,6 +92,48 @@ static WIDTH: AtomicU32 = AtomicU32::new(0);
 static EXTENSION: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static HZ: AtomicU32 = AtomicU32::new(0);
+static ARM_REVISION: Revision = Revision::new();
+
+pub(crate) fn idle_arm_stamp() -> Option<Stamp> {
+    ARM_REVISION.stamp()
+}
+pub(crate) fn idle_counter_wide() -> bool {
+    state().has(COUNTER64)
+}
+/// Existing Runtime/BSP owner retains all comparator and mapping writes.
+/// Hardware counter/pending observations additionally reject consumed arms.
+pub(crate) fn retains_idle_arm(stamp: Stamp, finite: bool) -> bool {
+    let value = state();
+    if !ARM_REVISION.matches(stamp)
+        || !value.has(MAPPED)
+        || !value.has(ONE_SHOT)
+        || read(0x10) & 3 != 3
+    {
+        return false;
+    }
+    let config = read(0x100);
+    if config & PERIODIC != 0 || (config & INT_ENABLE != 0) != finite || read(0x20) & 1 != 0 {
+        return false;
+    }
+    let valid = if finite {
+        // A narrow main counter can alias an entire elapsed wrap. Until its
+        // separate long-idle policy can prove elapsed time, keep programming
+        // normally. A narrow comparator over a wide counter remains bounded.
+        if !value.has(COUNTER64) {
+            return false;
+        }
+        let (mask, maximum) = if value.has(TIMER64) {
+            (u64::MAX, 0x3fff_ffff_ffff_ffff)
+        } else {
+            (u64::from(u32::MAX), 0x7fff_ffff)
+        };
+        let target = read(0x108) & mask;
+        timer_arm::counter_future(main_counter(), target, mask, maximum)
+    } else {
+        true
+    };
+    valid && ARM_REVISION.matches(stamp)
+}
 
 fn state() -> Status {
     unsafe { *STATE.0.get() }
@@ -104,6 +149,7 @@ fn read(offset: u64) -> u64 {
     unsafe { reg(offset).read_volatile() }
 }
 fn write(offset: u64, value: u64) {
+    ARM_REVISION.advance_owned();
     unsafe { reg(offset).write_volatile(value) };
 }
 fn log(mut value: Status) {
@@ -116,6 +162,7 @@ fn map(base: u64) -> bool {
     if !paging::ensure_mmio(virtual_page, page) {
         return false;
     }
+    ARM_REVISION.advance_owned();
     BASE.store(phys::r4os_rust_phys_to_virt(base), Ordering::Release);
     true
 }
@@ -190,6 +237,7 @@ fn disable(mut value: Status) -> Status {
 }
 pub fn init(base: u64, number: u8, min_tick: u16, legacy: bool) -> Status {
     let _owner = RuntimeGuard::acquire();
+    ARM_REVISION.advance_owned();
     let mut value = Status {
         flags: if base != 0 { AVAILABLE } else { 0 } | if legacy { LEGACY } else { 0 },
         number,

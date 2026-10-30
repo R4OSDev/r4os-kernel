@@ -33,4 +33,5 @@ pub mod pci_scan;
 pub mod pcie;
 pub mod time;
 pub mod timer;
+pub(crate) mod timer_arm;
 pub mod timer_boot;

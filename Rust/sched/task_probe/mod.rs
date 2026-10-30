@@ -69,10 +69,13 @@ fn boot_cases() -> bool {
                 crate::arch::lapic::log_timer(0);
                 return false;
             }
-            return crate::arch::lapic::deadline_boot_check();
+            // Keep the original real source demotion/AP wake receipt. The
+            // same BSP oracle then proves retention on the calibrated count
+            // fallback, with a new clock generation and fresh physical arm.
+            return crate::arch::lapic::deadline_boot_check() && deadlines::retained_idle();
         }
         if option_is(value, b"idle-deadline") {
-            if !deadlines::storm() {
+            if !deadlines::retained_idle() || !deadlines::storm() {
                 return helpers::fail(b"idle-deadline");
             }
             helpers::puts(b"TASKREG08244 idle-timeout PASS due=65 bounded=64+1 future=held timer-irq=unchanged\r\n");

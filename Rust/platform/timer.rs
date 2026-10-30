@@ -1,11 +1,17 @@
 //! Original logical event epoch and BSP deadline backend. IRQ-independent
 //! readers consume atomic values; mutations retain BSP/runtime admission.
-use super::{clock_math as math, clocksource};
+use super::{
+    clock_math as math, clocksource, cpu_topology,
+    timer_arm::{Cache, Context, Stamp},
+};
 use crate::{
-    arch::{hpet, ioapic, lapic, pit, runtime::RuntimeGuard},
+    arch::{hpet, ioapic, lapic, percpu, pit, runtime::RuntimeGuard},
     build_config::config,
 };
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
+};
 pub const NO_DEADLINE: u64 = u64::MAX;
 pub const MAX_FINITE: u64 = u64::MAX - 1;
 #[repr(C)]
@@ -62,6 +68,55 @@ static LATE: AtomicU64 = AtomicU64::new(0);
 static MAX_LATENESS: AtomicU64 = AtomicU64::new(0);
 static LAST_LATENESS: AtomicU64 = AtomicU64::new(0);
 static LAST_IRQ: AtomicU64 = AtomicU64::new(0);
+struct ArmCache(UnsafeCell<Cache>);
+// Exclusive BSP boot or existing Runtime/local IF=0 retains every access.
+// A copied receipt alone never authorizes reuse; hardware validates it too.
+unsafe impl Sync for ArmCache {}
+static IDLE_ARM: ArmCache = ArmCache(UnsafeCell::new(Cache::EMPTY));
+
+fn clear_idle_arm() {
+    unsafe { (*IDLE_ARM.0.get()).clear() };
+}
+fn idle_context() -> Context {
+    let cpu = percpu::current_index();
+    Context {
+        backend: active_backend(),
+        cpu,
+        epoch: cpu_topology::epoch(cpu),
+        clock: clocksource::generation(),
+    }
+}
+fn backend_stamp() -> Option<Stamp> {
+    match active_backend() {
+        1 => hpet::idle_arm_stamp(),
+        2 => lapic::idle_arm_stamp(),
+        _ => None,
+    }
+}
+fn backend_retains(stamp: Stamp, finite: bool) -> bool {
+    match active_backend() {
+        1 => hpet::retains_idle_arm(stamp, finite),
+        2 => lapic::retains_idle_arm(stamp, finite),
+        _ => false,
+    }
+}
+fn retain_idle_arm(requested: u64, now: u64, context: Context) -> bool {
+    let candidate = unsafe { (*IDLE_ARM.0.get()).candidate(requested, now, context) };
+    candidate.is_some_and(|stamp| {
+        backend_retains(stamp, requested != NO_DEADLINE) && idle_context() == context
+    })
+}
+fn remember_idle_arm(requested: u64, checkpoint: u64, context: Context) {
+    if !context.valid() || idle_context() != context {
+        return;
+    }
+    if let Some(stamp) = backend_stamp()
+        && backend_retains(stamp, requested != NO_DEADLINE)
+        && idle_context() == context
+    {
+        unsafe { (*IDLE_ARM.0.get()).remember(requested, checkpoint, context, stamp) };
+    }
+}
 
 pub fn active_backend() -> u32 {
     BACKEND.load(Ordering::Acquire)
@@ -181,6 +236,7 @@ fn activate_modern() {
     );
 }
 fn clear_modern_deadlines() {
+    clear_idle_arm();
     MODERN_ORIGIN.store(0, Ordering::Release);
     MODERN_HZ.store(0, Ordering::Release);
     set_scale(math::FixedScale::default());
@@ -205,6 +261,7 @@ pub fn init_pit(requested: u32) {
     INITIALIZED.store(true, Ordering::Release);
 }
 fn switch_backend(backend: u32, requested: u32) -> bool {
+    clear_idle_arm();
     let ready = match backend {
         1 => hpet::r4os_rust_hpet_control(6, 0, requested) != 0,
         2 => lapic::r4os_rust_lapic_control(12, 0, requested) != 0,
@@ -293,6 +350,7 @@ fn capable() -> bool {
 }
 fn enable_deadlines() -> bool {
     let _owner = RuntimeGuard::acquire();
+    clear_idle_arm();
     let enabled = capable();
     DEADLINE_ENABLED.store(enabled, Ordering::Release);
     MODE.store(0, Ordering::Release);
@@ -332,9 +390,15 @@ fn enter_idle(requested: u64) -> bool {
         MODE.store(1, Ordering::Release);
         IDLE_ENTRIES.fetch_add(1, Ordering::Relaxed);
     }
+    let context = idle_context();
+    if retain_idle_arm(requested, now, context) {
+        return true;
+    }
+    clear_idle_arm();
     if requested == NO_DEADLINE {
         disarm_backend();
         ARMED.store(NO_DEADLINE, Ordering::Release);
+        remember_idle_arm(requested, NO_DEADLINE, context);
         return true;
     }
     let armed = ARMED.load(Ordering::Acquire);
@@ -364,8 +428,10 @@ fn enter_idle(requested: u64) -> bool {
         fallback_pit();
         return false;
     }
-    ARMED.store(math::finite_deadline(now, programmed), Ordering::Release);
+    let checkpoint = math::finite_deadline(now, programmed);
+    ARMED.store(checkpoint, Ordering::Release);
     ARMS.fetch_add(1, Ordering::Relaxed);
+    remember_idle_arm(requested, checkpoint, context);
     true
 }
 fn leave_idle() -> bool {
@@ -377,6 +443,7 @@ fn leave_idle() -> bool {
     if MODE.load(Ordering::Acquire) != 1 {
         return active_backend() != 0;
     }
+    clear_idle_arm();
     if ARMED.load(Ordering::Acquire) != NO_DEADLINE {
         CANCELS.fetch_add(1, Ordering::Relaxed);
     }
@@ -396,6 +463,11 @@ fn leave_idle() -> bool {
     MODE.store(0, Ordering::Release);
     RESUMES.fetch_add(1, Ordering::Relaxed);
     true
+}
+/// Copied observation for the explicit hardware IRQ oracle. It adds no owner
+/// or producer measurement and never serves as a runtime completion flag.
+pub(crate) fn observed_last_irq_tick() -> u64 {
+    LAST_IRQ.load(Ordering::Acquire)
 }
 pub fn deadline_stats() -> DeadlineStats {
     let _owner = RuntimeGuard::acquire();

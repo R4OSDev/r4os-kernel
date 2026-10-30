@@ -6,6 +6,7 @@ use super::{apic_target, hpet, msr, percpu, runtime::RuntimeGuard};
 use crate::{
     build_config::config,
     memory::{paging, phys},
+    platform::timer_arm::{Revision, Stamp},
 };
 use core::{
     cell::UnsafeCell,
@@ -107,6 +108,38 @@ static CURRENT_COUNT: AtomicU32 = AtomicU32::new(0);
 static HZ: AtomicU32 = AtomicU32::new(0);
 static IDLE_COUNT_RATE: AtomicU64 = AtomicU64::new(0);
 static BSP_ID: AtomicU64 = AtomicU64::new(u64::MAX);
+static ARM_REVISIONS: [Revision; crate::arch::smp_policy::MAX_CPUS] =
+    [const { Revision::new() }; crate::arch::smp_policy::MAX_CPUS];
+
+fn arm_revision() -> &'static Revision {
+    &ARM_REVISIONS[percpu::current_index() as usize]
+}
+fn invalidate_arm() {
+    // This CPU with IF=0 is the sole physical timer writer; early BSP is0.
+    arm_revision().advance_owned();
+}
+pub(crate) fn idle_arm_stamp() -> Option<Stamp> {
+    arm_revision().stamp()
+}
+/// Runtime/local IF=0 retains this CPU's hardware. A matching revision is
+/// necessary, but consumed, masked or replaced hardware is never a wake arm.
+pub(crate) fn retains_idle_arm(stamp: Stamp, finite: bool) -> bool {
+    if !arm_revision().matches(stamp) || !is_enabled() {
+        return false;
+    }
+    let lvt = read(LVT);
+    if lvt & 255 != VECTOR || lvt & PERIODIC != 0 || (lvt & MASKED == 0) != finite {
+        return false;
+    }
+    let valid = if lvt & (1 << 18) != 0 {
+        deadline::retains_idle_arm(finite)
+    } else if finite {
+        read(CURRENT) != 0
+    } else {
+        read(INITIAL) == 0 && read(CURRENT) == 0
+    };
+    valid && arm_revision().matches(stamp)
+}
 
 fn state() -> Status {
     let mut value = unsafe { *STATE.0.get() };
@@ -147,6 +180,9 @@ fn read(register: u32) -> u32 {
     }
 }
 fn write(register: u32, value: u32) {
+    if matches!(register, LVT | INITIAL | DIVIDE) {
+        invalidate_arm();
+    }
     if MODE_X2.load(Ordering::Acquire) {
         unsafe { msr::write(0x800 + (register >> 4), u64::from(value)) };
         return;
@@ -277,6 +313,7 @@ fn init_current() -> bool {
     if BASE.load(Ordering::Acquire) == 0 && !MODE_X2.load(Ordering::Acquire) {
         return false;
     }
+    invalidate_arm();
     let mut base = unsafe { msr::read(APIC_BASE) } | BASE_ENABLE;
     if MODE_X2.load(Ordering::Acquire) {
         base |= BASE_X2;
@@ -294,6 +331,7 @@ fn map(base: u64) -> bool {
     if !paging::ensure_mmio(virtual_page, page) {
         return false;
     }
+    invalidate_arm();
     BASE.store(phys::r4os_rust_phys_to_virt(base), Ordering::Release);
     true
 }
@@ -304,6 +342,7 @@ pub fn init(
     topology_needs_x2: bool,
 ) -> Status {
     let _owner = RuntimeGuard::acquire();
+    invalidate_arm();
     let mut value = Status {
         phys_base: address,
         reason: 1,

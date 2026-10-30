@@ -1,8 +1,8 @@
 //! Original finite checkpoint/earlier timer and 65-task bounded timeout cases.
 use super::{helpers::*, state::*, workers};
 use crate::{
-    arch::runtime,
-    platform::timer,
+    arch::{hpet, lapic, runtime},
+    platform::{timer, timer_arm::Stamp},
     sched::{
         scheduler,
         task::task_types::{Role, State, Task},
@@ -10,6 +10,43 @@ use crate::{
 };
 use core::ptr;
 const TIMER_OBJECT: u64 = 0x5449_4d45_5741_4954;
+fn physical_stamp() -> Option<Stamp> {
+    match timer::active_backend() {
+        1 => hpet::idle_arm_stamp(),
+        2 => lapic::idle_arm_stamp(),
+        _ => None,
+    }
+}
+// Caller holds the existing diagnostic Runtime and preemption boundary.
+unsafe fn retention_turns() -> (bool, bool, bool, bool) {
+    unsafe {
+        let mut ok = timer::r4os_rust_timer_control(12, u64::MAX - 1, 0) != 0;
+        let long = timer::deadline_stats();
+        (*raw()).deadline_checkpointed =
+            long.armed_deadline != u64::MAX && long.armed_deadline < u64::MAX - 1;
+        let finite_stamp = physical_stamp();
+        let finite_width_known = timer::active_backend() != 1 || hpet::idle_counter_wide();
+        for _ in 0..4 {
+            ok = (timer::r4os_rust_timer_control(12, u64::MAX - 1, 0) != 0) && ok;
+        }
+        let retained_finite = !finite_width_known
+            || finite_stamp.is_some()
+                && physical_stamp() == finite_stamp
+                && timer::deadline_stats().one_shot_arms == long.one_shot_arms;
+        ok = (timer::r4os_rust_timer_control(13, 0, 0) != 0) && ok;
+        // Preserve the original long-arm cancellation oracle above. This
+        // separate empty turn proves actual disarm identity without telemetry.
+        ok = (timer::r4os_rust_timer_control(12, u64::MAX, 0) != 0) && ok;
+        let empty_stamp = physical_stamp();
+        for _ in 0..4 {
+            ok = (timer::r4os_rust_timer_control(12, u64::MAX, 0) != 0) && ok;
+        }
+        let retained_empty = empty_stamp.is_some() && physical_stamp() == empty_stamp;
+        ok = (timer::r4os_rust_timer_control(13, 0, 0) != 0) && ok;
+        (ok, retained_finite, retained_empty, finite_width_known)
+    }
+}
+
 pub unsafe fn probe() -> bool {
     unsafe {
         let before = timer::deadline_stats();
@@ -18,11 +55,7 @@ pub unsafe fn probe() -> bool {
         }
         let flags = runtime::save_runtime();
         scheduler::r4os_rust_scheduler_control(6, 0, 0);
-        let mut ok = timer::r4os_rust_timer_control(12, u64::MAX - 1, 0) != 0;
-        let long = timer::deadline_stats();
-        (*raw()).deadline_checkpointed =
-            long.armed_deadline != u64::MAX && long.armed_deadline < u64::MAX - 1;
-        ok = (timer::r4os_rust_timer_control(13, 0, 0) != 0) && ok;
+        let (mut ok, retained_finite, retained_empty, finite_width_known) = retention_turns();
         let start = now();
         let long_deadline = timer::r4os_rust_timer_control(6, start, LONG_TICKS);
         let early = timer::r4os_rust_timer_control(6, start, EARLY_TICKS);
@@ -36,12 +69,22 @@ pub unsafe fn probe() -> bool {
         // BSP's due-wait poll after a different IRQ/IPI; restoring productive
         // work then cancels its idle timer before that IRQ is delivered.
         // No runtime owner spans this bounded IF-on hardware interval.
+        let mut observed_irq = one_shot_before;
         for _ in 0..1_000_000 {
-            if timer::r4os_rust_timer_control(16, 0, 0) > one_shot_before
-                || now().saturating_sub(start) >= EARLY_TICKS + LATENESS_BAR
+            let irq = timer::r4os_rust_timer_control(16, 0, 0);
+            let current = now();
+            if irq > one_shot_before && timer::observed_last_irq_tick() >= early
+                || current.saturating_sub(start) >= EARLY_TICKS + LATENESS_BAR
             {
                 break;
             }
+            if irq > observed_irq && current < early {
+                // An old/early count vector is not completion of this due.
+                // Exercise the normal idle readmission with the SAME absolute
+                // target: retain live hardware or rearm consumed hardware.
+                ok = (timer::r4os_rust_timer_control(12, early, 0) != 0) && ok;
+            }
+            observed_irq = irq;
             core::hint::spin_loop();
         }
         let finish = runtime::save_runtime();
@@ -60,6 +103,8 @@ pub unsafe fn probe() -> bool {
         (*raw()).deadline_irqs = one_shot_end - one_shot_before;
         (*raw()).deadline_lateness = armed_end.last_lateness_ticks;
         let passed = ok
+            && retained_finite
+            && retained_empty
             && (*raw()).deadline_checkpointed
             && after.mode == 0
             && after.earlier_reprograms > before.earlier_reprograms
@@ -70,12 +115,17 @@ pub unsafe fn probe() -> bool {
             && sleep_elapsed >= EARLY_TICKS
             && (*raw()).deadline_irqs >= 1
             && (*raw()).deadline_irqs <= IRQ_BAR
+            && armed_end.last_irq_tick >= early
             && armed_end.last_lateness_ticks <= LATENESS_BAR;
         if !passed {
             puts(b"TASKREG06932 deadline-failed ok=");
             dec(u64::from(ok));
             puts(b" checkpoint=");
             dec(u64::from((*raw()).deadline_checkpointed));
+            puts(b" retained_finite=");
+            dec(u64::from(retained_finite));
+            puts(b" retained_empty=");
+            dec(u64::from(retained_empty));
             puts(b" elapsed=");
             dec(elapsed);
             puts(b" sleep_elapsed=");
@@ -88,6 +138,10 @@ pub unsafe fn probe() -> bool {
             dec(after.timer_irqs - before.timer_irqs - (*raw()).deadline_total_irqs);
             puts(b" lateness=");
             dec(armed_end.last_lateness_ticks);
+            puts(b" last_irq=");
+            dec(armed_end.last_irq_tick);
+            puts(b" expected_due=");
+            dec(early);
             puts(b" earlier=");
             dec(after.earlier_reprograms - before.earlier_reprograms);
             puts(b" cancels=");
@@ -103,10 +157,79 @@ pub unsafe fn probe() -> bool {
             puts(b" periodic=");
             dec(u64::from(after.mode == 0));
             puts(b"\r\n");
+        } else {
+            puts(b"TIMER08864 retained PASS finite=");
+            puts(if finite_width_known {
+                b"4"
+            } else {
+                b"unavailable-narrow-main"
+            });
+            puts(b" empty=4 physical-revision=unchanged backend=");
+            dec(u64::from(timer::active_backend()));
+            puts(b" finite-width-qualified=");
+            dec(u64::from(finite_width_known));
+            puts(b" checkpoint=finite earlier=real-irq sleep=real cancellation=preserved\r\n");
         }
         passed
     }
 }
+/// Explicit existing boot selector only. Retention uses the same checked
+/// physical turns as probe; actual wake suspends the productive controller.
+/// No raw busy-thread count-IRQ limit is reinterpreted as an idle workload.
+pub unsafe fn retained_idle() -> bool {
+    unsafe {
+        let before = timer::deadline_stats();
+        if before.flags & 3 != 3 || timer::active_backend() == 0 {
+            return false;
+        }
+        let flags = runtime::save_runtime();
+        scheduler::r4os_rust_scheduler_control(6, 0, 0);
+        let (ok, finite, empty, width) = retention_turns();
+        scheduler::r4os_rust_scheduler_control(7, 0, 0);
+        runtime::restore_runtime(flags);
+        let start = now();
+        sleep(EARLY_TICKS, b"taskreg-retained-idle");
+        let elapsed = now().saturating_sub(start);
+        let after = timer::deadline_stats();
+        let passed = ok
+            && finite
+            && empty
+            && (*raw()).deadline_checkpointed
+            && after.mode == 0
+            && after.cancels > before.cancels
+            && after.periodic_resumes >= before.periodic_resumes + 2
+            && after.runtime_fallbacks == before.runtime_fallbacks
+            && elapsed >= EARLY_TICKS
+            && after.last_irq_tick >= start.saturating_add(EARLY_TICKS);
+        if !passed {
+            puts(b"TIMER08864 retained-idle FAIL finite=");
+            dec(u64::from(finite));
+            puts(b" empty=");
+            dec(u64::from(empty));
+            puts(b" elapsed=");
+            dec(elapsed);
+            puts(b" last_irq=");
+            dec(after.last_irq_tick);
+            puts(b" due=");
+            dec(start.saturating_add(EARLY_TICKS));
+            puts(b"\r\n");
+            return false;
+        }
+        puts(b"TIMER08864 retained PASS finite=");
+        puts(if width {
+            b"4"
+        } else {
+            b"unavailable-narrow-main"
+        });
+        puts(b" empty=4 physical-revision=unchanged backend=");
+        dec(u64::from(timer::active_backend()));
+        puts(b" finite-width-qualified=");
+        dec(u64::from(width));
+        puts(b" checkpoint=finite sleep=real cancellation=preserved scope=idle-retention\r\n");
+        true
+    }
+}
+
 unsafe fn begin_wait(t: *mut Task, tick: u64, reason: &[u8]) {
     unsafe {
         // The real native wait mutator keeps the exact timeout sequence/tree.
