@@ -196,9 +196,6 @@ pub unsafe extern "C" fn r4os_rust_r4dev_performance_summary(
         if display_stats.registered {
             flags |= performance_flag_display_ready | performance_flag_display_responsiveness_ready;
         }
-        if audio.max_streams > 0 {
-            flags |= performance_flag_audio_latency_ready;
-        }
         if boot.initialized {
             flags |= performance_flag_boot_perf_ready;
         }
@@ -417,21 +414,21 @@ pub unsafe extern "C" fn r4os_rust_r4dev_performance_summary(
             audio_stream_high_water_bytes: audio.stream_available_high_water_bytes,
             audio_stream_write_truncations: audio.stream_write_truncations,
             audio_stream_dropped_bytes: audio.stream_dropped_bytes,
-            audio_stream_write_total_ticks: audio.stream_write_total_ticks,
-            audio_stream_write_max_ticks: audio.stream_write_max_ticks,
-            audio_stream_write_last_ticks: audio.stream_write_last_ticks,
+            audio_stream_write_total_ticks: audio_duration_ticks_unavailable,
+            audio_stream_write_max_ticks: audio_duration_ticks_unavailable,
+            audio_stream_write_last_ticks: audio_duration_ticks_unavailable,
             audio_backend_write_calls: audio.backend_write_calls,
-            audio_backend_write_total_ticks: audio.backend_write_total_ticks,
-            audio_backend_write_max_ticks: audio.backend_write_max_ticks,
-            audio_backend_write_last_ticks: audio.backend_write_last_ticks,
+            audio_backend_write_total_ticks: audio_duration_ticks_unavailable,
+            audio_backend_write_max_ticks: audio_duration_ticks_unavailable,
+            audio_backend_write_last_ticks: audio_duration_ticks_unavailable,
             audio_backend_refills: audio.backend_status_refills,
             audio_backend_silence_refills: audio.backend_status_silence_refills,
             audio_backend_buffer_bytes: audio.backend_status_buffer_bytes,
             audio_backend_queued_buffers: audio.backend_status_queued_buffers,
             audio_backend_last_buffer_bytes: audio.backend_status_last_buffer_bytes,
-            audio_backend_refill_total_ticks: audio.backend_status_refill_total_ticks,
-            audio_backend_refill_max_ticks: audio.backend_status_refill_max_ticks,
-            audio_backend_refill_last_ticks: audio.backend_status_refill_last_ticks,
+            audio_backend_refill_total_ticks: audio_duration_ticks_unavailable,
+            audio_backend_refill_max_ticks: audio_duration_ticks_unavailable,
+            audio_backend_refill_last_ticks: audio_duration_ticks_unavailable,
             loader_initialized: loader.initialized,
             loader_started: loader.loader_started,
             loader_completed: loader.loader_completed,

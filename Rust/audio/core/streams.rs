@@ -79,7 +79,6 @@ pub(crate) unsafe fn write_stream_for_owner(
     byte_count: u32,
 ) -> i32 {
     unsafe {
-        let write_start = timer::tick_count();
         if !owner.valid() {
             return INVALID;
         }
@@ -104,7 +103,6 @@ pub(crate) unsafe fn write_stream_for_owner(
         }
         (*p).transaction = true;
         let _transaction = Transaction { stream: p, token };
-        let _timing = WriteTiming(write_start);
         let Some(frame_bytes) = pcm::source_frame_bytes((*p).channels, (*p).format) else {
             return INVALID;
         };
@@ -680,7 +678,6 @@ unsafe fn pump_output_owned(goal: PumpGoal) -> i32 {
                 slice::from_raw_parts_mut(scratch, chunk_bytes),
                 ptr::null_mut(),
             );
-            let start = timer::tick_count();
             let (result, backend_generation, receipt) =
                 write_mixed_tracked_owned(slice::from_raw_parts(scratch, chunk_bytes));
             relock();
@@ -690,12 +687,7 @@ unsafe fn pump_output_owned(goal: PumpGoal) -> i32 {
                 }
             }
             g!(backend_write_calls) = g!(backend_write_calls).wrapping_add(1);
-            record_tick_stat(
-                ptr::addr_of_mut!(g!(backend_write_total_ticks)),
-                ptr::addr_of_mut!(g!(backend_write_max_ticks)),
-                ptr::addr_of_mut!(g!(backend_write_last_ticks)),
-                start,
-            );
+
             if result != 0 {
                 if result != BUSY {
                     g!(total_backend_fail) = g!(total_backend_fail).wrapping_add(1);

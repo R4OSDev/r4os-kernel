@@ -69,13 +69,7 @@ struct State {
     stream_available_high_water: u64,
     stream_write_truncations: u64,
     stream_dropped_bytes: u64,
-    stream_write_total_ticks: u64,
-    stream_write_max_ticks: u64,
-    stream_write_last_ticks: u64,
     backend_write_calls: u64,
-    backend_write_total_ticks: u64,
-    backend_write_max_ticks: u64,
-    backend_write_last_ticks: u64,
     sid_acquired: bool,
     sid_session: sessions::Session,
     sid_stop_target: Option<SidOutputTarget>,
@@ -153,13 +147,7 @@ static STATE: Resident<State> = Resident(UnsafeCell::new(State {
     stream_available_high_water: 0,
     stream_write_truncations: 0,
     stream_dropped_bytes: 0,
-    stream_write_total_ticks: 0,
-    stream_write_max_ticks: 0,
-    stream_write_last_ticks: 0,
     backend_write_calls: 0,
-    backend_write_total_ticks: 0,
-    backend_write_max_ticks: 0,
-    backend_write_last_ticks: 0,
     sid_acquired: false,
     sid_session: sessions::Session::EMPTY,
     sid_stop_target: None,
@@ -382,32 +370,7 @@ impl Drop for Transactions {
         }
     }
 }
-struct WriteTiming(u64);
-impl Drop for WriteTiming {
-    fn drop(&mut self) {
-        unsafe {
-            record_tick_stat(
-                ptr::addr_of_mut!(g!(stream_write_total_ticks)),
-                ptr::addr_of_mut!(g!(stream_write_max_ticks)),
-                ptr::addr_of_mut!(g!(stream_write_last_ticks)),
-                self.0,
-            )
-        }
-    }
-}
-// Preserve the original functional clock reversal check and timing formula.
-#[allow(clippy::implicit_saturating_sub)]
-unsafe fn record_tick_stat(total: *mut u64, max: *mut u64, last: *mut u64, start: u64) {
-    unsafe {
-        let now = timer::tick_count();
-        let elapsed = if now >= start { now - start } else { 0 };
-        *total = (*total).wrapping_add(elapsed);
-        *last = elapsed;
-        if elapsed > *max {
-            *max = elapsed;
-        }
-    }
-}
+
 pub(crate) unsafe fn init() {
     unsafe {
         MIX_DUE.store(u64::MAX, Ordering::Release);
@@ -458,13 +421,7 @@ pub(crate) unsafe fn init() {
         g!(stream_available_high_water) = 0;
         g!(stream_write_truncations) = 0;
         g!(stream_dropped_bytes) = 0;
-        g!(stream_write_total_ticks) = 0;
-        g!(stream_write_max_ticks) = 0;
-        g!(stream_write_last_ticks) = 0;
         g!(backend_write_calls) = 0;
-        g!(backend_write_total_ticks) = 0;
-        g!(backend_write_max_ticks) = 0;
-        g!(backend_write_last_ticks) = 0;
         g!(sid_acquired) = false;
         g!(sid_write_count) = 0;
         g!(sid_last_register) = 0;
@@ -546,13 +503,7 @@ pub(crate) unsafe fn performance_summary() -> PerformanceSummary {
             stream_available_high_water_bytes: g!(stream_available_high_water),
             stream_write_truncations: g!(stream_write_truncations),
             stream_dropped_bytes: g!(stream_dropped_bytes),
-            stream_write_total_ticks: g!(stream_write_total_ticks),
-            stream_write_max_ticks: g!(stream_write_max_ticks),
-            stream_write_last_ticks: g!(stream_write_last_ticks),
             backend_write_calls: g!(backend_write_calls),
-            backend_write_total_ticks: g!(backend_write_total_ticks),
-            backend_write_max_ticks: g!(backend_write_max_ticks),
-            backend_write_last_ticks: g!(backend_write_last_ticks),
             sid_writes: g!(sid_write_count),
             sid_pcm_writes: g!(sid_pcm_writes),
             sid_pcm_fail: g!(sid_pcm_fail),
@@ -617,24 +568,6 @@ pub(crate) unsafe fn performance_summary() -> PerformanceSummary {
                     out.backend_status_last_buffer_bytes = out
                         .backend_status_last_buffer_bytes
                         .wrapping_add(status.last_buffer_bytes);
-                    if status.total_write_ticks > out.backend_write_total_ticks {
-                        out.backend_write_total_ticks = status.total_write_ticks;
-                    }
-                    if status.max_write_ticks > out.backend_write_max_ticks {
-                        out.backend_write_max_ticks = status.max_write_ticks;
-                    }
-                    if status.last_write_ticks > out.backend_write_last_ticks {
-                        out.backend_write_last_ticks = status.last_write_ticks;
-                    }
-                    out.backend_status_refill_total_ticks = out
-                        .backend_status_refill_total_ticks
-                        .wrapping_add(status.total_refill_ticks);
-                    if status.max_refill_ticks > out.backend_status_refill_max_ticks {
-                        out.backend_status_refill_max_ticks = status.max_refill_ticks;
-                    }
-                    if status.last_refill_ticks > out.backend_status_refill_last_ticks {
-                        out.backend_status_refill_last_ticks = status.last_refill_ticks;
-                    }
                 }
             }
         }
