@@ -539,6 +539,9 @@ unsafe fn take_request(worker: *mut Worker) -> *mut Request {
     unsafe {
         let lane = usize::from((*worker).service);
         let queued = (*state()).lanes[lane].unreserved();
+        if !(*worker).service && !queued {
+            return ptr::null_mut();
+        }
         let now = if (*worker).service {
             timer::tick_count()
         } else {
@@ -554,16 +557,17 @@ unsafe fn take_request(worker: *mut Worker) -> *mut Request {
             {
                 continue;
             }
+            let first = (*req).state == 1 && queued;
+            let suspended = (*worker).service && (*req).state == 2 && (*req).task_id == 0;
+            if !first && !suspended {
+                continue;
+            }
             let epoch = if (*worker).service {
                 service::epoch((*req).service_handle)
             } else {
                 0
             };
-            let first = (*req).state == 1 && queued;
-            let resume = (*worker).service
-                && (*req).state == 2
-                && (*req).task_id == 0
-                && ((*req).service_epoch != epoch || service::expired(req, now));
+            let resume = suspended && ((*req).service_epoch != epoch || service::expired(req, now));
             if !first && !resume {
                 continue;
             }
