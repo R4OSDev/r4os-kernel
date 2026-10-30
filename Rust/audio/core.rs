@@ -75,6 +75,8 @@ struct State {
     backend_write_max_ticks: u64,
     backend_write_last_ticks: u64,
     sid_acquired: bool,
+    sid_stop_target: Option<SidOutputTarget>,
+    sid_stop_revision: u64,
     sid_write_count: u64,
     sid_last_register: u8,
     sid_last_value: u8,
@@ -151,6 +153,8 @@ static STATE: Resident<State> = Resident(UnsafeCell::new(State {
     backend_write_max_ticks: 0,
     backend_write_last_ticks: 0,
     sid_acquired: false,
+    sid_stop_target: None,
+    sid_stop_revision: 1,
     sid_write_count: 0,
     sid_last_register: 0,
     sid_last_value: 0,
@@ -229,6 +233,20 @@ static OUTPUT_PERMIT: Resident<Semaphore> = Resident(UnsafeCell::new(Semaphore {
 }));
 static OUTPUT_OWNER: AtomicUsize = AtomicUsize::new(0);
 static OUTPUT_PRESENT: AtomicU8 = AtomicU8::new(0);
+// Functional identity for selection and completed output ends. Only the
+// output owner advances it; SID snapshots it before its private callback.
+static OUTPUT_REVISION: AtomicU64 = AtomicU64::new(1);
+const SID_RUNNING: u8 = 0;
+const SID_QUIET: u8 = 1;
+const SID_STOPPED: u8 = 2;
+// Stream Close must distinguish an acquired handle from a producing SID.
+static SID_PHASE: AtomicU8 = AtomicU8::new(SID_RUNNING);
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SidOutputTarget {
+    backend: u64,
+    revision: u64,
+    local: i32,
+}
 static PROGRESS: Resident<Event> = Resident(UnsafeCell::new(Event::AUTO));
 static MIX_DUE: AtomicU64 = AtomicU64::new(u64::MAX);
 static BACKEND_DUE: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -389,6 +407,10 @@ pub(crate) unsafe fn init() {
         });
         OUTPUT_OWNER.store(0, Ordering::Relaxed);
         OUTPUT_PRESENT.store(0, Ordering::Relaxed);
+        SID_PHASE.store(SID_RUNNING, Ordering::Relaxed);
+        g!(sid_stop_target) = None;
+        OUTPUT_REVISION.store(1, Ordering::Relaxed);
+        g!(sid_stop_revision) = 1;
         g!(next_stream_id) = 1;
         for i in 0..8 {
             backend(i).write(AudioBackend::EMPTY);
@@ -606,7 +628,7 @@ mod progress;
 mod streams;
 mod synths;
 use outputs::{
-    active_output_present, idle_active_pcm_owned, register_mixer_backend, stop_active_pcm,
+    active_output_present, finish_sid_output, idle_active_pcm_owned, register_mixer_backend,
     write_active_pcm, write_active_pcm_owned,
 };
 pub(crate) use outputs::{
@@ -628,6 +650,7 @@ pub(crate) use streams::{
     open_stream, open_stream_for_owner, set_volume, set_volume_for_owner, write_stream,
     write_stream_for_owner,
 };
+use synths::sid_producing;
 pub(crate) use synths::{
     apply_configured_sid_model, configure_sid_model, midi_close, midi_open_synth, midi_send,
     opl3_render_block, opl3_reset, opl3_stop, opl3_write_register,

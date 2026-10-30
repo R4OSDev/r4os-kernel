@@ -1,6 +1,14 @@
 //! Exact synths operations of the parent owner; no duplicated state.
 use super::*;
 
+fn sid_resumed() {
+    SID_PHASE.store(SID_RUNNING, Ordering::Release);
+}
+
+pub(super) unsafe fn sid_producing() -> bool {
+    unsafe { g!(sid_acquired) && SID_PHASE.load(Ordering::Acquire) == SID_RUNNING }
+}
+
 pub(crate) unsafe fn configure_sid_model(model: &[u8]) {
     unsafe {
         g!(sid_model_option) = Span {
@@ -47,6 +55,7 @@ pub(crate) unsafe fn sid_acquire() -> i32 {
         if result > 0 {
             g!(sid_acquired) = true;
             g!(sid_pcm_pending_len) = 0;
+            sid_resumed();
         }
         result
     }
@@ -67,6 +76,9 @@ pub(crate) unsafe fn sid_write_register(handle: u32, register: u8, value: u8) ->
         g!(sid_last_value) = value;
         g!(sid_write_count) += 1;
         g!(sid_last_result) = write(c.context, handle, register as u32, value as u32);
+        if g!(sid_last_result) == 0 {
+            sid_resumed();
+        }
         g!(sid_last_result)
     }
 }
@@ -84,6 +96,7 @@ pub(crate) unsafe fn sid_release(handle: u32) -> i32 {
         g!(sid_last_result) = release(c.context, handle);
         g!(sid_acquired) = false;
         g!(sid_pcm_pending_len) = 0;
+        sid_resumed();
         g!(sid_last_result)
     }
 }
@@ -106,6 +119,7 @@ pub(crate) unsafe fn sid_load_data(
         }
         g!(sid_last_result) = load(c.context, handle, load_addr as u32, data, byte_count);
         if g!(sid_last_result) == 0 {
+            sid_resumed();
             byte_count.try_into().unwrap()
         } else {
             g!(sid_last_result)
@@ -122,6 +136,9 @@ pub(crate) unsafe fn sid_init(handle: u32, init_addr: u16, song: u16) -> i32 {
             return -1;
         }
         g!(sid_last_result) = init(c.context, handle, init_addr as u32, song as u32);
+        if g!(sid_last_result) == 0 {
+            sid_resumed();
+        }
         g!(sid_last_result)
     }
 }
@@ -142,6 +159,7 @@ pub(crate) unsafe fn sid_play_frame(handle: u32, play_addr: u16, frame_hz: u16) 
         if g!(sid_last_result) != 0 {
             return g!(sid_last_result);
         }
+        sid_resumed();
         let rendered = render(
             c.context,
             handle,
@@ -172,12 +190,28 @@ pub(crate) unsafe fn sid_stop(handle: u32) -> i32 {
         if handle != 1 || !g!(sid_acquired) {
             return -1;
         }
-        g!(sid_last_result) = stop(c.context);
-        if g!(sid_last_result) == 0 {
-            (*p).stops = (*p).stops.wrapping_add(1);
+        if SID_PHASE.load(Ordering::Acquire) == SID_STOPPED {
+            g!(sid_last_result) = 0;
+            return 0;
         }
-        g!(sid_pcm_pending_len) = 0;
-        stop_active_pcm();
+        if SID_PHASE.load(Ordering::Acquire) == SID_RUNNING {
+            let revision = OUTPUT_REVISION.load(Ordering::Acquire);
+            g!(sid_last_result) = stop(c.context);
+            if g!(sid_last_result) != 0 {
+                // The private source has not acknowledged Stop. Its pending
+                // rendered PCM and the shared output still belong to it.
+                return g!(sid_last_result);
+            }
+            (*p).stops = (*p).stops.wrapping_add(1);
+            g!(sid_pcm_pending_len) = 0;
+            g!(sid_stop_target) = None;
+            g!(sid_stop_revision) = revision;
+            SID_PHASE.store(SID_QUIET, Ordering::Release);
+        }
+        g!(sid_last_result) = finish_sid_output();
+        if g!(sid_last_result) == 0 {
+            SID_PHASE.store(SID_STOPPED, Ordering::Release);
+        }
         g!(sid_last_result)
     }
 }
@@ -580,6 +614,11 @@ pub(super) unsafe fn register_synth_internal(name: &[u8], config: SynthRegistrat
         let len = (*p).name_len;
         if len > 0 {
             ptr::copy_nonoverlapping(name.as_ptr(), ptr::addr_of_mut!((*p).name).cast(), len);
+        }
+        if name_eq(name, b"SID") {
+            // Replacing even the same registration creates a new source;
+            // an earlier provider's private Stop receipt cannot apply.
+            sid_resumed();
         }
         boot(b"[AUDIO] synth engine registered ");
         boot(slice::from_raw_parts(ptr::addr_of!((*p).name).cast(), len));

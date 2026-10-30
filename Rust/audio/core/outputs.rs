@@ -1,4 +1,5 @@
 //! Exact outputs operations of the parent owner; no duplicated state.
+use super::streams::open_stream_count;
 use super::*;
 
 pub(crate) unsafe fn register_mixer_backend_z(name: *const u8, pointer: *const c_void) -> i32 {
@@ -167,6 +168,20 @@ pub(crate) unsafe fn audio_output_info(index: u32, out: *mut a::AudioOutputInfo)
 pub(super) unsafe fn select_output(slot: usize, local: u32) -> i32 {
     unsafe {
         let p = backend(slot);
+        let changed = g!(active_audio_slot) != Some(slot)
+            || (*p).outputs.is_some_and(|outputs| {
+                (outputs.active)((*p).config.context as u64) != local as i32
+            });
+        // Selection can also finish the preceding backend. Reserve both
+        // identities before any callback, rather than ever reuse a receipt.
+        if changed
+            && OUTPUT_REVISION
+                .load(Ordering::Relaxed)
+                .checked_add(2)
+                .is_none()
+        {
+            return INVALID;
+        }
         if let Some(outputs) = (*p).outputs {
             let result = (outputs.select)((*p).config.context as u64, local);
             if result < 0 {
@@ -179,6 +194,9 @@ pub(super) unsafe fn select_output(slot: usize, local: u32) -> i32 {
                 return stopped;
             }
             set_active_backend(slot);
+        }
+        if changed {
+            OUTPUT_REVISION.fetch_add(1, Ordering::Release);
         }
         0
     }
@@ -443,6 +461,10 @@ pub(super) unsafe fn register_audio_backend_internal(
         if (*p).closing {
             return false;
         }
+        let revision = OUTPUT_REVISION.load(Ordering::Relaxed);
+        if was_active && revision.checked_add(1).is_none() {
+            return false;
+        }
         let generation = g!(next_backend_generation);
         let Some(next) = generation.checked_add(1) else {
             return false;
@@ -467,6 +489,9 @@ pub(super) unsafe fn register_audio_backend_internal(
         boot(b" [OK]\r\n");
         if was_active || (g!(active_audio_slot).is_none() && (config.write.is_some())) {
             set_active_backend(slot);
+        }
+        if was_active {
+            OUTPUT_REVISION.store(revision + 1, Ordering::Release);
         }
         true
     }
@@ -546,17 +571,59 @@ pub(super) unsafe fn write_active_pcm_owned(
     }
 }
 
-pub(super) unsafe fn stop_active_pcm() {
+pub(super) unsafe fn finish_sid_output() -> i32 {
     unsafe {
-        stop_active_pcm_result();
-    }
-}
-
-pub(super) unsafe fn stop_active_pcm_result() -> i32 {
-    unsafe {
+        // Avoid touching hardware for other real producers. Check again
+        // after output admission because a PCM Open may win that lease.
+        {
+            let Some(_streams) = StreamLock::acquire() else {
+                return BUSY;
+            };
+            if open_stream_count() != 0 || g!(midi_acquired) {
+                return 0;
+            }
+        }
         let Some(_output) = OutputGuard::acquire(false) else {
             return BUSY;
         };
+        {
+            let Some(_streams) = StreamLock::acquire() else {
+                return BUSY;
+            };
+            if open_stream_count() != 0 || g!(midi_acquired) {
+                return 0;
+            }
+        }
+        if OUTPUT_REVISION.load(Ordering::Relaxed) != g!(sid_stop_revision) {
+            return 0;
+        }
+        let Some(slot) = g!(active_audio_slot) else {
+            return 0;
+        };
+        let p = backend(slot);
+        let c = (*p).config;
+        let target = SidOutputTarget {
+            backend: (*p).generation,
+            revision: OUTPUT_REVISION.load(Ordering::Relaxed),
+            local: if let Some(outputs) = (*p).outputs {
+                let active = (outputs.active)(c.context as u64);
+                if active < 0 {
+                    return active;
+                }
+                active
+            } else {
+                0
+            },
+        };
+        if let Some(previous) = g!(sid_stop_target) {
+            if previous != target {
+                // Selection/unregister or another completed output end has
+                // already retired this exact target. Never idle its successor.
+                return 0;
+            }
+        } else {
+            g!(sid_stop_target) = Some(target);
+        }
         idle_active_pcm_owned()
     }
 }
@@ -569,7 +636,15 @@ pub(super) unsafe fn idle_active_pcm_owned() -> i32 {
         let p = backend(slot);
         let c = (*p).config;
 
-        backend_contract::finish_pcm(EndMode::Idle, (*p).closing, c.context, c.stop, (*p).idle)
+        let Some(next) = OUTPUT_REVISION.load(Ordering::Relaxed).checked_add(1) else {
+            return INVALID;
+        };
+        let result =
+            backend_contract::finish_pcm(EndMode::Idle, (*p).closing, c.context, c.stop, (*p).idle);
+        if result == 0 {
+            OUTPUT_REVISION.store(next, Ordering::Release);
+        }
+        result
     }
 }
 
@@ -581,7 +656,15 @@ pub(super) unsafe fn stop_active_pcm_owned() -> i32 {
         let p = backend(slot);
         let c = (*p).config;
 
-        backend_contract::finish_pcm(EndMode::Stop, (*p).closing, c.context, c.stop, (*p).idle)
+        let Some(next) = OUTPUT_REVISION.load(Ordering::Relaxed).checked_add(1) else {
+            return INVALID;
+        };
+        let result =
+            backend_contract::finish_pcm(EndMode::Stop, (*p).closing, c.context, c.stop, (*p).idle);
+        if result == 0 {
+            OUTPUT_REVISION.store(next, Ordering::Release);
+        }
+        result
     }
 }
 

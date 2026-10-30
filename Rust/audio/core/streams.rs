@@ -462,7 +462,7 @@ pub(super) unsafe fn stop_closing_streams_locked(closing_count: u32) -> i32 {
 
 unsafe fn stop_closing_and_observe_locked(closing_count: u32, observe: bool) -> (i32, bool) {
     unsafe {
-        if open_stream_count() != closing_count || g!(sid_acquired) || g!(midi_acquired) {
+        if open_stream_count() != closing_count || sid_producing() || g!(midi_acquired) {
             return (0, false);
         }
         unlock();
@@ -471,7 +471,7 @@ unsafe fn stop_closing_and_observe_locked(closing_count: u32, observe: bool) -> 
             return (BUSY, false);
         };
         relock();
-        if open_stream_count() != closing_count || g!(sid_acquired) || g!(midi_acquired) {
+        if open_stream_count() != closing_count || sid_producing() || g!(midi_acquired) {
             return (0, false);
         }
         unlock();

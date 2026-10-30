@@ -13,6 +13,18 @@ extends its unchanged200-byte prefix to224 bytes. No extra worker thread or
 global scheduler admission is added. Contract, ownership and hardware evidence
 are documented in the workspace `Docs/Audio/PlaybackProgress.txt`.
 
+Kernel427 separates a SID source's acknowledged Stop from the shared PCM
+output's Idle completion. A failed private Stop retains pending PCM; an
+acknowledged source stays quiet across Busy/error retries. Actual other PCM
+or MIDI producers keep their output. The last foreign PCM Close may finish
+the output even while the quiet SID handle remains acquired. Private functional
+output revisions prevent an old Stop retry from idling a successor output.
+There is no new public API, periodic sampler, worker or hardware owner.
+`Tests/Guest/SidStop` builds explicit native callback/stream regressions outside
+normal images; their frozen binaries fail eight checks on426 and pass on427.
+Physical HDA/queued-PCM/last-Close evidence and its limits are in the workspace
+`Docs/Audio/README.txt` release0.88.52 entry.
+
 Task/thread inventory pages stage native values and preserve their final
 epoch checks under the original owner, then release that owner before writing
 caller rows, cursor or page replies. Demand-committed caller memory can fault
