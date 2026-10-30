@@ -179,7 +179,6 @@ pub(crate) unsafe fn write_stream_for_owner(
             return BUSY;
         }
         (*p).progress_eligible = true;
-        let was_empty = (*p).available == 0;
         assert_eq!(
             mixer::ring_write(
                 (*p).ring.bytes_mut(),
@@ -190,9 +189,6 @@ pub(crate) unsafe fn write_stream_for_owner(
             output.len()
         );
         (*p).resampler = resampler;
-        if was_empty {
-            (*p).deferred_once = false;
-        }
         g!(stream_available_high_water) =
             g!(stream_available_high_water).max((*p).available as u64);
         (*p).total_written = (*p).total_written.wrapping_add(accepted_bytes as u64);
@@ -338,7 +334,7 @@ pub(crate) unsafe fn close_streams_for_owner(owner: Owner) -> bool {
         }
         if owner_queued
             && active_output_present()
-            && pump_goal_locked(true, PumpGoal::Streams(reserved)) < 0
+            && pump_goal_locked(PumpGoal::Streams(reserved)) < 0
         {
             return false;
         }
@@ -549,29 +545,29 @@ unsafe fn pump_draining_stream_locked(p: *mut Stream) -> i32 {
         for (i, selected) in mask.iter_mut().enumerate() {
             *selected = ptr::eq(p, stream(i));
         }
-        pump_goal_locked(true, PumpGoal::Streams(mask))
+        pump_goal_locked(PumpGoal::Streams(mask))
     }
 }
 
-unsafe fn pump_goal_locked(force: bool, goal: PumpGoal) -> i32 {
+unsafe fn pump_goal_locked(goal: PumpGoal) -> i32 {
     unsafe {
         unlock();
         let Some(output) = OutputGuard::acquire(false) else {
             relock();
             return BUSY;
         };
-        let result = pump_output_owned(force, goal);
+        let result = pump_output_owned(goal);
         drop(output);
         relock();
         result
     }
 }
 
-pub(super) unsafe fn pump_available_output_owned(force: bool) -> i32 {
-    unsafe { pump_output_owned(force, PumpGoal::All) }
+pub(super) unsafe fn pump_available_output_owned() -> i32 {
+    unsafe { pump_output_owned(PumpGoal::All) }
 }
 
-unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
+unsafe fn pump_output_owned(goal: PumpGoal) -> i32 {
     unsafe {
         refresh_playback_owned();
         let mut flow_revision = match playback_progress::apply_flow_owned() {
@@ -601,7 +597,6 @@ unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
                 return 0;
             }
             let mut selected = [false; MAX_STREAMS];
-            let mut open_count = 0;
             let mut ready_count = 0;
             let mut single_ready = 0;
             let mut chunk_bytes = MIX_QUANTUM_BYTES;
@@ -610,7 +605,6 @@ unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
                 if (*p).state != StreamState::Open {
                     continue;
                 }
-                open_count += 1;
                 if (*p).available < pcm::TARGET_FRAME_BYTES {
                     continue;
                 }
@@ -622,11 +616,6 @@ unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
             }
             if ready_count == 1 {
                 let p = stream(single_ready);
-                if open_count > 1 && !force && !(*p).deferred_once {
-                    (*p).deferred_once = true;
-                    schedule_progress(&MIX_DUE, 2);
-                    return 0;
-                }
                 selected[single_ready] = true;
                 chunk_bytes = chunk_bytes.min((*p).available);
             } else {
@@ -743,7 +732,6 @@ unsafe fn pump_output_owned(force: bool, goal: PumpGoal) -> i32 {
                     &mut (*p).available,
                     chunk_bytes,
                 );
-                (*p).deferred_once = false;
             }
         }
         if goal_drained(goal) { 0 } else { BUSY }

@@ -304,7 +304,6 @@ pub struct Stream {
     pub read_pos: usize,
     pub write_pos: usize,
     pub available: usize,
-    pub deferred_once: bool,
     pub resampler: ResamplerState,
     pub total_written: u64,
     pub transaction: bool,
@@ -327,7 +326,6 @@ impl Stream {
         read_pos: 0,
         write_pos: 0,
         available: 0,
-        deferred_once: false,
         resampler: ResamplerState {
             rate: 0,
             channels: 0,

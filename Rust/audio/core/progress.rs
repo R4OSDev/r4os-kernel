@@ -101,7 +101,7 @@ pub(super) unsafe fn run_progress_if_due(now: u64) -> bool {
             // This dedicated worker may wait for the output lease. PCM
             // acceptance never waits for backend ownership or callbacks.
             let result = if let Some(_output) = OutputGuard::acquire(true) {
-                super::streams::pump_available_output_owned(true)
+                super::streams::pump_available_output_owned()
             } else {
                 BUSY
             };
