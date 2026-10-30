@@ -41,7 +41,7 @@ struct Record {
     payload: Semaphore,
 }
 const _: () = {
-    assert!(size_of::<Record>() == 120);
+    assert!(size_of::<Record>() == 160);
     assert!(core::mem::offset_of!(Record, payload) == 72);
 };
 fn owner_table() -> *mut Table<m::Owner> {

@@ -104,12 +104,14 @@ unsafe fn rotate_right(index: *mut Index, node: Node, offset: usize) -> Node {
         pivot
     }
 }
-unsafe fn rebalance(index: *mut Index, start: Node, offset: usize) {
+unsafe fn rebalance<const OBSERVE: bool>(index: *mut Index, start: Node, offset: usize) {
     unsafe {
         let mut cursor = start;
         while !cursor.is_null() {
             let node = cursor;
-            (*index).visits = (*index).visits.wrapping_add(1);
+            if OBSERVE {
+                (*index).visits = (*index).visits.wrapping_add(1);
+            }
             update(node, offset);
             let mut top = node;
             if balance(node, offset) > 1 {
@@ -187,7 +189,12 @@ pub(crate) unsafe fn neighbors(
 /// # Safety
 /// Caller serializes aligned stable records and valid memberships. The offset
 /// selects Links in each node; ordering is pure and cannot wait or reschedule.
-pub unsafe fn insert(index: *mut Index, node: Node, offset: usize, less: Less) -> Neighbors {
+unsafe fn insert_impl<const OBSERVE: bool>(
+    index: *mut Index,
+    node: Node,
+    offset: usize,
+    less: Less,
+) -> Neighbors {
     unsafe {
         links(node, offset).write(Links::default());
         let mut parent = null_mut();
@@ -195,7 +202,9 @@ pub unsafe fn insert(index: *mut Index, node: Node, offset: usize, less: Less) -
         let mut neighbors = Neighbors::default();
         while !cursor.is_null() {
             let candidate = cursor;
-            (*index).visits = (*index).visits.wrapping_add(1);
+            if OBSERVE {
+                (*index).visits = (*index).visits.wrapping_add(1);
+            }
             parent = candidate;
             if less(node, candidate) {
                 neighbors.following = candidate;
@@ -217,15 +226,17 @@ pub unsafe fn insert(index: *mut Index, node: Node, offset: usize, less: Less) -
             (*index).first = node;
         }
         (*index).count += 1;
-        rebalance(index, parent, offset);
+        rebalance::<OBSERVE>(index, parent, offset);
         neighbors
     }
 }
-unsafe fn minimum(index: *mut Index, node: Node, offset: usize) -> Node {
+unsafe fn minimum<const OBSERVE: bool>(index: *mut Index, node: Node, offset: usize) -> Node {
     unsafe {
         let mut cursor = node;
         while !(*links(cursor, offset)).left.is_null() {
-            (*index).visits = (*index).visits.wrapping_add(1);
+            if OBSERVE {
+                (*index).visits = (*index).visits.wrapping_add(1);
+            }
             cursor = (*links(cursor, offset)).left;
         }
         cursor
@@ -234,15 +245,17 @@ unsafe fn minimum(index: *mut Index, node: Node, offset: usize) -> Node {
 /// # Safety
 /// Caller serializes aligned stable records and valid memberships. The offset
 /// selects Links in each node; ordering is pure and cannot wait or reschedule.
-pub unsafe fn next(index: *mut Index, node: Node, offset: usize) -> Node {
+unsafe fn next_impl<const OBSERVE: bool>(index: *mut Index, node: Node, offset: usize) -> Node {
     unsafe {
         if !(*links(node, offset)).right.is_null() {
-            return minimum(index, (*links(node, offset)).right, offset);
+            return minimum::<OBSERVE>(index, (*links(node, offset)).right, offset);
         }
         let mut child = node;
         let mut parent = (*links(child, offset)).parent;
         while !parent.is_null() {
-            (*index).visits = (*index).visits.wrapping_add(1);
+            if OBSERVE {
+                (*index).visits = (*index).visits.wrapping_add(1);
+            }
             if (*links(parent, offset)).left == child {
                 return parent;
             }
@@ -255,10 +268,10 @@ pub unsafe fn next(index: *mut Index, node: Node, offset: usize) -> Node {
 /// # Safety
 /// Caller serializes aligned stable records and valid memberships. The offset
 /// selects Links in each node; ordering is pure and cannot wait or reschedule.
-pub unsafe fn remove(index: *mut Index, node: Node, offset: usize) {
+unsafe fn remove_impl<const OBSERVE: bool>(index: *mut Index, node: Node, offset: usize) {
     unsafe {
         if (*index).first == node {
-            (*index).first = next(index, node, offset);
+            (*index).first = next_impl::<OBSERVE>(index, node, offset);
         }
         let mut start = (*links(node, offset)).parent;
         if (*links(node, offset)).left.is_null() {
@@ -266,7 +279,7 @@ pub unsafe fn remove(index: *mut Index, node: Node, offset: usize) {
         } else if (*links(node, offset)).right.is_null() {
             replace(index, node, (*links(node, offset)).left, offset);
         } else {
-            let successor = minimum(index, (*links(node, offset)).right, offset);
+            let successor = minimum::<OBSERVE>(index, (*links(node, offset)).right, offset);
             if (*links(successor, offset)).parent != node {
                 start = (*links(successor, offset)).parent;
                 replace(index, successor, (*links(successor, offset)).right, offset);
@@ -282,8 +295,38 @@ pub unsafe fn remove(index: *mut Index, node: Node, offset: usize) {
         }
         links(node, offset).write(Links::default());
         (*index).count -= 1;
-        rebalance(index, start, offset);
+        rebalance::<OBSERVE>(index, start, offset);
     }
+}
+/// # Safety
+/// Caller retains stable ordered members and exclusive index ownership.
+pub unsafe fn insert(index: *mut Index, node: Node, offset: usize, less: Less) -> Neighbors {
+    unsafe { insert_impl::<true>(index, node, offset, less) }
+}
+/// # Safety
+/// Same owner contract; the new functional wait index has no visit observer.
+pub(crate) unsafe fn insert_quiet(
+    index: *mut Index,
+    node: Node,
+    offset: usize,
+    less: Less,
+) -> Neighbors {
+    unsafe { insert_impl::<false>(index, node, offset, less) }
+}
+/// # Safety
+/// Caller retains the live index member and its Links at offset.
+pub unsafe fn next(index: *mut Index, node: Node, offset: usize) -> Node {
+    unsafe { next_impl::<true>(index, node, offset) }
+}
+/// # Safety
+/// Caller retains exact membership and exclusive index ownership.
+pub unsafe fn remove(index: *mut Index, node: Node, offset: usize) {
+    unsafe { remove_impl::<true>(index, node, offset) }
+}
+/// # Safety
+/// Same owner contract; no unused visit statistic is collected for waits.
+pub(crate) unsafe fn remove_quiet(index: *mut Index, node: Node, offset: usize) {
+    unsafe { remove_impl::<false>(index, node, offset) }
 }
 /// # Safety
 /// Caller serializes aligned stable records and valid memberships. The offset
@@ -367,6 +410,32 @@ mod tests {
                 },
                 false,
             )
+        }
+    }
+
+    #[test]
+    fn quiet_operations_keep_exact_membership_without_collecting_visits() {
+        let mut index = Index::default();
+        let mut records: Vec<_> = (0..257).map(|i| record(i, 1)).collect();
+        let mut active = [true; 257];
+        unsafe {
+            for r in &mut records {
+                insert_quiet(&mut index, node(r), ID, id_before);
+            }
+            assert_eq!(index.visits, 0);
+            for step in 0..257 {
+                let which = (step * 73) % 257;
+                remove_quiet(&mut index, node(&mut records[which]), ID);
+                active[which] = false;
+                let first = active
+                    .iter()
+                    .position(|&v| v)
+                    .map_or(null_mut(), |i| node(&mut records[i]));
+                assert_eq!(index.first, first);
+                assert_eq!(index.count, 256 - step);
+                assert_eq!(index.visits, 0);
+            }
+            assert!(index.root.is_null());
         }
     }
 

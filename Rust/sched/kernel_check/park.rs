@@ -144,11 +144,12 @@ fn one(mode: u32, cpu: u32) -> bool {
         if mode < 2 {
             let flags = runtime::save_runtime();
             let c = registry::core(t);
-            let linked = wait_node::link(
+            let linked = wait_node::link_ranked(
                 ptr::addr_of_mut!((*queue()).core),
                 ptr::addr_of_mut!((*c).wait_node),
                 t.cast(),
                 (*c).generation,
+                registry::wake_rank(t),
             );
             let blocked = if linked {
                 scheduler::block_current_owned(

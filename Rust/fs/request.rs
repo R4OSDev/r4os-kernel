@@ -228,13 +228,7 @@ const fn guard(name: &'static [u8]) -> UnwindGuard {
         depth: 0,
         name: Text::literal(name),
         queue: WaitQueue {
-            core: QueueCore {
-                head: ptr::null_mut(),
-                tail: ptr::null_mut(),
-                count: 0,
-                closing: false,
-                generation: 1,
-            },
+            core: QueueCore::EMPTY,
         },
         ..UnwindGuard::EMPTY
     }

@@ -1053,6 +1053,7 @@ pub unsafe extern "C" fn r4os_rust_task_set_field(task: *mut c_void, field: u8, 
             }
             48 => {
                 (*c).role = role(value as u8);
+                crate::sched::mutex_pi::changed(task.cast());
             }
             49 => {
                 (*c).priority = match value {
@@ -1073,9 +1074,11 @@ pub unsafe extern "C" fn r4os_rust_task_set_field(task: *mut c_void, field: u8, 
             }
             54 => {
                 (*c).donation_budget_ticks_remaining = value as u32;
+                crate::sched::mutex_pi::changed(task.cast());
             }
             55 => {
                 (*c).donation_budget_dispatches_remaining = value as u16;
+                crate::sched::mutex_pi::changed(task.cast());
             }
             56 => {
                 (*c).donation_budget_exhausted_recorded = value != 0;

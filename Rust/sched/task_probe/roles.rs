@@ -101,7 +101,7 @@ unsafe fn clean_directed() -> bool {
         ok
     }
 }
-pub unsafe fn directed() -> bool {
+unsafe fn directed_round(reprioritize: bool) -> bool {
     unsafe {
         (*raw()).directed_queue = crate::sched::sync_types::WaitQueue::EMPTY;
         (*raw()).directed_results = 0;
@@ -148,8 +148,31 @@ pub unsafe fn directed() -> bool {
                 return false;
             }
         }
-        for i in [3, 2, 1, 0] {
-            if queue(ptr::addr_of_mut!((*raw()).directed_queue), 0) != (*raw()).directed_ids[i] {
+        let order = if reprioritize {
+            [3, 0, 1, 2]
+        } else {
+            [3, 2, 1, 0]
+        };
+        for (turn, i) in order.into_iter().enumerate() {
+            let selected = {
+                let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+                // Real blocked-wait role owners publish immediately, without a
+                // lock edge or a deferred PI pump. Reinsertion preserves wait age.
+                let updates: &[(usize, Role)] = match (reprioritize, turn) {
+                    (true, 1) => &[(0, Role::ShortCompletion)],
+                    (true, 2) => &[(2, Role::Batch), (1, Role::Batch)],
+                    _ => &[],
+                };
+                let updated = updates.iter().all(|&(index, role)| {
+                    mutate(16, (*raw()).directed_tasks[index], role as u64, 0) == 1
+                });
+                let scans = wait_summary().directed_scans;
+                updated
+                    && queue(ptr::addr_of_mut!((*raw()).directed_queue), 0)
+                        == (*raw()).directed_ids[i]
+                    && wait_summary().directed_scans == scans + 1
+            };
+            if !selected {
                 clean_directed();
                 return false;
             }
@@ -168,7 +191,8 @@ pub unsafe fn directed() -> bool {
         let ok = (*raw()).directed_results == DIRECTED as u32
             && (*raw()).directed_failures == 0
             && after.directed_wakes >= before.directed_wakes + DIRECTED as u64
-            && after.directed_fifo_bypasses >= before.directed_fifo_bypasses + 3
+            && after.directed_fifo_bypasses
+                >= before.directed_fifo_bypasses + if reprioritize { 1 } else { 3 }
             && after.directed_scans >= before.directed_scans + DIRECTED as u64
             && switched
             && safe_after.safe_reschedule_switches > safe_before.safe_reschedule_switches
@@ -176,6 +200,13 @@ pub unsafe fn directed() -> bool {
         let cleaned = clean_directed();
         ok && cleaned
     }
+}
+pub unsafe fn directed() -> bool {
+    if !unsafe { directed_round(false) && directed_round(true) } {
+        return false;
+    }
+    puts(b"TASKREG08862 ranked-handoff PASS mixed=4 reprioritized=4 scans=1/wake promotion=immediate demotion=immediate equal-rank=original-fifo tasks=8 own=reaped\r\n");
+    true
 }
 unsafe extern "C" fn budget_main() {
     unsafe {

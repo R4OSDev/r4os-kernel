@@ -120,11 +120,12 @@ unsafe fn wait_impl(
             leave(flags);
             return WaitResult::Failed;
         }
-        if !wait_node::link(
+        if !wait_node::link_ranked(
             ptr::addr_of_mut!((*queue).core),
             ptr::addr_of_mut!((*c).wait_node),
             target.cast(),
             (*c).generation,
+            registry::wake_rank(target),
         ) {
             leave(flags);
             note(super::sync_stats::WaitMetric::Drops);
@@ -178,34 +179,24 @@ pub(super) unsafe fn pop_waiter(queue: *mut WaitQueue, directed: bool) -> *mut w
             return take_node((*core).head);
         }
         let head = (*core).head;
-        if head.is_null() {
-            return ptr::null_mut();
-        }
-        let mut selected = ptr::null_mut();
-        let mut best = 255;
-        let mut cursor = head;
-        while !cursor.is_null() {
-            note(super::sync_stats::WaitMetric::DirectedScans);
-            let c = registry::core((*cursor).owner.cast());
-            if (*c).generation == (*cursor).owner_generation && (*c).state == State::Blocked {
-                let rank = registry::wake_rank((*cursor).owner.cast());
-                if rank < best {
-                    best = rank;
-                    selected = cursor;
-                    if rank == 0 {
-                        break;
-                    }
-                }
+        loop {
+            let selected = wait_node::first_ranked(core);
+            if selected.is_null() {
+                return ptr::null_mut();
             }
-            cursor = (*cursor).next;
+            note(super::sync_stats::WaitMetric::DirectedScans);
+            let c = registry::core((*selected).owner.cast());
+            if (*c).generation != (*selected).owner_generation || (*c).state != State::Blocked {
+                take_node(selected);
+                continue;
+            }
+            // All rank changes publish the index before a decision; exact
+            // generation/state validation remains at the actual handoff.
+            if selected != head {
+                note(super::sync_stats::WaitMetric::DirectedFifoBypasses);
+            }
+            return take_node(selected);
         }
-        if selected.is_null() {
-            return take_node(head);
-        }
-        if selected != head {
-            note(super::sync_stats::WaitMetric::DirectedFifoBypasses);
-        }
-        take_node(selected)
     }
 }
 // WaitQueue contains Task nodes. A stale-generation fallback must detach the
@@ -248,10 +239,12 @@ pub(super) unsafe fn pop_wake(queue: *mut WaitQueue, result: WaitResult, directe
     }
 }
 pub(super) unsafe fn drain(queue: *mut WaitQueue, result: WaitResult) -> u32 {
+    let bulk = unsafe { wait_node::begin_drain(ptr::addr_of_mut!((*queue).core)) };
     let mut count = 0u32;
     while unsafe { pop_wake(queue, result, false) } != 0 {
         count = count.saturating_add(1);
     }
+    unsafe { wait_node::end_drain(ptr::addr_of_mut!((*queue).core), bulk) };
     count
 }
 pub(super) unsafe fn handoff_permit(queue: *mut WaitQueue) -> u32 {

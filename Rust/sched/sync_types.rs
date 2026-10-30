@@ -121,13 +121,7 @@ pub struct LockSummary {
 
 impl WaitQueue {
     pub const EMPTY: Self = Self {
-        core: QueueCore {
-            head: core::ptr::null_mut(),
-            tail: core::ptr::null_mut(),
-            count: 0,
-            closing: false,
-            generation: 1,
-        },
+        core: QueueCore::EMPTY,
     };
 }
 impl Event {
@@ -198,12 +192,12 @@ pub(super) fn wait_result(value: u32) -> super::task::task_types::WaitResult {
     }
 }
 const _: () = {
-    assert!(core::mem::size_of::<WaitQueue>() == 40);
-    assert!(core::mem::size_of::<Event>() == 48);
-    assert!(core::mem::size_of::<Completion>() == 48);
-    assert!(core::mem::size_of::<Semaphore>() == 48);
-    assert!(core::mem::size_of::<Mutex>() == 128);
-    assert!(core::mem::size_of::<UnwindGuard>() == 136);
+    assert!(core::mem::size_of::<WaitQueue>() == 80);
+    assert!(core::mem::size_of::<Event>() == 88);
+    assert!(core::mem::size_of::<Completion>() == 88);
+    assert!(core::mem::size_of::<Semaphore>() == 88);
+    assert!(core::mem::size_of::<Mutex>() == 168);
+    assert!(core::mem::size_of::<UnwindGuard>() == 176);
     assert!(core::mem::size_of::<WaitRequest>() == 72);
     assert!(core::mem::size_of::<WaitSummary>() == 96);
     assert!(core::mem::size_of::<LockSummary>() == 120);

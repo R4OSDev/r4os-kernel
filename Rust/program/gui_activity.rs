@@ -225,5 +225,5 @@ pub(crate) unsafe fn wait(last: u64, timeout: u64, mask: u32, out: *mut u64) -> 
     i32::from(sequence != last || result == 1)
 }
 const _: () = {
-    assert!(core::mem::size_of::<Channel>() == 72);
+    assert!(core::mem::size_of::<Channel>() == 112);
 };

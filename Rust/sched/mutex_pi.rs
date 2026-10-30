@@ -224,6 +224,14 @@ pub(super) unsafe fn bind(t: *mut Task, m: Lock) -> bool {
 pub(crate) unsafe fn changed(t: *mut Task) {
     unsafe {
         let c = registry::core(t);
+        // Plain waits and changes behind an already queued PI propagation
+        // still publish their current wake rank in this same admission.
+        if !(*c).wait_node.queue.is_null()
+            && (*c).wait_node.owner == t.cast()
+            && (*c).wait_node.owner_generation == (*c).generation
+        {
+            wait_node::set_rank(ptr::addr_of_mut!((*c).wait_node), registry::wake_rank(t));
+        }
         if (*c).lock_edge.is_empty() || (*c).pi_queued {
             return;
         }
