@@ -8,6 +8,10 @@ use crate::{
 };
 use core::{cell::UnsafeCell, mem::size_of, ptr};
 const CAP: usize = 128;
+// Preserve storage I/O when general leases exhaust their pool. The actual
+// executing storage callback may use the final pin/mapping slot. CAP, owner
+// generations and hardware-completion requirements stay unchanged.
+const STORAGE_SLOT: usize = CAP - 1;
 const PAGE: u64 = 4096;
 const MAX_BYTES: u32 = 16 * 1024 * 1024;
 #[derive(Clone, Copy)]
@@ -320,6 +324,9 @@ pub unsafe extern "C" fn r4os_rust_driver_dma_pin(
         }
     }
     let Some(i) = slot else { return -5 };
+    if i == STORAGE_SLOT && admission::r4os_rust_driver_api_storage_owner() == 0 {
+        return -5;
+    }
     let generation = segments::r4os_rust_dma_handle(0, unsafe { (*raw()).pin_generations[i] }, 0);
     unsafe { (*raw()).pin_generations[i] = generation };
     let handle = segments::r4os_rust_dma_handle(1, i as u64, generation);
@@ -537,6 +544,9 @@ pub unsafe extern "C" fn r4os_rust_driver_dma_map(
         }
     }
     let Some(slot) = slot else { return -5 };
+    if slot == STORAGE_SLOT && admission::r4os_rust_driver_api_storage_owner() == 0 {
+        return -5;
+    }
     let Some(normalized) = constraints(c) else {
         return -2;
     };
