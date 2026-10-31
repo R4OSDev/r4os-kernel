@@ -36,6 +36,9 @@ Deep modes on a normal kernel:
       one succeeds; main-thread use/close proves process-scoped ownership;
  C: MIDI Close with zero ordinary streams preserves a producing SID source,
     followed by SID continuation and one real last-source Idle acknowledgement.
+ N: MIDI pending4096B survives private Stop error/Busy, resumes the identical
+    PCM hash without rendering again, then one last-source Idle ACK; an actual
+    ordinary PCM stream also survives MIDI Close and accepts the next write.
 Each app prints detailed actual receipts, result=PASS and exits0. SID callbacks
 also log through the real DriverApi owner. Existing callback admission forbids
 heap allocation; a callback-scope check requires heap unavailable. This is not

@@ -135,6 +135,58 @@ const Probe = struct {
         self.report("P53 PENDING play={d} release_error={d} retry={d} release={d} same_render={d} bytes={d} failed_release_callbacks={d} failed_idle={d} private_stop_acks={d} release_acks={d} callback_scope_checks={d}", .{ played, failed, retry, released, @intFromBool(resumed.sid_renders == before.sid_renders), resumed.bytes - before.bytes, rejected.sid_releases - before.sid_releases, rejected.idle_calls - before.idle_calls, after.sid_stop_acks - before.sid_stop_acks, after.sid_release_acks - before.sid_release_acks, after.callback_scope_checks });
         return played == a.service_api_result_busy and failed == -55 and retry == 0 and released == 0 and resumed.sid_renders == before.sid_renders and resumed.sid_plays == before.sid_plays and resumed.bytes == before.bytes + 3840 and rejected.sid_releases == before.sid_releases and rejected.idle_calls == before.idle_calls and after.sid_stop_acks == before.sid_stop_acks + 1 and after.sid_release_acks == before.sid_release_acks + 1;
     }
+    fn midiPending(self: *const Probe) bool {
+        if (!self.controls(.{ .write_result = a.service_api_result_busy })) return false;
+        if (self.audio.midiOpenSynth("OPL3") != 1) return false;
+        defer {
+            _ = self.controls(.{});
+            _ = self.release(false);
+        }
+        const rendered = self.audio.midiRender(1, 1024);
+        const queued = self.snapshot() orelse return false;
+        if (!self.controls(.{ .write_result = a.service_api_result_busy, .midi_stop_result = -55 })) return false;
+        const failed = self.audio.midiClose(1);
+        const rejected = self.snapshot() orelse return false;
+        if (!self.controls(.{ .write_result = a.service_api_result_busy, .midi_stop_result = a.service_api_result_busy })) return false;
+        const busy = self.audio.midiClose(1);
+        const retained_snapshot = self.snapshot() orelse return false;
+        if (!self.controls(.{})) return false;
+        const retry = self.audio.midiRender(1, 1024);
+        const resumed = self.snapshot() orelse return false;
+        const closed = self.release(false);
+        const after = self.snapshot() orelse return false;
+        const expected = [_]u8{0x5a} ** 4096;
+        const same = resumed.midi_renders == queued.midi_renders;
+        const bytes = resumed.bytes - queued.bytes;
+        const hash_ok = resumed.last_hash == p.hash(&expected);
+        self.report("P86 MIDI_PENDING render={d} error={d} busy={d} retry={d} close={d} same_render={d} bytes={d} hash={d} failed_idle={d}/{d} private_acks={d} idle_acks={d}", .{ rendered, failed, busy, retry, closed, @intFromBool(same), bytes, @intFromBool(hash_ok), rejected.idle_calls - queued.idle_calls, retained_snapshot.idle_calls - queued.idle_calls, after.midi_stop_acks - queued.midi_stop_acks, after.idle_acks - queued.idle_acks });
+        return rendered == a.service_api_result_busy and failed == -55 and busy == a.service_api_result_busy and retry == 0 and closed == 0 and same and bytes == expected.len and hash_ok and rejected.idle_calls == queued.idle_calls and retained_snapshot.idle_calls == queued.idle_calls and retained_snapshot.midi_stop_acks == queued.midi_stop_acks and after.midi_stop_acks == queued.midi_stop_acks + 1 and after.idle_acks == queued.idle_acks + 1;
+    }
+    fn midiWhilePcm(self: *const Probe) bool {
+        if (!self.controls(.{})) return false;
+        const opened = self.audio.audioOpenStream(48000, 2, .s16le);
+        if (opened <= 0) return false;
+        const raw: u32 = @intCast(opened);
+        defer _ = self.audio.audioClose(raw);
+        const signal = [_]u8{0x23} ** 1920;
+        const written = self.audio.audioWrite(raw, &signal);
+        if (self.audio.midiOpenSynth("OPL3") != 1) return false;
+        defer _ = self.release(false);
+        const rendered = self.audio.midiRender(1, 1024);
+        const before = self.snapshot() orelse return false;
+        const perf = self.dev.performanceSummary() orelse return false;
+        const closed = self.release(false);
+        const after = self.snapshot() orelse return false;
+        const continued = self.audio.audioWrite(raw, &signal);
+        const deadline = self.sys.ticks() +| self.sys.ticksFromMilliseconds(3000);
+        var pcm_close = self.audio.audioClose(raw);
+        while (pcm_close == a.service_api_result_busy and self.sys.ticks() < deadline) {
+            self.sys.sleepTicks(1);
+            pcm_close = self.audio.audioClose(raw);
+        }
+        self.report("P86 MIDI_PCM core_open={d} write={d} render={d} midi_close={d} idle={d} stop={d} reset={d} private_acks={d} continued={d} pcm_close={d}", .{ perf.audio_open_streams, written, rendered, closed, after.idle_calls - before.idle_calls, after.stop_calls - before.stop_calls, after.reset_generation - before.reset_generation, after.midi_stop_acks - before.midi_stop_acks, continued, pcm_close });
+        return perf.audio_open_streams > 0 and written == signal.len and rendered == 0 and closed == 0 and after.idle_calls == before.idle_calls and after.stop_calls == before.stop_calls and after.reset_generation == before.reset_generation and after.midi_stop_acks == before.midi_stop_acks + 1 and continued == signal.len and pcm_close == 0;
+    }
     fn reaper(self: *const Probe, sid: bool) bool {
         var control: p.Controls = .{ .sid_stop_result = if (sid) -55 else 0, .midi_stop_result = if (sid) 0 else -55, .sid_release_result = if (sid) -66 else 0, .idle_result = a.service_api_result_busy };
         if (!self.controls(control)) return false;
@@ -323,6 +375,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
         'T' => probe.threads(false),
         'U' => probe.threads(true),
         'C' => probe.midiWhileSid(),
+        'N' => probe.midiPending() and probe.midiWhilePcm(),
         'G' => probe.generations(false),
         'H' => probe.generations(true),
         'L' => probe.lifecycle(false),
