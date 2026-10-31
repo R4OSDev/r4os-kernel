@@ -9,7 +9,19 @@ use super::{
     vm_transactions,
 };
 use crate::sched::{sync_types, sync_wait, task_context};
-use core::{cell::UnsafeCell, ffi::c_void, mem::MaybeUninit, ptr};
+use core::{
+    cell::UnsafeCell,
+    ffi::c_void,
+    mem::MaybeUninit,
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+static RETIRE_NOTICE: AtomicBool = AtomicBool::new(false);
+/// Caller holds the VM owner and has just checked a still-live pager blocker.
+pub(super) fn observe_retirement() {
+    RETIRE_NOTICE.store(true, Ordering::Release);
+}
 
 // Same CPU-bound VM owner; a token is explicitly consumed before waiting.
 struct Held {
@@ -492,6 +504,11 @@ fn wake_activity() {
             ACTIVITY.sequence.get(),
         )
     };
+    // All callers have released the VM owner before this existing Runtime
+    // edge. This is a retry hint, never an I/O/TLB/free acknowledgment.
+    if RETIRE_NOTICE.load(Ordering::Acquire) && RETIRE_NOTICE.swap(false, Ordering::AcqRel) {
+        crate::program::retire_progress::changed();
+    }
 }
 unsafe extern "C" fn pager_unchanged(raw: *mut c_void) -> bool {
     unsafe { ACTIVITY.sequence.get().read() == raw.cast::<u64>().read() }

@@ -1,7 +1,7 @@
 //! Original thread construction/current/status/exit and entry-address admission.
 //! Task creation and identity operations call the existing native scheduler owner.
 use super::{
-    completions, exit, process, registry, registry_state,
+    completions, exit, process, registry,
     registry_types::ProgramInstance,
     stack,
     threads::{self, Thread},
@@ -15,7 +15,7 @@ use crate::{
     loader::registry_control as modules,
     platform::timer,
     sched::{
-        scheduler, sync_objects,
+        scheduler,
         task::{task_api, task_registry},
     },
 };
@@ -410,7 +410,7 @@ pub unsafe extern "C" fn r4os_rust_program_thread_leave_spawn(thread: *mut Threa
         completions::orphan(h);
         process::r4os_rust_program_process_clients(0, h);
         threads::unpin_execution(thread);
-        sync_objects::r4os_rust_sync_event((*registry_state::state()).event, 0, 0);
+        super::retire_progress::changed();
         threads::exit_task();
     }
 }

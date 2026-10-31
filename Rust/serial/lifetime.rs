@@ -47,6 +47,7 @@ pub(crate) fn reap_process(client: a::ProgramProcessHandle) -> bool {
             let _g = RuntimeGuard::acquire();
             (*raw()).head
         };
+        let mut complete = true;
         while !p.is_null() {
             let (owned, next, handle, registration) = {
                 let _g = RuntimeGuard::acquire();
@@ -58,19 +59,33 @@ pub(crate) fn reap_process(client: a::ProgramProcessHandle) -> bool {
                 )
             };
             if owned
-                && io::close_port(
-                    p,
-                    handle,
-                    registration,
-                    a::serial_close_abort,
-                    u64::from(timer::frequency()) * 3,
-                ) != a::serial_ok
+                && io::close_port(p, handle, registration, a::serial_close_abort, 0) != a::serial_ok
             {
-                return false;
+                complete = false;
             }
             p = next;
         }
-        true
+        complete
+    }
+}
+pub(crate) fn retire_wait_process(client: a::ProgramProcessHandle) -> bool {
+    let _g = RuntimeGuard::acquire();
+    unsafe {
+        let mut p = (*raw()).head;
+        let mut found = false;
+        while !p.is_null() {
+            if (*p).handle != 0 && same((*p).client, client) {
+                // A callback return or another closer has a definite notice.
+                // Backend WOULD_BLOCK, opening and other errors do not.
+                if (*p).active_io == 0 && !(*p).close_running {
+                    return false;
+                }
+                (*p).retire_notice = true;
+                found = true;
+            }
+            p = (*p).next;
+        }
+        found
     }
 }
 /// Closes admission before DriverShutdown. Waiting happens only on this exact

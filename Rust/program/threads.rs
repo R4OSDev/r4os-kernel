@@ -9,7 +9,7 @@ use crate::{
     memory::{heap, owner::Guard},
     platform::timer,
     sched::{
-        scheduler, sync_objects,
+        scheduler,
         sync_types::WaitQueue,
         sync_wait,
         task::{task_api, task_registry, task_types::ExecutionOwnerKind},
@@ -70,11 +70,13 @@ pub struct Thread {
     pub join_lease_active: bool,
     pub retire_pending: bool,
     pub used: bool,
-    pub(super) _padding0: [u8; 3],
+    pub(super) retire_notice: bool,
+    pub(super) _padding0: [u8; 2],
     // Only this exact pinned execution writes its resident kernel return
     // anchor. The fault path consumes it without touching the module stack.
     pub(super) fault_frame: *mut crate::arch::callback_abort::Frame,
     pub(super) stack_exhausted: bool,
+    pub(super) retire_retry: super::retire_wait::Retry,
 }
 impl Default for Thread {
     fn default() -> Self {
@@ -113,14 +115,16 @@ impl Default for Thread {
             join_lease_active: false,
             retire_pending: false,
             used: false,
-            _padding0: [0; 3],
+            retire_notice: false,
+            _padding0: [0; 2],
             fault_frame: ptr::null_mut(),
             stack_exhausted: false,
+            retire_retry: super::retire_wait::Retry::EMPTY,
         }
     }
 }
 const _: () = {
-    assert!(mem::size_of::<Thread>() == 376);
+    assert!(mem::size_of::<Thread>() == 400);
     assert!(mem::align_of::<Thread>() == 8);
     assert!(mem::size_of::<OptionalLease>() == 40);
     assert!(mem::offset_of!(OptionalLease, present) == 32);
@@ -447,7 +451,16 @@ pub(super) unsafe fn unpin(thread: *mut Thread) -> bool {
             return false;
         }
         (*thread).pin_count -= 1;
+        if (*thread).pin_count == 0 {
+            notify_retire(thread);
+        }
         true
+    }
+}
+/// Caller holds the thread registry owner; consume only an enrolled notice.
+pub(super) unsafe fn notify_retire(thread: *mut Thread) {
+    if unsafe { mem::replace(&mut (*thread).retire_notice, false) } {
+        super::retire_progress::changed();
     }
 }
 pub(super) unsafe fn mark(thread: *mut Thread, running: bool, code: i32) {
@@ -512,7 +525,7 @@ pub(super) unsafe fn unpin_execution(thread: *mut Thread) {
         }
         registry::unlock();
         if wake {
-            sync_objects::r4os_rust_sync_event((*registry_state::state()).event, 0, 0);
+            super::retire_progress::changed();
         }
     }
 }
@@ -578,7 +591,7 @@ pub(super) unsafe fn release_input(thread: *mut Thread) -> bool {
         let wake = (*slot).pin_count == 0 && (*slot).state == 6;
         registry::unlock();
         if wake {
-            sync_objects::r4os_rust_sync_event((*registry_state::state()).event, 0, 0);
+            super::retire_progress::changed();
         }
         true
     }

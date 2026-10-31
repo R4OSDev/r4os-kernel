@@ -27,7 +27,9 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 pub(crate) use io::{cancel, close, drain, transfer};
-pub(crate) use lifetime::{cancel_task, driver_close, driver_quiesced, reap_process, stop_process};
+pub(crate) use lifetime::{
+    cancel_task, driver_close, driver_quiesced, reap_process, retire_wait_process, stop_process,
+};
 pub(crate) use operations::{configure, count, open, port_at, status};
 #[derive(Clone, Copy)]
 pub(crate) struct Client {
@@ -60,6 +62,7 @@ struct Port {
     opening: bool,
     provider_closing: bool,
     close_running: bool,
+    retire_notice: bool,
     last_error: i32,
     sequence: u64,
     queue: WaitQueue,
@@ -85,6 +88,7 @@ impl Port {
             opening: false,
             provider_closing: false,
             close_running: false,
+            retire_notice: false,
             last_error: 0,
             sequence: 0,
             queue: WaitQueue::EMPTY,
@@ -289,10 +293,19 @@ impl Drop for Lease {
         unsafe {
             assert!(self.valid() && (*self.port).active_io != 0);
             (*self.port).active_io -= 1;
+            if (*self.port).active_io == 0 {
+                notify_retire(self.port);
+            }
             if (*self.port).closing || (*self.port).provider_closing {
                 changed(self.port);
             }
         }
+    }
+}
+/// Runtime held; consume only a notice enrolled on this resident port.
+unsafe fn notify_retire(p: *mut Port) {
+    if unsafe { mem::replace(&mut (*p).retire_notice, false) } {
+        crate::program::retire_progress::changed();
     }
 }
 struct Waiter {

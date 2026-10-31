@@ -63,6 +63,8 @@ struct State {
     scratch: MaybeUninit<Record>,
     initialized: bool,
     cleanup_started: bool,
+    retire_changed: bool,
+    retire_watching: bool,
     recovery_cache_device: Option<Reference>,
 }
 struct Storage(UnsafeCell<State>);
@@ -84,6 +86,8 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
     scratch: MaybeUninit::uninit(),
     initialized: false,
     cleanup_started: false,
+    retire_changed: false,
+    retire_watching: false,
     recovery_cache_device: None,
 }));
 fn state() -> *mut State {
@@ -189,7 +193,15 @@ impl Gate {
 impl Drop for Gate {
     fn drop(&mut self) {
         unsafe {
+            let notice = (*gate()).depth == 1 && (*state()).retire_changed;
+            if notice {
+                (*state()).retire_changed = false;
+                (*state()).retire_watching = false;
+            }
             sync_locks::r4os_rust_sync_guard(gate(), 3, 0);
+            if notice {
+                crate::program::retire_progress::changed();
+            }
         }
     }
 }
@@ -926,7 +938,7 @@ struct Releasing {
 impl Drop for Releasing {
     fn drop(&mut self) {
         unsafe {
-            let _ = scalar(
+            let released = scalar(
                 18,
                 Input {
                     id: (*self.op).id,
@@ -934,6 +946,9 @@ impl Drop for Releasing {
                     ..Input::default()
                 },
             );
+            if released.is_ok() && (*state()).retire_watching {
+                (*state()).retire_changed = true;
+            }
             (*self.op).id = 0;
         }
     }
@@ -1534,6 +1549,39 @@ pub(crate) fn release_owner(a: Args) -> bool {
         }
     }
     complete
+}
+/// The cleanup worker owns all further provider retries for these marked
+/// operations. Only its real claim removal will ring the reaper doorbell.
+pub(crate) fn retire_wait_owner(a: Args) -> bool {
+    let Some(_gate) = Gate::try_enter() else {
+        return false;
+    };
+    if unsafe { !(*state()).cleanup_started } {
+        return false;
+    }
+    let mut found = false;
+    for i in 0..16 {
+        let op = operation(i);
+        unsafe {
+            if (*op).id == 0
+                || (*op).owner.program != a.program
+                || (*op).owner.program_generation != a.program_generation
+                || a.task != 0
+                    && ((*op).owner.task != a.task
+                        || (*op).owner.task_generation != a.task_generation)
+            {
+                continue;
+            }
+            if !(*op).cleanup {
+                return false;
+            }
+            found = true;
+        }
+    }
+    if found {
+        unsafe { (*state()).retire_watching = true };
+    }
+    found
 }
 unsafe extern "C" fn cleanup_main() -> ! {
     loop {

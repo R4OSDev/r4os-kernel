@@ -64,6 +64,8 @@ pub mod registry_state;
 pub mod registry_types;
 pub mod remote_frame_state;
 pub mod retire_phase;
+pub(crate) mod retire_progress;
+pub(crate) mod retire_wait;
 pub mod runtime_tables;
 pub mod self_test;
 pub mod service_api;

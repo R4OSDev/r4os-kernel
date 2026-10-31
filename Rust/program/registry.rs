@@ -2,10 +2,7 @@
 //! Every raw record has a stable address; no Rust reference spans a peer call.
 use super::{memory, registry_state::state, registry_types::*};
 use crate::{
-    contract::ProgramProcessHandle as Handle,
-    memory::heap,
-    platform::timer,
-    sched::{sync_locks, sync_objects},
+    contract::ProgramProcessHandle as Handle, memory::heap, platform::timer, sched::sync_locks,
 };
 use core::{ffi::c_void, mem, ptr};
 
@@ -57,7 +54,7 @@ impl Drop for Guard {
     }
 }
 fn signal() {
-    unsafe { sync_objects::r4os_rust_sync_event((*state()).event, 0, 0) };
+    super::retire_progress::queued();
 }
 unsafe fn stats() -> *mut ProgramRegistryStats {
     unsafe { (*state()).stats }
@@ -467,6 +464,7 @@ pub(super) unsafe fn clear_slot(slot: *mut ProgramRegistrySlot) {
         (*slot).retire_image_stack_released = false;
         (*slot).retire_owner_released = false;
         (*slot).retire_attempts = 0;
+        (*slot).retire_retry = super::retire_wait::Retry::EMPTY;
         (*slot).retire_next = ptr::null_mut();
         (*slot).completion = ptr::null_mut();
         init_core(ptr::addr_of_mut!((*slot).instance), 0);
@@ -479,7 +477,7 @@ pub(super) unsafe fn clear_slot(slot: *mut ProgramRegistrySlot) {
 }
 pub(super) unsafe fn enqueue(slot: *mut ProgramRegistrySlot) -> bool {
     unsafe {
-        if (*slot).retire_queued || (*slot).retire_in_progress {
+        if (*slot).retire_queued || (*slot).retire_in_progress || (*slot).retire_retry.blocked() {
             return false;
         }
         (*slot).retire_queued = true;
@@ -494,21 +492,72 @@ pub(super) unsafe fn enqueue(slot: *mut ProgramRegistrySlot) -> bool {
     }
 }
 pub(super) unsafe fn take() -> *mut ProgramRegistrySlot {
+    unsafe { take_ready(super::retire_progress::round(), timer::tick_count()) }
+}
+/// The existing registry owner serializes queue rotation and retry hints.
+/// A failed leaf retains its exact slot lifetime, but cannot hold up another
+/// ready process merely because it is at the head of this FIFO.
+pub(super) unsafe fn take_ready(round: u64, now: u64) -> *mut ProgramRegistrySlot {
     unsafe {
         let s = state();
-        let slot = (*s).retire_head;
-        if slot.is_null() {
-            return slot;
+        let last = (*s).retire_tail;
+        loop {
+            let slot = (*s).retire_head;
+            if slot.is_null() {
+                return slot;
+            }
+            (*s).retire_head = (*slot).retire_next;
+            if (*s).retire_head.is_null() {
+                (*s).retire_tail = ptr::null_mut();
+            }
+            (*slot).retire_next = ptr::null_mut();
+            (*slot).retire_queued = false;
+            if (*slot).retire_retry.ready(round, now) {
+                (*slot).retire_in_progress = true;
+                (*slot).retire_retry.begin(round);
+                return slot;
+            }
+            enqueue(slot);
+            if slot == last {
+                return ptr::null_mut();
+            }
         }
-        (*s).retire_head = (*slot).retire_next;
-        if (*s).retire_head.is_null() {
-            (*s).retire_tail = ptr::null_mut();
-        }
-        (*slot).retire_next = ptr::null_mut();
-        (*slot).retire_queued = false;
-        (*slot).retire_in_progress = true;
-        slot
     }
+}
+/// Registry owner held. Only explicit retry deadlines arm a timer; progress
+/// waits stay queued without turning an unrelated timer tick into readiness.
+pub(super) unsafe fn retire_wait() -> (bool, Option<u64>) {
+    unsafe {
+        let mut pending = false;
+        let mut deadline = None;
+        let mut slot = (*state()).retire_head;
+        while !slot.is_null() {
+            pending = true;
+            if let Some(tick) = (*slot).retire_retry.deadline() {
+                deadline = Some(deadline.map_or(tick, |old: u64| old.min(tick)));
+            }
+            slot = (*slot).retire_next;
+        }
+        (pending, deadline)
+    }
+}
+pub(super) fn reset_retire_rounds() -> bool {
+    let Some(_guard) = Guard::acquire() else {
+        return false;
+    };
+    unsafe {
+        let mut chunk = (*state()).head;
+        while !chunk.is_null() {
+            for index in 0..16 {
+                let slot = ptr::addr_of_mut!((*chunk).slots)
+                    .cast::<ProgramRegistrySlot>()
+                    .add(index);
+                (*slot).retire_retry.reset_round();
+            }
+            chunk = (*chunk).next;
+        }
+    }
+    true
 }
 unsafe fn unlink_chunk(wanted: *mut ProgramRegistryChunk) -> bool {
     unsafe {
@@ -620,6 +669,7 @@ unsafe fn reserve(out: *mut ProgramInstanceReservation) -> u8 {
                 (*slot).retire_image_stack_released = false;
                 (*slot).retire_owner_released = false;
                 (*slot).retire_attempts = 0;
+                (*slot).retire_retry = super::retire_wait::Retry::EMPTY;
                 (*slot).retire_next = ptr::null_mut();
                 (*slot).completion = ptr::null_mut();
                 init_core(ptr::addr_of_mut!((*slot).instance), id);
@@ -758,6 +808,12 @@ pub(super) unsafe fn unlink_completion(wanted: *mut ProgramCompletionNode) -> bo
     }
 }
 pub(super) unsafe fn finish_cancel(r: *const ProgramInstanceReservation) -> u8 {
+    unsafe { finish_cancel_notify(r, true) }
+}
+pub(super) unsafe fn finish_cancel_notify(
+    r: *const ProgramInstanceReservation,
+    notify: bool,
+) -> u8 {
     unsafe {
         let slot = (*r).slot;
         let complete = super::peer_lifetime::cleanup(ptr::addr_of_mut!((*slot).instance));
@@ -776,10 +832,15 @@ pub(super) unsafe fn finish_cancel(r: *const ProgramInstanceReservation) -> u8 {
         if !complete {
             (*slot).retire_in_progress = false;
             (*slot).retire_attempts = (*slot).retire_attempts.wrapping_add(1);
+            (*slot)
+                .retire_retry
+                .defer(timer::tick_count(), super::retire_wait::Wait::Retry);
             (*stats()).retire_deferred = (*stats()).retire_deferred.wrapping_add(1);
             enqueue(slot);
             unlock();
-            signal();
+            if notify {
+                signal();
+            }
             return DEFERRED;
         }
         let node = (*slot).completion;
@@ -905,7 +966,7 @@ pub(super) unsafe fn unpin(lease: *const ProgramInstanceLease) {
     };
     unlock();
     if wake {
-        signal();
+        super::retire_progress::changed();
     }
 }
 fn mix(value: u64) -> u64 {

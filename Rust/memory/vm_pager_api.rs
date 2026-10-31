@@ -35,6 +35,29 @@ fn first_owned(owner: u8, owner_id: u64, kind: Option<u8>) -> Option<u32> {
     }
     None
 }
+fn pager_retire_pending(id: u32) -> bool {
+    let Some(slot) = ps::index(id) else {
+        return false;
+    };
+    let range = vm_ranges::read(slot);
+    let pending = range.pager_io_count != 0
+        && !range.resident_commit_active
+        && !range.resident_commit_failed
+        && range.partial_uncommit_len == 0;
+    if pending {
+        pager::observe_retirement();
+    }
+    pending
+}
+pub(crate) fn retire_wait_range(id: u32) -> bool {
+    let _held = Guard::acquire(5);
+    vm_transactions::r4os_rust_vm_initialized() && pager_retire_pending(id)
+}
+pub(crate) fn retire_wait_owner(owner: u8, owner_id: u64) -> bool {
+    let _held = Guard::acquire(5);
+    vm_transactions::r4os_rust_vm_initialized()
+        && first_owned(owner, owner_id, None).is_some_and(pager_retire_pending)
+}
 fn release_owner(owner: u8, owner_id: u64, kind: Option<u8>) -> Result<u64, u32> {
     let mut released = 0;
     loop {

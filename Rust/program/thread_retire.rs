@@ -1,7 +1,9 @@
 //! Ordered thread/task/I/O/namespace/stack retirement. A failed acknowledgement
 //! retains the precise thread, task identity, join lease and original retry edge.
 use super::{
-    registry, stack, thread_join,
+    registry, retire_progress,
+    retire_wait::Wait,
+    stack, thread_join,
     threads::{self, Thread},
 };
 use crate::{
@@ -80,7 +82,46 @@ enum Claim {
     Pending(usize),
     Claimed(*mut Thread, task_context::Unwind),
 }
-unsafe fn claim(handle: Handle) -> Claim {
+unsafe fn pause(thread: *mut Thread, wait: Wait) {
+    unsafe {
+        (*thread).retire_retry.begin(retire_progress::round());
+        (*thread).retire_retry.defer(timer::tick_count(), wait);
+    }
+}
+unsafe fn observe(thread: *mut Thread, reason: usize) -> Wait {
+    unsafe {
+        match reason {
+            // leave_spawn already publishes the exact deferred exit.
+            0 => Wait::Progress,
+            1 => {
+                if task_api::observe_retirement((*thread).task_id, (*thread).task_generation) {
+                    Wait::Progress
+                } else {
+                    Wait::Retry
+                }
+            }
+            2 | 4 => {
+                (*thread).retire_notice = true;
+                Wait::Progress
+            }
+            3 => {
+                (*thread).retire_notice = true;
+                // A killed join owner may never run its join epilogue. Its
+                // native task edge must also be covered before parking.
+                if task_api::observe_retirement(
+                    (*thread).join_owner_task_id,
+                    (*thread).join_owner_task_generation,
+                ) {
+                    Wait::Progress
+                } else {
+                    Wait::Retry
+                }
+            }
+            _ => Wait::Retry,
+        }
+    }
+}
+unsafe fn claim(handle: Handle, gated: bool) -> Claim {
     let _guard = Guard::acquire(0);
     unsafe {
         let mut pending = None;
@@ -93,6 +134,14 @@ unsafe fn claim(handle: Handle) -> Claim {
                 || (*thread).instance_id != handle.instance_id
                 || (*thread).instance_generation != handle.generation
             {
+                continue;
+            }
+            if gated
+                && !(*thread)
+                    .retire_retry
+                    .ready(retire_progress::round(), timer::tick_count())
+            {
+                pending.get_or_insert(2);
                 continue;
             }
             (*thread).retire_pending = true;
@@ -125,6 +174,10 @@ unsafe fn claim(handle: Handle) -> Claim {
                 None
             };
             if let Some(reason) = reason {
+                if gated {
+                    let wait = observe(thread, reason);
+                    pause(thread, wait);
+                }
                 if pending.is_none() {
                     pending = Some(reason);
                 }
@@ -132,6 +185,9 @@ unsafe fn claim(handle: Handle) -> Claim {
             }
             let token = task_context::enter();
             if !token.admitted() {
+                if gated {
+                    pause(thread, Wait::Retry);
+                }
                 if pending.is_none() {
                     pending = Some(5);
                 }
@@ -139,6 +195,9 @@ unsafe fn claim(handle: Handle) -> Claim {
             }
             (*thread).retire_in_progress = true;
             (*thread).pin_count = 1;
+            if gated {
+                (*thread).retire_retry.begin(retire_progress::round());
+            }
             if changed {
                 threads::bump();
             }
@@ -176,6 +235,7 @@ unsafe fn clear_claim(thread: *mut Thread, keep_join: bool) {
             return;
         }
         clear_fields(thread, keep_join);
+        threads::notify_retire(thread);
     }
 }
 pub(super) unsafe fn release_task(
@@ -310,9 +370,13 @@ pub(super) unsafe fn complete(
             return false;
         }
         (*thread).flags |= threads::JOINED;
+        let notice = mem::replace(&mut (*thread).retire_notice, false);
         threads::unlink(thread);
         drop(guard);
         if threads::free(thread) {
+            if notice {
+                retire_progress::changed();
+            }
             report(report_boot, b"SERVMAN: Thread frei");
             return true;
         }
@@ -320,12 +384,16 @@ pub(super) unsafe fn complete(
         let _guard = Guard::acquire(0);
         threads::link(thread);
         clear_fields(thread, keep_join);
+        threads::notify_retire(thread);
+        if notice {
+            retire_progress::changed();
+        }
         false
     }
 }
-unsafe fn release(handle: Handle, report_boot: bool) -> bool {
+unsafe fn release(handle: Handle, report_boot: bool, gated: bool) -> bool {
     loop {
-        match unsafe { claim(handle) } {
+        match unsafe { claim(handle, gated) } {
             Claim::Done => return true,
             Claim::Pending(reason) => {
                 report(report_boot, DETAILS[reason]);
@@ -333,12 +401,89 @@ unsafe fn release(handle: Handle, report_boot: bool) -> bool {
             }
             Claim::Claimed(thread, token) => {
                 report(report_boot, b"SERVMAN: Thread freigeben");
+                // The claim pins this record. Keep only a value identity after
+                // complete returns: another retire caller may then free it.
+                let identity = unsafe {
+                    crate::contract::ProgramJoinHandle {
+                        thread_id: (*thread).id,
+                        instance_id: (*thread).instance_id,
+                        thread_generation: (*thread).generation,
+                        instance_generation: (*thread).instance_generation,
+                        ..Default::default()
+                    }
+                };
                 if !unsafe { complete(thread, token, report_boot, false) } {
-                    return false;
+                    if !gated {
+                        return false;
+                    }
+                    let _guard = Guard::acquire(0);
+                    unsafe {
+                        let current = threads::by_handle(identity);
+                        if !current.is_null() {
+                            let wait = if (*current).retire_in_progress {
+                                (*current).retire_notice = true;
+                                Wait::Progress
+                            } else if !(*current).task_detached
+                                && task_api::observe_retirement(
+                                    (*current).task_id,
+                                    (*current).task_generation,
+                                )
+                            {
+                                Wait::Progress
+                            } else {
+                                Wait::Retry
+                            };
+                            // Preserve an in-flight round reset performed by
+                            // the main reaper; defer never overwrites begin.
+                            (*current).retire_retry.defer(timer::tick_count(), wait);
+                        }
+                    }
                 }
             }
         }
     }
+}
+pub(super) unsafe fn release_ready(handle: Handle, report_boot: bool) -> bool {
+    unsafe { release(handle, report_boot, true) }
+}
+/// Only scheduling metadata is inspected here. A lack of records or an
+/// unclassified/in-flight failure needs a bounded retry, never a false ACK.
+pub(super) unsafe fn waiting(handle: Handle) -> Wait {
+    let _guard = Guard::acquire(0);
+    unsafe {
+        let mut found = false;
+        let mut cursor = (*threads::state()).head;
+        while !cursor.is_null() {
+            let thread = cursor;
+            cursor = (*thread).registry_next;
+            if !(*thread).used
+                || (*thread).instance_id != handle.instance_id
+                || (*thread).instance_generation != handle.generation
+            {
+                continue;
+            }
+            found = true;
+            if (*thread).retire_retry.deadline().is_some()
+                || (*thread)
+                    .retire_retry
+                    .ready(retire_progress::round(), timer::tick_count())
+            {
+                return Wait::Retry;
+            }
+        }
+        if found { Wait::Progress } else { Wait::Retry }
+    }
+}
+pub(super) fn reset_retire_rounds() -> bool {
+    let _guard = Guard::acquire(0);
+    unsafe {
+        let mut thread = (*threads::state()).head;
+        while !thread.is_null() {
+            (*thread).retire_retry.reset_round();
+            thread = (*thread).registry_next;
+        }
+    }
+    true
 }
 /// # Safety
 /// No registry mutex held. Exact handle and optional skip identity are values;
@@ -360,7 +505,7 @@ pub unsafe extern "C" fn r4os_rust_program_threads_release(
     handle: Handle,
     report_boot: bool,
 ) -> bool {
-    unsafe { release(handle, report_boot) }
+    unsafe { release(handle, report_boot, false) }
 }
 /// # Safety
 /// Original cooperative by-ID lookup, then exact generation retirement.
@@ -381,7 +526,7 @@ pub unsafe extern "C" fn r4os_rust_program_threads_instance(
             terminate(handle, code, has_skip.then_some(skip));
             true
         } else {
-            release(handle, false)
+            release(handle, false, false)
         }
     }
 }

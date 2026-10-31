@@ -1,11 +1,10 @@
 //! Original one-shot lifecycle test admission and progress acknowledgments.
 //! This native owner is the only mutable failure state; immutable boot option
 //! bytes are borrowed briefly from the existing configuration owner.
-use super::registry_state::state;
 use crate::{
     fs::vfs_types::Bytes,
     sched::{
-        sync_locks, sync_objects,
+        sync_locks,
         sync_types::{Mutex, Text},
     },
 };
@@ -109,7 +108,7 @@ fn signal() {
         }
         unlock();
     }
-    unsafe { sync_objects::r4os_rust_sync_event((*state()).event, 0, 0) };
+    super::retire_progress::changed();
 }
 pub(super) fn consume(phase: u8) -> bool {
     if !lock() {

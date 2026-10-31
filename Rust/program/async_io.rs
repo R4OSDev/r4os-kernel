@@ -3,7 +3,10 @@
 //! request mutex spans a filesystem/service wait or dynamic Task retirement.
 mod dispatch;
 mod service;
-use super::{context, registry_state, registry_types::ProgramInstance, thread_retire, threads};
+use super::{
+    context, registry_types::ProgramInstance, retire_progress, retire_wait::Wait, thread_retire,
+    threads,
+};
 use crate::{
     boot::foundation,
     contract::{
@@ -103,6 +106,7 @@ struct Request {
     state: u32,
     cancel_requested: bool,
     close_pending: bool,
+    retire_retry: super::retire_wait::Retry,
     waiters: u32,
     flags: u32,
     status: i32,
@@ -149,6 +153,7 @@ impl Request {
         state: 0,
         cancel_requested: false,
         close_pending: false,
+        retire_retry: super::retire_wait::Retry::EMPTY,
         waiters: 0,
         flags: 0,
         status: 0,
@@ -226,6 +231,7 @@ struct State {
     requests: [Request; CAPACITY],
     workers: [Worker; WORKERS],
     cursor: [usize; 2],
+    close_cursor: usize,
     lanes: [Lane; 2],
     creations: u64,
     processed: u64,
@@ -244,6 +250,7 @@ static STATE: Cell<State> = Cell(UnsafeCell::new(State {
     requests: [const { Request::EMPTY }; CAPACITY],
     workers: [const { Worker::empty() }; WORKERS],
     cursor: [0; 2],
+    close_cursor: 0,
     lanes: [Lane::EMPTY; 2],
     creations: 0,
     processed: 0,
@@ -1239,7 +1246,7 @@ fn recovered(id: u32) {
     foundation::puts(b"\r\n");
 }
 fn signal_reaper() {
-    unsafe { sync_objects::r4os_rust_sync_event((*registry_state::state()).event, 0, 0) };
+    retire_progress::queued();
 }
 unsafe fn retire(value: Claim) -> bool {
     unsafe {
@@ -1318,7 +1325,10 @@ unsafe fn defer_close(value: Claim) -> u8 {
         if matches!((*req).state, 1 | 2) || (*req).waiters != 0 {
             return 0;
         }
-        (*req).close_pending = true;
+        if !(*req).close_pending {
+            (*req).retire_retry = super::retire_wait::Retry::EMPTY;
+            (*req).close_pending = true;
+        }
         drop(guard);
         signal_reaper();
         2
@@ -1333,7 +1343,10 @@ unsafe fn mark_pending(id: u32) -> bool {
         if req.is_null() || matches!((*req).state, 1 | 2) || (*req).waiters != 0 {
             return false;
         }
-        (*req).close_pending = true;
+        if !(*req).close_pending {
+            (*req).retire_retry = super::retire_wait::Retry::EMPTY;
+            (*req).close_pending = true;
+        }
         drop(guard);
         signal_reaper();
         true
@@ -1619,16 +1632,22 @@ pub(super) unsafe fn reap() -> u8 {
             return 2;
         };
         let mut pending = None;
-        for i in 0..CAPACITY {
+        for offset in 0..CAPACITY {
+            let i = ((*state()).close_cursor + offset) % CAPACITY;
             let req = ptr::addr_of_mut!((*state()).requests[i]);
             if !(*req).used
                 || !(*req).close_pending
                 || (*req).waiters != 0
                 || matches!((*req).state, 1 | 2)
+                || !(*req)
+                    .retire_retry
+                    .ready(retire_progress::round(), timer::tick_count())
             {
                 continue;
             }
             pending = Some(claim(i, req));
+            (*req).retire_retry.begin(retire_progress::round());
+            (*state()).close_cursor = (i + 1) % CAPACITY;
             break;
         }
         drop(guard);
@@ -1636,7 +1655,24 @@ pub(super) unsafe fn reap() -> u8 {
             return 0;
         };
         if !retire(value) {
-            return 2;
+            // Observe the exact native blocker after the failed attempt. A
+            // vanished/already-quiescent task or opaque resource error has no
+            // proven future edge and therefore keeps the bounded retry.
+            let wait = if task_api::observe_retirement(value.task_id, value.task_generation) {
+                Wait::Progress
+            } else {
+                Wait::Retry
+            };
+            let Some(_guard) = lock() else {
+                return 2;
+            };
+            let req = claimed(value);
+            if !req.is_null() && (*req).close_pending {
+                (*req).retire_retry.defer(timer::tick_count(), wait);
+            }
+            // An attempted request, including a deferred one, may not hide
+            // later ready close requests behind the first occupied slot.
+            return 1;
         }
         let Some(guard) = lock() else {
             return 2;
@@ -1652,6 +1688,63 @@ pub(super) unsafe fn reap() -> u8 {
             recovered(value.id);
         }
         1
+    }
+}
+/// Main reaper's idle predicate under the canonical request owner. An unknown
+/// waiter/state transition is explicitly timed rather than assumed signaled.
+pub(super) unsafe fn retire_wait() -> Option<(bool, Option<u64>)> {
+    let _guard = lock()?;
+    unsafe {
+        let mut pending = false;
+        let mut deadline = None;
+        for i in 0..CAPACITY {
+            let req = ptr::addr_of_mut!((*state()).requests[i]);
+            if !(*req).used || !(*req).close_pending {
+                continue;
+            }
+            pending = true;
+            let due = if (*req).waiters != 0 || matches!((*req).state, 1 | 2) {
+                Some(timer::tick_count().saturating_add(1))
+            } else {
+                (*req).retire_retry.deadline()
+            };
+            if let Some(due) = due {
+                deadline = Some(deadline.map_or(due, |old: u64| old.min(due)));
+            }
+        }
+        Some((pending, deadline))
+    }
+}
+pub(super) fn reset_retire_rounds() -> bool {
+    let Some(_guard) = lock() else {
+        return false;
+    };
+    unsafe {
+        for i in 0..CAPACITY {
+            (*state()).requests[i].retire_retry.reset_round();
+        }
+    }
+    true
+}
+/// Query after cancel/purge failed, before the reaper parks. The request mutex
+/// binds each worker identity and the native task owner enrolls the real edge.
+pub(super) unsafe fn waiting(handle: Handle, caller: Option<(u32, u64)>) -> Wait {
+    let Some(_guard) = lock() else {
+        return Wait::Retry;
+    };
+    unsafe {
+        let mut found = false;
+        for i in 0..CAPACITY {
+            let req = ptr::addr_of_mut!((*state()).requests[i]);
+            if !owned(req, handle, caller) || (*req).task_id == 0 {
+                continue;
+            }
+            found = true;
+            if !task_api::observe_retirement((*req).task_id, (*req).task_generation) {
+                return Wait::Retry;
+            }
+        }
+        if found { Wait::Progress } else { Wait::Retry }
     }
 }
 fn path_byte(value: u8) -> u8 {

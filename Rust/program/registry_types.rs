@@ -74,6 +74,7 @@ pub struct ProgramRegistrySlot {
     pub retire_image_stack_released: bool,
     pub retire_owner_released: bool,
     _padding0: [u8; 2],
+    pub(crate) retire_retry: super::retire_wait::Retry,
 }
 
 #[repr(C)]
@@ -256,13 +257,14 @@ const _: () = {
     assert!(core::mem::offset_of!(ProgramRegistrySlot, retire_storage_released) == 299);
     assert!(core::mem::offset_of!(ProgramRegistrySlot, retire_image_stack_released) == 300);
     assert!(core::mem::offset_of!(ProgramRegistrySlot, retire_owner_released) == 301);
-    assert!(core::mem::size_of::<ProgramRegistrySlot>() == 304);
+    assert!(core::mem::offset_of!(ProgramRegistrySlot, retire_retry) == 304);
+    assert!(core::mem::size_of::<ProgramRegistrySlot>() == 328);
     assert!(core::mem::align_of::<ProgramRegistrySlot>() == 8);
     assert!(core::mem::offset_of!(ProgramRegistryChunk, next) == 0);
     assert!(core::mem::offset_of!(ProgramRegistryChunk, serial) == 8);
     assert!(core::mem::offset_of!(ProgramRegistryChunk, empty_since_epoch) == 16);
     assert!(core::mem::offset_of!(ProgramRegistryChunk, slots) == 24);
-    assert!(core::mem::size_of::<ProgramRegistryChunk>() == 4888);
+    assert!(core::mem::size_of::<ProgramRegistryChunk>() == 5272);
     assert!(core::mem::align_of::<ProgramRegistryChunk>() == 8);
     assert!(core::mem::offset_of!(ProgramInstanceReservation, slot) == 0);
     assert!(core::mem::offset_of!(ProgramInstanceReservation, generation) == 8);

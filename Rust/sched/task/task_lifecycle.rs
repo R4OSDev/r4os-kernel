@@ -53,6 +53,7 @@ unsafe fn clear_claim(task: *mut Task) {
             (*c).release_in_progress = false;
             (*c).retire_pending = true;
             registry::link_reap(task);
+            registry::notify_retire_waiter(task);
         }
     }
     runtime::restore_runtime(flags);
@@ -97,6 +98,7 @@ unsafe fn complete_admitted(task: *mut Task) -> bool {
             if registry::contains(task) {
                 (*c).release_in_progress = false;
                 registry::link_reap(task);
+                registry::notify_retire_waiter(task);
             }
             runtime::restore_runtime(flags);
             puts(b"TASK RELEASE INVARIANT: retry anchor changed\r\n");
@@ -120,6 +122,7 @@ unsafe fn complete_admitted(task: *mut Task) -> bool {
                 return false;
             }
             registry::unlink_registry(task);
+            let notice = registry::take_retire_notice(task);
             resources::reset_critical(index);
             (*registry::raw()).critical[index].in_use = false;
             if (*registry::raw()).critical_in_use != 0 {
@@ -131,8 +134,12 @@ unsafe fn complete_admitted(task: *mut Task) -> bool {
                 high_water,
                 resources::timestamp().wrapping_sub(started),
             );
+            if notice {
+                crate::program::retire_progress::changed();
+            }
             return true;
         }
+        let notice = registry::take_retire_notice(task);
         registry::unlink_registry(task);
         runtime::restore_runtime(flags);
         if resources::free_metadata(task) {
@@ -141,6 +148,9 @@ unsafe fn complete_admitted(task: *mut Task) -> bool {
                 high_water,
                 resources::timestamp().wrapping_sub(started),
             );
+            if notice {
+                crate::program::retire_progress::changed();
+            }
             return true;
         }
         let retry = runtime::save_runtime();
@@ -148,6 +158,9 @@ unsafe fn complete_admitted(task: *mut Task) -> bool {
         (*c).retire_pending = true;
         registry::link_registry(task);
         runtime::restore_runtime(retry);
+        if notice {
+            crate::program::retire_progress::changed();
+        }
         puts(b"Task object release pending retry\r\n");
         false
     }
@@ -228,6 +241,9 @@ pub(crate) unsafe fn unpin(task: *mut Task) -> bool {
             return false;
         }
         (*registry::core(task)).pin_count -= 1;
+        if (*registry::core(task)).pin_count == 0 {
+            registry::notify_retire_waiter(task);
+        }
         let token = claim(task);
         runtime::restore_runtime(flags);
         if let Some(token) = token {
@@ -381,6 +397,32 @@ pub(crate) unsafe fn retire(id: u32, generation: u64) -> RetireResult {
             Some(token) if complete_release(task, token) => RetireResult::Released,
             _ => RetireResult::Pending,
         }
+    }
+}
+
+/// Register before the final owned check of a demonstrably changing blocker.
+/// This does not set retire_pending or change ready/kill policy. Resource/heap/
+/// invariant failures without a proven notice still require bounded retry.
+pub(crate) unsafe fn observe_retirement(id: u32, generation: u64) -> bool {
+    let _runtime = runtime::RuntimeGuard::acquire();
+    unsafe {
+        let task = registry::find_identity(id, generation);
+        if task.is_null() || scheduler::current() == task.cast::<c_void>() {
+            return false;
+        }
+        let c = registry::core(task);
+        if (*c).critical_reserve_slot != registry::NO_RESERVE {
+            return false;
+        }
+        let changing = (*c).running_cpu != 0xff
+            || (*c).pin_count != 0
+            || (*c).release_in_progress
+            || (*c).state != State::Dead
+                && ((*c).held_lock_count != 0 || (*c).unwind_guard_count != 0);
+        if changing {
+            (*c).retire_notice = true;
+        }
+        changing
     }
 }
 pub(crate) unsafe fn release_dead(id: u32, generation: Option<u64>) -> bool {

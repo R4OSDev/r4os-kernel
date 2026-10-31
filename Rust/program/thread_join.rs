@@ -45,6 +45,7 @@ pub(super) unsafe fn reclaim_stale(target: *mut Thread) {
         if (*target).pin_count != 0 {
             (*target).pin_count -= 1;
         }
+        threads::notify_retire(target);
     }
 }
 #[allow(clippy::too_many_arguments)]
@@ -108,6 +109,7 @@ pub(super) unsafe fn release_locked(target: *mut Thread, owner: u32, generation:
         if (*target).pin_count != 0 {
             (*target).pin_count -= 1;
         }
+        threads::notify_retire(target);
         true
     }
 }
@@ -288,6 +290,9 @@ unsafe fn join(id: u32, exact: Option<Handle>, timeout: u64, out: *mut i32) -> i
             }
             if (*target).join_waiter_refs != 0 {
                 (*target).join_waiter_refs -= 1;
+                if (*target).join_waiter_refs == 0 {
+                    threads::notify_retire(target);
+                }
             }
             let completed = matches!((*target).state, 3 | 4);
             drop(guard);

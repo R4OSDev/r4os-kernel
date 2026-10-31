@@ -185,6 +185,7 @@ impl Drop for Closing {
             let _g = RuntimeGuard::acquire();
             assert!((*self.0).close_running);
             (*self.0).close_running = false;
+            notify_retire(self.0);
             changed(self.0);
         }
     }

@@ -893,6 +893,7 @@ pub(super) unsafe fn mark_ready(task: *mut Task, now: u64) {
         if blocked {
             bump_epoch();
         }
+        notify_retire_waiter(task);
     }
 }
 pub(super) unsafe fn mark_running(task: *mut Task) {
@@ -946,7 +947,19 @@ pub(super) unsafe fn switched_out(task: *mut Task) {
             select_home(task);
             link_ready(task);
         }
+        notify_retire_waiter(task);
     }
+}
+/// Runtime owner held. A notice requests another exact retirement attempt;
+/// it is not a physical return or release acknowledgement. The outer switch
+/// admission still excludes foreign release until cpu.S publishes the stack.
+pub(super) unsafe fn notify_retire_waiter(task: *mut Task) {
+    if unsafe { take_retire_notice(task) } {
+        crate::program::retire_progress::changed();
+    }
+}
+pub(super) unsafe fn take_retire_notice(task: *mut Task) -> bool {
+    unsafe { core::mem::replace(&mut (*core(task)).retire_notice, false) }
 }
 pub(super) unsafe fn record_scheduled(task: *mut Task, now: u64) -> u64 {
     unsafe {
@@ -1098,6 +1111,7 @@ pub(super) unsafe fn transition_dead(
             (*c).retire_pending = true;
             link_reap(task);
         }
+        notify_retire_waiter(task);
         bump_epoch();
     }
 }

@@ -15,6 +15,9 @@ use core::{
     ffi::c_void,
     ptr::{self, null_mut},
 };
+pub(crate) unsafe fn observe_retirement(id: u32, generation: u64) -> bool {
+    unsafe { lifetime::observe_retirement(id, generation) }
+}
 fn state(value: u8) -> State {
     match value {
         0 => State::Unused,
