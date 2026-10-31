@@ -443,7 +443,11 @@ pub(crate) unsafe extern "C" fn acquire(
         let flags = (*gui).window_info.flags;
         // Request is only PENDING. The desktop grant validates actual focus;
         // Down may wake its receiver before the corresponding focus notice.
-        if flags & c::GuiWindowFlag::visible == 0
+        // Cooperative process-close publishes under this same metadata owner.
+        // A cancelled capture must not be reacquired before window teardown.
+        if AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).close_requested))
+            .load(Ordering::Acquire)
+            || flags & c::GuiWindowFlag::visible == 0
             || flags & (c::GuiWindowFlag::minimized | c::GuiWindowFlag::close_requested) != 0
         {
             return c::gui_pointer_error_unavailable;

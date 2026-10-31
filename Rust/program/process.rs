@@ -3,6 +3,7 @@
 use super::{completions, exit, reaper, registry, registry_state::state, registry_types::*};
 use crate::{
     contract::{ProgramProcessCompletion as Completion, ProgramProcessHandle as Handle},
+    memory::owner::Guard,
     platform::timer,
     sched::{scheduler, sync_objects},
 };
@@ -112,6 +113,29 @@ unsafe fn kill_clients(host: Handle) {
         unsafe { exit::r4os_rust_program_exit_commit(child, -9, 2) };
     }
 }
+/// Caller holds the exact running slot under Registry. Metadata0 serializes
+/// capture cancellation and flag publication with native capture admission.
+unsafe fn mark_close(instance: *mut ProgramInstance, owner: Handle) -> bool {
+    unsafe {
+        let flag = AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).close_requested));
+        if flag.load(Ordering::Acquire) {
+            return false;
+        }
+        let guard = Guard::acquire(0);
+        let gui = (*instance).gui_payload.cast::<super::payload_types::Gui>();
+        if !gui.is_null() {
+            super::gui_pointer::visibility(
+                gui,
+                owner,
+                crate::contract::GuiWindowFlag::close_requested,
+            );
+        }
+        flag.store(true, Ordering::Release);
+        drop(guard);
+        true
+    }
+}
+
 unsafe fn close_clients() {
     loop {
         if !registry::lock() {
@@ -144,9 +168,9 @@ unsafe fn close_clients() {
                     {
                         continue;
                     }
-                    AtomicBool::from_ptr(ptr::addr_of_mut!((*slot).instance.close_requested))
-                        .store(true, Ordering::Release);
-                    changed = Some(registry::handle_for_slot(slot));
+                    let owner = registry::handle_for_slot(slot);
+                    mark_close(ptr::addr_of_mut!((*slot).instance), owner);
+                    changed = Some(owner);
                     registry::epoch();
                     break 'search;
                 }
@@ -361,15 +385,13 @@ pub unsafe extern "C" fn r4os_rust_program_process_close(input: *const Handle) -
             registry::unlock();
             return status;
         }
-        let flag = AtomicBool::from_ptr(ptr::addr_of_mut!((*slot).instance.close_requested));
-        if !flag.load(Ordering::Acquire) {
-            flag.store(true, Ordering::Release);
+        if mark_close(ptr::addr_of_mut!((*slot).instance), h) {
             registry::epoch();
         }
         registry::unlock();
         program_process_input(h);
-        crate::service::desktop_events::r4os_rust_desktop_signal();
         close_clients();
+        crate::service::desktop_events::r4os_rust_desktop_signal();
     }
     0
 }
