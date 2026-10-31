@@ -75,7 +75,7 @@ pub struct Thread {
     // Only this exact pinned execution writes its resident kernel return
     // anchor. The fault path consumes it without touching the module stack.
     pub(super) fault_frame: *mut crate::arch::callback_abort::Frame,
-    pub(super) stack_exhausted: bool,
+    pub(super) execution_aborted: bool,
     pub(super) retire_retry: super::retire_wait::Retry,
 }
 impl Default for Thread {
@@ -118,7 +118,7 @@ impl Default for Thread {
             retire_notice: false,
             _padding0: [0; 2],
             fault_frame: ptr::null_mut(),
-            stack_exhausted: false,
+            execution_aborted: false,
             retire_retry: super::retire_wait::Retry::EMPTY,
         }
     }
@@ -143,7 +143,7 @@ const _: () = {
     assert!(mem::offset_of!(Thread, instance_generation) == 152);
     assert!(mem::offset_of!(Thread, execution_pinned) == 350);
     assert!(mem::offset_of!(Thread, fault_frame) == 360);
-    assert!(mem::offset_of!(Thread, stack_exhausted) == 368);
+    assert!(mem::offset_of!(Thread, execution_aborted) == 368);
     assert!(mem::offset_of!(Thread, console_input_lease) == 0);
     assert!(mem::offset_of!(Thread, spawn_transaction_depth) == 308);
     assert!(mem::offset_of!(Thread, exit_deferred) == 349);

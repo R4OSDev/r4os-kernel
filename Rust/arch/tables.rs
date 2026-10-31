@@ -239,7 +239,7 @@ fn ist(vector: u64) -> u8 {
     match vector {
         2 | 8 => 1,
         18 => 3,
-        10 | 11 | 12 | 13 | 14 | 17 | 21 | 29 | 30 => 2,
+        6 | 10 | 11 | 12 | 13 | 14 | 17 | 21 | 29 | 30 => 2,
         _ => 0,
     }
 }
@@ -462,20 +462,31 @@ unsafe fn exception_inner(frame: *const InterruptFrame, address: u64, private_st
             (*frame).error_code,
         );
         crate::program::stack_fault::emit();
-        if (*frame).vector == 14
-            && !private_stack
-            && let Some(boundary) = crate::program::fault::abort_exhausted(
+        let boundary = if (*frame).vector == 14 && !private_stack {
+            crate::program::fault::abort_exhausted(
                 address,
                 (*frame).error_code,
                 interrupted_rsp(frame),
                 (*frame).rip,
                 (*frame).rflags,
             )
-        {
+            .map(|frame| (frame, crate::program::fault::STACK_EXHAUSTED_EXIT))
+        } else if (*frame).vector == 6 {
+            crate::program::fault::abort_invalid_opcode(
+                (*frame).error_code,
+                interrupted_rsp(frame),
+                (*frame).rip,
+                (*frame).rflags,
+            )
+            .map(|frame| (frame, crate::program::fault::CPU_EXCEPTION_EXIT))
+        } else {
+            None
+        };
+        if let Some((boundary, exit_code)) = boundary {
             let target = frame.cast_mut();
             (*target).rip = super::callback_abort::r4os_rust_callback_resume as *const () as u64;
             (*target).rdi = boundary as u64;
-            (*target).rsi = crate::program::fault::STACK_EXHAUSTED_EXIT as i64 as u64;
+            (*target).rsi = exit_code as i64 as u64;
             // Resume with IF retained and the SysV direction/control contract.
             // The existing boundary restores MXCSR/x87 and callee registers.
             (*target).rflags &= !((1 << 8) | (1 << 10) | (1 << 16) | (1 << 18));

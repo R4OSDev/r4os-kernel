@@ -17,6 +17,12 @@ const MAIN: u32 = 1;
 const GUARD: u64 = 4096;
 const HEADROOM: u64 = 64 * 1024;
 pub(crate) const STACK_EXHAUSTED_EXIT: i32 = -4096;
+pub(crate) const CPU_EXCEPTION_EXIT: i32 = -4097;
+
+enum Abort {
+    Exhausted(u64),
+    InvalidOpcode,
+}
 
 unsafe extern "C" {
     static __r4os_kernel_text_start: u8;
@@ -34,8 +40,34 @@ pub(crate) unsafe fn abort_exhausted(
     rip: u64,
     flags: u64,
 ) -> Option<*const callback_abort::Frame> {
+    if error & !2 != 0 {
+        return None;
+    }
+    unsafe { abort_program(Abort::Exhausted(address), rsp, rip, flags) }
+}
+
+/// Only #UD with its real zero error code is admitted here. The architecture
+/// owner supplies an IST frame; every other CPU exception keeps its fatal path.
+pub(crate) unsafe fn abort_invalid_opcode(
+    error: u64,
+    rsp: u64,
+    rip: u64,
+    flags: u64,
+) -> Option<*const callback_abort::Frame> {
+    if error != 0 {
+        return None;
+    }
+    unsafe { abort_program(Abort::InvalidOpcode, rsp, rip, flags) }
+}
+
+unsafe fn abort_program(
+    cause: Abort,
+    rsp: u64,
+    rip: u64,
+    flags: u64,
+) -> Option<*const callback_abort::Frame> {
     unsafe {
-        if error & !2 != 0 || flags & ((1 << 9) | (1 << 10)) != 1 << 9 || !owner::fault_allowed() {
+        if flags & ((1 << 9) | (1 << 10)) != 1 << 9 || !owner::fault_allowed() {
             return None;
         }
         let current = scheduler::current();
@@ -53,7 +85,7 @@ pub(crate) unsafe fn abort_exhausted(
             || !(*task).guard_offer.is_empty()
             || (*thread).state != 2
             || !(*thread).execution_pinned
-            || (*thread).stack_exhausted
+            || (*thread).execution_aborted
             || (*thread).generation == 0
             || (*thread).instance_generation == 0
             || (*thread).spawn_transaction_depth != 0
@@ -74,13 +106,33 @@ pub(crate) unsafe fn abort_exhausted(
         };
         if program_stack.range_id == 0
             || program_stack.guard_size != GUARD
-            || address < program_stack.base
-            || address - program_stack.base >= GUARD
             || rsp < program_stack.base
             || rsp - program_stack.base >= program_stack.reserve_size
-            || rsp.abs_diff(address) > GUARD
         {
             return None;
+        }
+        match cause {
+            Abort::Exhausted(address) => {
+                if address < program_stack.base
+                    || address - program_stack.base >= GUARD
+                    || rsp.abs_diff(address) > GUARD
+                {
+                    return None;
+                }
+            }
+            Abort::InvalidOpcode => {
+                // No failing module-stack read or continuation is needed.
+                // Still require its interrupted SP to name committed owned
+                // stack storage; unknown/corrupt stack provenance stays fatal.
+                if program_stack.committed_base == 0
+                    || program_stack.committed_size == 0
+                    || rsp < program_stack.committed_base
+                    || rsp >= program_stack.top
+                    || rsp & 7 != 0
+                {
+                    return None;
+                }
+            }
         }
         let base = (*instance).program_image_base;
         if !(rip >= base && rip - base < (*instance).program_image_size as u64)
@@ -110,7 +162,7 @@ pub(crate) unsafe fn abort_exhausted(
         {
             return None;
         }
-        (*thread).stack_exhausted = true;
+        (*thread).execution_aborted = true;
         Some(frame)
     }
 }

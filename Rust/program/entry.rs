@@ -76,11 +76,11 @@ unsafe fn invoke(thread: *mut threads::Thread, entry: usize, arg: usize, top: u6
             return r4os_call_program(entry, arg, top);
         }
         let mut frame = abort::Frame::default();
-        (*thread).stack_exhausted = false;
+        (*thread).execution_aborted = false;
         (*thread).fault_frame = ptr::addr_of_mut!(frame);
         let code = abort::r4os_rust_program_invoke(entry, arg, top, ptr::addr_of_mut!(frame));
         (*thread).fault_frame = ptr::null_mut();
-        if (*thread).stack_exhausted {
+        if (*thread).execution_aborted {
             // This runs on the retained kernel stack after restoring its
             // callee registers. No module epilogue/callback is resumed.
             thread_runtime::exit_thread(thread, code, Some(contract::program_exit_reason_failed));

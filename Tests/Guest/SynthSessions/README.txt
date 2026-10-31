@@ -12,7 +12,8 @@ live process), SE/ME (natural owner exit), SK/MK (targeted process kill), SX/MX
 generation-bound output, exact completion/reap and observation release matter.
 The stack exhaustion body is the existing Spectra stack/recovery consume body;
 require vector14, reserve-exhausted reason, and exact instance/task/thread
-generations. UD2 remains a distinct fatal-CPU-exception finding (roadmap87).
+generations. Kernel447 also admits narrowly checked program #UD at the same
+existing resident callback boundary; other origins remain fatal (below).
 
 On original Kernel427 the eight frozen binaries fail these owner contracts.
 Only that legacy controller explicitly repairs global state after recording a
@@ -60,3 +61,27 @@ It adds no public platform API or table field. Restore core.rs and rebuild the
 normal artifact byte-identically before product/benchmark use; do not commit
 the include/call. Shut down owned guests normally and remove private source
 images with the canonical Distribution test-retention helper.
+
+CPU exceptions (0.88.87), still on the normal kernel
+------------------------------------------------
+Build only changed parts with -Part driver,fault,fault-controller; optional
+-CacheRoot reuses an existing SDK cache without rebuilding unrelated fixtures.
+Install fault/F87A.R4X, fault-controller/F87CTRL.R4X and the controlled P53D
+with the same existing P53C protocol; provide C:\TEMP\IO87.BIN (8192 bytes).
+F87CTRL M: real main UD2 after SID acquisition and a retained File I/O request.
+F87CTRL T: real worker UD2 after MIDI acquisition; the exact worker generation
+           differs from its main. Both must complete -4097 / Failed, full
+           output/reap/observation release, one private Stop ACK, successful
+           reacquire/close and a surviving foreign ordinary PCM write/close.
+Private Stop error blocks completion; a configured Busy interval also stays
+blocked. The counter check does not isolate one specific Busy callback; only
+the final actual successful Stop acknowledgement authorizes release. Existing
+controlled Stop/Busy cases retain their separate callback proof. An unclosed
+I/O request is deliberately retained; no physically pending DMA is claimed.
+The driver has test-only UD2 for write_result=-87. F87CTRL D must produce a
+global vector6 fatal from the real loaded R4D inside an audio-progress task.
+F87A I executes CLI then UD2 and must also stay globally fatal. These two
+intentional fatal cases require isolated owned guests, full originals and one
+guarded QMP quit after capture; they cannot shut down normally. Never run D/I
+in a normal user session. Preserve the existing P53APP SX guard-recovery case.
+These are explicit native fixtures, not normal boot tests or product probes.
