@@ -456,6 +456,10 @@ unsafe fn start(name: &[u8], out: *mut c::ServiceInfo) -> i32 {
     }
 }
 unsafe fn stop(name: &[u8], out: *mut c::ServiceInfo, timeout: u64) -> i32 {
+    // One budget covers status/close work and every subsequent wait. Forever
+    // is a separate mode; a saturated finite deadline must remain finite.
+    let deadline =
+        (timeout != c::io_wait_forever).then(|| timer::tick_count().saturating_add(timeout));
     unsafe {
         out.write(c::ServiceInfo::default());
         refresh_name(name);
@@ -489,8 +493,7 @@ unsafe fn stop(name: &[u8], out: *mut c::ServiceInfo, timeout: u64) -> i32 {
                 return c::service_api_result_stop_failed;
             }
         }
-        let mut waited = 0u64;
-        while waited < timeout {
+        loop {
             refresh_name(name);
             let Some(current) = self::entry(name) else {
                 return NOT_FOUND;
@@ -502,11 +505,15 @@ unsafe fn stop(name: &[u8], out: *mut c::ServiceInfo, timeout: u64) -> i32 {
                 status(name, out);
                 return c::service_api_result_stop_failed;
             }
+            // Real completion observed at the boundary wins. Only positive
+            // remaining integral ticks permit the existing one-tick wait;
+            // delayed scheduling or status work cannot renew the budget.
+            if deadline.is_some_and(|end| timer::tick_count() >= end) {
+                break;
+            }
             let mut queue = WaitQueue::default();
             sync_wait::r4os_rust_sync_timer(&mut queue, 1, b"service-stop".as_ptr(), 12);
-            waited += 1;
         }
-        refresh_name(name);
         status(name, out);
         c::service_api_result_timeout
     }
