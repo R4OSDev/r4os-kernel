@@ -328,37 +328,6 @@ pub unsafe fn remove(index: *mut Index, node: Node, offset: usize) {
 pub(crate) unsafe fn remove_quiet(index: *mut Index, node: Node, offset: usize) {
     unsafe { remove_impl::<false>(index, node, offset) }
 }
-/// # Safety
-/// Caller serializes aligned stable records and valid memberships. The offset
-/// selects Links in each node; ordering is pure and cannot wait or reschedule.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_task_index_insert(
-    index: *mut Index,
-    node: Node,
-    offset: usize,
-    less: Less,
-    output: *mut Neighbors,
-) {
-    unsafe { output.write(insert(index, node, offset, less)) };
-}
-/// # Safety
-/// Caller serializes aligned stable records and valid memberships. The offset
-/// selects Links in each node; ordering is pure and cannot wait or reschedule.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_task_index_next(
-    index: *mut Index,
-    node: Node,
-    offset: usize,
-) -> Node {
-    unsafe { next(index, node, offset) }
-}
-/// # Safety
-/// Caller serializes aligned stable records and valid memberships. The offset
-/// selects Links in each node; ordering is pure and cannot wait or reschedule.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_task_index_remove(index: *mut Index, node: Node, offset: usize) {
-    unsafe { remove(index, node, offset) }
-}
 const _: () = {
     assert!(core::mem::size_of::<Links>() == 32);
     assert!(core::mem::size_of::<Index>() == 32);
