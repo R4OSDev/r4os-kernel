@@ -18,7 +18,7 @@ use core::{
     cell::UnsafeCell,
     ffi::c_void,
     mem, ptr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 // This resident queue is only for observation waiters, including cancellation
@@ -88,6 +88,40 @@ pub unsafe extern "C" fn retain(
     let Some(creator) = (unsafe { context::handle() }) else {
         return -5;
     };
+    let owner = if flags & c::program_observation_flag_portable != 0 {
+        c::ProgramProcessHandle::default()
+    } else {
+        creator
+    };
+    unsafe { retain_owned(handle, owner, out, |_| true) }
+}
+
+/// The service owner commits only with its bounded rank120 try-lock while
+/// ProgramRegistry110 keeps the exact completion resident. No allocation,
+/// callback, sleep or fallible step follows a successful service commit.
+/// The ownerless binding retains terminal evidence, never a live instance.
+pub(super) unsafe fn retain_service(
+    handle: c::ProgramProcessHandle,
+    out: *mut c::ProgramObservationHandle,
+    commit: impl FnOnce(c::ProgramObservationHandle) -> bool,
+) -> i32 {
+    if !registry::valid(handle) {
+        return -1;
+    }
+    let Some(_task) = task_context::Admission::acquire(false) else {
+        return -5;
+    };
+    unsafe { retain_owned(handle, c::ProgramProcessHandle::default(), out, commit) }
+}
+
+/// `commit` may only validate/mutate a higher ranked owner with a bounded
+/// try-lock. It must not wait, allocate, or re-enter ProgramRegistry.
+unsafe fn retain_owned(
+    handle: c::ProgramProcessHandle,
+    owner_handle: c::ProgramProcessHandle,
+    out: *mut c::ProgramObservationHandle,
+    commit: impl FnOnce(c::ProgramObservationHandle) -> bool,
+) -> i32 {
     owner::prepare_stack();
     let memory = heap::r4os_rust_heap_alloc(
         mem::size_of::<ProgramObservationNode>(),
@@ -115,21 +149,23 @@ pub unsafe extern "C" fn retain(
                 process: handle,
                 id: (*state()).next_observation_id,
             };
-            (*state()).next_observation_id += 1;
-            let item = memory.cast::<ProgramObservationNode>();
-            item.write(ProgramObservationNode {
-                next: (*state()).observation_head,
-                key,
-                owner: if flags & c::program_observation_flag_portable != 0 {
-                    c::ProgramProcessHandle::default()
-                } else {
-                    creator
-                },
-                completion: node,
-            });
-            (*node).observation_refs += 1;
-            (*state()).observation_head = item;
-            0
+            if !commit(key) {
+                -5
+            } else {
+                // All validation and allocation precede commit. Publication
+                // below is infallible and remains under this same owner.
+                (*state()).next_observation_id += 1;
+                let item = memory.cast::<ProgramObservationNode>();
+                item.write(ProgramObservationNode {
+                    next: (*state()).observation_head,
+                    key,
+                    owner: owner_handle,
+                    completion: node,
+                });
+                (*node).observation_refs += 1;
+                (*state()).observation_head = item;
+                0
+            }
         }
     };
     registry::unlock();
@@ -137,12 +173,66 @@ pub unsafe extern "C" fn retain(
         unsafe {
             heap::r4os_rust_heap_free(memory, mem::size_of::<ProgramObservationNode>());
         }
-    } else {
+    } else if !out.is_null() {
         unsafe {
             out.write(key);
         }
     }
     result
+}
+
+/// Kernel-owned portable binding; the caller retains its native frame and
+/// holds no service/endpoint owner while releasing the observation owner.
+pub(super) unsafe fn release_service(key: c::ProgramObservationHandle) -> i32 {
+    unsafe { close(key) }
+}
+
+/// One ProgramRegistry visit observes the bound live Close flag or actual
+/// retained state2/3 evidence, including after another owner reap. Logical
+/// return/history alone cannot complete the service. Outputs are private
+/// resident kernel storage, written after the registry owner is released.
+pub(super) unsafe fn service_state(
+    key: c::ProgramObservationHandle,
+    out: *mut c::ProgramProcessCompletion,
+    out_close: *mut bool,
+) -> i32 {
+    if !valid(key) {
+        return -1;
+    }
+    let mut record = c::ProgramProcessCompletion::default();
+    let mut close_requested = false;
+    if !registry::lock() {
+        return -5;
+    }
+    let status = unsafe {
+        let item = find(key);
+        if item.is_null() {
+            -2
+        } else {
+            let node = (*item).completion;
+            if (*node).state == 1 {
+                let slot = registry::lookup_handle(key.process, true);
+                if !slot.is_null() {
+                    close_requested =
+                        AtomicBool::from_ptr(ptr::addr_of_mut!((*slot).instance.close_requested))
+                            .load(Ordering::Acquire);
+                }
+                -5
+            } else {
+                assert!(matches!((*node).state, 2 | 3));
+                record = completions::record(node);
+                0
+            }
+        }
+    };
+    registry::unlock();
+    unsafe {
+        out_close.write(close_requested);
+        if status == 0 {
+            out.write(record);
+        }
+    }
+    status
 }
 
 unsafe fn close(key: c::ProgramObservationHandle) -> i32 {

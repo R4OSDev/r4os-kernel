@@ -213,6 +213,20 @@ pub(super) fn lock_registry(family: usize) -> Option<TimedLock> {
         )
     }
 }
+/// Used only by the lower ranked ProgramRegistry publication transaction.
+/// Admission is a bounded try: no wait or allocation under that owner.
+pub(super) fn try_lock_registry(family: usize) -> Option<TimedLock> {
+    assert!(family < 3);
+    unsafe {
+        TimedLock::acquire(
+            ptr::addr_of_mut!((*raw()).lock),
+            ptr::addr_of_mut!((*raw()).timing)
+                .cast::<LockTiming>()
+                .add(family),
+            true,
+        )
+    }
+}
 pub(super) unsafe fn endpoint_lock(
     ep: *mut Endpoint,
     family: usize,
@@ -461,7 +475,15 @@ pub(super) unsafe fn target_slot(target: &ApiIndexTarget, require_instance: bool
         if target.registry_generation != (*raw()).generation {
             return None;
         }
-        let slot = api_slot(target.api_index)?;
+        let slot = if target.api_index == NAMED_TARGET_INDEX {
+            let slot = target.service_slot;
+            if slot >= MAX_SERVICES || !(*entry(slot)).used {
+                return None;
+            }
+            slot
+        } else {
+            api_slot(target.api_index)?
+        };
         if slot != target.service_slot {
             return None;
         }
@@ -471,10 +493,48 @@ pub(super) unsafe fn target_slot(target: &ApiIndexTarget, require_instance: bool
         {
             return None;
         }
-        if require_instance && e.instance_id != target.instance_id {
+        if require_instance
+            && (e.start_generation != target.start_generation
+                || !same_binding(e.binding, target.binding))
+        {
             return None;
         }
+        if require_instance && e.instance_id != target.instance_id {
+            // Another observer may already have published this same actual
+            // completion. Its retained binding still identifies exactly the
+            // old process; a subsequent start must replace that binding.
+            if target.binding.id == 0
+                || e.instance_id != 0
+                || !matches!(e.state, STATE_STOPPED | STATE_DISABLED | STATE_FAILED)
+            {
+                return None;
+            }
+        }
         Some(slot)
+    }
+}
+pub(super) fn same_binding(a: c::ProgramObservationHandle, b: c::ProgramObservationHandle) -> bool {
+    a.id == b.id
+        && a.process.instance_id == b.process.instance_id
+        && a.process.generation == b.process.generation
+        && a.process.reserved == b.process.reserved
+}
+/// Registry owner is held. Named queries do not scan the public program
+/// inventory or increment the existing indexed-enumeration counters.
+pub(super) unsafe fn target_for_slot(slot: usize, index: u32) -> ApiIndexTarget {
+    unsafe {
+        let e = &*entry(slot);
+        ApiIndexTarget {
+            registry_generation: (*raw()).generation,
+            api_index: index,
+            service_slot: slot,
+            instance_id: e.instance_id,
+            state: e.state,
+            name: e.name,
+            name_len: e.name_len,
+            start_generation: e.start_generation,
+            binding: e.binding,
+        }
     }
 }
 pub(super) unsafe fn select_target(index: u32, query: bool) -> Option<ApiIndexTarget> {
@@ -494,18 +554,7 @@ pub(super) unsafe fn select_target(index: u32, query: bool) -> Option<ApiIndexTa
             p.refresh_requests = p.refresh_requests.wrapping_add(1);
         }
         p.refresh_visits = p.refresh_visits.wrapping_add(1);
-        let e = &*entry(slot);
-        let mut result = ApiIndexTarget {
-            registry_generation: (*r).generation,
-            api_index: index,
-            service_slot: slot,
-            instance_id: e.instance_id,
-            state: e.state,
-            name_len: e.name_len,
-            ..ApiIndexTarget::EMPTY
-        };
-        result.name[..e.name_len].copy_from_slice(&e.name[..e.name_len]);
-        Some(result)
+        Some(target_for_slot(slot, index))
     }
 }
 

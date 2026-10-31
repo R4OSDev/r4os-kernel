@@ -42,6 +42,9 @@ pub struct Options {
     pub forced_cpu: u8,
     pub forced_cpu_present: bool,
     pub reserved: u8,
+    // Synchronous construction-only binding; never copied into an instance
+    // or kept after launch returns. Only managed service launches set it.
+    pub service_start: *mut super::service_api::Reservation,
 }
 
 fn report(enabled: bool, text: &[u8]) {
@@ -664,6 +667,24 @@ unsafe fn background(
         if !options.out_handle.is_null() {
             options.out_handle.write(handle);
         }
+        if !options.service_start.is_null() {
+            let binding = if class == 2 {
+                super::service_api::bind_start(options.service_start, handle)
+            } else {
+                -1
+            };
+            if binding != 0 {
+                // Registry publication alone does not make this task runnable.
+                // Reuse the existing exact-generation published-failure path;
+                // an exchanged service reservation never executes this child.
+                while !ready(handle) && !exit::r4os_rust_program_exit_begin(handle, -1, 2) {
+                    scheduler::yield_task();
+                }
+                (*exit_state::state()).last_exit_code = 1;
+                error(options, binding);
+                return FAILED;
+            }
+        }
         if scheduler::r4os_rust_scheduler_task(3, task, 0, 0, ptr::null(), 0) == 0 {
             foundation::puts(b"Program task publication failed\r\n");
             while !ready(handle) && !exit::r4os_rust_program_exit_begin(handle, -1, 2) {
@@ -758,7 +779,7 @@ const _: () = {
     assert!(mem::offset_of!(Loaded, value) == 0);
     assert!(mem::offset_of!(Loaded, origin) == 1920);
     assert!(mem::offset_of!(Loaded, origin_len) == 2048);
-    assert!(mem::size_of::<Options>() == 40);
+    assert!(mem::size_of::<Options>() == 48);
     assert!(mem::offset_of!(Options, owner_handle) == 0);
     assert!(mem::offset_of!(Options, out_handle) == 16);
     assert!(mem::offset_of!(Options, error_out) == 24);
@@ -770,6 +791,7 @@ const _: () = {
     assert!(mem::offset_of!(Options, forced_cpu) == 37);
     assert!(mem::offset_of!(Options, forced_cpu_present) == 38);
     assert!(mem::offset_of!(Options, reserved) == 39);
+    assert!(mem::offset_of!(Options, service_start) == 40);
 };
 
 unsafe fn program_entry_boot_detail(value: Bytes) {

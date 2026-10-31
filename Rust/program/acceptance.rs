@@ -648,6 +648,7 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
             span(b"CLIPSVC"),
             existing.as_mut_ptr(),
         );
+        let mut installed_target = MaybeUninit::<service_api::Target>::uninit();
         if registered
             && crate::program::service_api::native_service_install(
                 span(b"CLIPSVC"),
@@ -655,6 +656,7 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
                 span(b"/RUN"),
                 0,
                 span(b""),
+                installed_target.as_mut_ptr(),
             ) != 0
         {
             return false;
@@ -836,11 +838,12 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
                 && cleanup;
         }
         if registered {
-            cleanup = (crate::program::service_api::native_service_name_mutate(
-                4,
-                span(b"CLIPSVC"),
+            cleanup = (service_api::r4os_rust_program_service_named(
+                7,
+                c"CLIPSVC".as_ptr().cast(),
+                ptr::null_mut(),
                 0,
-                span(b""),
+                0,
             ) == 0)
                 && cleanup;
         }

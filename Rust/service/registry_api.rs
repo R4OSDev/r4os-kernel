@@ -20,6 +20,10 @@ pub(super) enum Change {
     Stopping,
     Finish(bool, i32, Bytes),
     Mode(u8),
+    ClearBinding,
+    RestartCount,
+    CancelStart,
+    Complete(i32),
 }
 unsafe fn key_slot(key: Key) -> Option<usize> {
     unsafe {
@@ -51,10 +55,9 @@ unsafe fn apply(key: Key, slot: usize, change: Change) -> i32 {
         let r = reg::raw();
         match change {
             Change::Unregister => {
-                let Key::Name(name) = key else {
-                    unreachable!();
-                };
-                let result = reg::unregister_in(&mut (*r).entries, reg::bytes(name));
+                let name = (*reg::entry(slot)).name;
+                let len = (*reg::entry(slot)).name_len;
+                let result = reg::unregister_in(&mut (*r).entries, &name[..len]);
                 if result == 0 {
                     reg::structure_changed();
                 }
@@ -88,6 +91,7 @@ unsafe fn apply(key: Key, slot: usize, change: Change) -> i32 {
                     slot,
                     generation: (*e).start_generation,
                     entry: e.read(),
+                    registry_generation: (*r).generation,
                 });
                 c::service_api_result_ok
             }
@@ -110,6 +114,46 @@ unsafe fn apply(key: Key, slot: usize, change: Change) -> i32 {
                 } else if e.state == STATE_DISABLED {
                     e.state = STATE_STOPPED;
                 }
+                0
+            }
+            Change::ClearBinding => {
+                (*reg::entry(slot)).binding = EMPTY_BINDING;
+                0
+            }
+            Change::RestartCount => {
+                let e = reg::entry(slot);
+                (*e).restart_count = (*e).restart_count.wrapping_add(1);
+                0
+            }
+            Change::CancelStart => {
+                finish_entry(
+                    slot,
+                    false,
+                    0,
+                    Bytes {
+                        data: ptr::null(),
+                        len: 0,
+                    },
+                );
+                0
+            }
+            Change::Complete(code) => {
+                // Decide against current stop intent under this owner, not
+                // against a state copied before an unlocked completion read.
+                let failed = (*reg::entry(slot)).state != STATE_STOPPING && code != 0;
+                finish_entry(
+                    slot,
+                    failed,
+                    code,
+                    Bytes {
+                        data: if failed {
+                            b"service exited".as_ptr()
+                        } else {
+                            ptr::null()
+                        },
+                        len: if failed { b"service exited".len() } else { 0 },
+                    },
+                );
                 0
             }
         }
@@ -143,10 +187,16 @@ pub(super) unsafe fn change(key: Key, action: Change) -> i32 {
                         if matches!(e.state, STATE_RUNNING | STATE_STARTING | STATE_STOPPING) {
                             return c::service_api_result_busy;
                         }
+                        if e.binding.id != 0 {
+                            return c::service_api_result_busy;
+                        }
                         true
                     }
                     Change::State(state, id, _, _) => state != STATE_RUNNING || e.instance_id != id,
                     Change::Stopping => {
+                        if e.state == STATE_STOPPING {
+                            return c::service_api_result_ok;
+                        }
                         if !matches!(e.state, STATE_RUNNING | STATE_STARTING) {
                             return -1;
                         }
@@ -156,13 +206,52 @@ pub(super) unsafe fn change(key: Key, action: Change) -> i32 {
                         if mode != MODE_DISABLED {
                             false
                         } else {
-                            if e.instance_id != 0 {
+                            if e.instance_id != 0 || e.binding.id != 0 {
                                 return -1;
                             }
                             true
                         }
                     }
-                    Change::Unregister | Change::Finish(_, _, _) => true,
+                    Change::Unregister => {
+                        if e.instance_id != 0
+                            || e.binding.id != 0
+                            || matches!(e.state, STATE_RUNNING | STATE_STARTING | STATE_STOPPING)
+                        {
+                            return c::service_api_result_busy;
+                        }
+                        true
+                    }
+                    Change::Finish(_, _, _) => true,
+                    Change::ClearBinding => {
+                        if e.instance_id != 0
+                            || matches!(e.state, STATE_STARTING | STATE_STOPPING | STATE_RUNNING)
+                        {
+                            return c::service_api_result_busy;
+                        }
+                        false
+                    }
+                    Change::RestartCount => false,
+                    Change::CancelStart => {
+                        if e.state != STATE_STARTING
+                            || e.instance_id != 0
+                            || e.binding.id != 0
+                            || e.start_generation == 0
+                        {
+                            return c::service_api_result_busy;
+                        }
+                        true
+                    }
+                    Change::Complete(_) => {
+                        if e.binding.id == 0 {
+                            return c::service_api_result_busy;
+                        }
+                        if e.instance_id == 0
+                            && matches!(e.state, STATE_STOPPED | STATE_DISABLED | STATE_FAILED)
+                        {
+                            return c::service_api_result_ok;
+                        }
+                        true
+                    }
                 }
             };
             if retire && let Some(i) = reg::endpoint_for_slot(slot) {
@@ -192,6 +281,7 @@ pub(super) unsafe fn register(
     args: Bytes,
     mode: u8,
     description: Bytes,
+    out_target: *mut ApiIndexTarget,
 ) -> i32 {
     unsafe {
         let Some(_guard) = reg::lock_registry(0) else {
@@ -207,6 +297,7 @@ pub(super) unsafe fn register(
         );
         if result >= 0 {
             reg::structure_changed();
+            out_target.write(reg::target_for_slot(result as usize, NAMED_TARGET_INDEX));
         }
         result
     }
@@ -244,40 +335,58 @@ unsafe fn start_entry(reservation: *const StartReservation) -> Option<usize> {
             && e.start_generation == generation
             && e.start_mode != MODE_DISABLED
             && e.state == STATE_STARTING
-            && e.instance_id == 0)
+            && e.instance_id == 0
+            && e.binding.id == 0)
             .then_some(slot)
     }
 }
 pub(super) unsafe fn complete_start(
     reservation: *const StartReservation,
-    id: u32,
+    binding: c::ProgramObservationHandle,
     ticks: u64,
 ) -> bool {
     unsafe {
-        let Some(_guard) = reg::lock_registry(0) else {
+        // Caller holds ProgramRegistry110 and has prevalidated/allocated the
+        // completion lease. Never wait or allocate while it is held.
+        let Some(_guard) = reg::try_lock_registry(0) else {
             return false;
         };
+        if (*reservation).registry_generation != (*reg::raw()).generation {
+            return false;
+        }
         let Some(slot) = start_entry(reservation) else {
             return false;
         };
-        if id == 0 {
+        if binding.id == 0
+            || binding.process.instance_id == 0
+            || binding.process.generation == 0
+            || binding.process.reserved != 0
+        {
             return false;
         }
         let e = reg::entry(slot);
         (*e).state = STATE_RUNNING;
-        (*e).instance_id = id;
+        (*e).instance_id = binding.process.instance_id;
+        (*e).binding = binding;
         (*e).start_tick = ticks;
         (*e).start_generation = 0;
         true
     }
 }
-pub(super) unsafe fn fail_start(reservation: *const StartReservation, code: i32, text: Bytes) {
+pub(super) unsafe fn fail_start(
+    reservation: *const StartReservation,
+    code: i32,
+    text: Bytes,
+) -> bool {
     unsafe {
         let Some(_guard) = reg::lock_registry(0) else {
-            return;
+            return false;
         };
         if let Some(slot) = start_entry(reservation) {
             finish_entry(slot, true, code, text);
+            true
+        } else {
+            false
         }
     }
 }
@@ -319,6 +428,18 @@ pub(super) unsafe fn entry_by_name(name: Bytes) -> Option<Entry> {
 pub(super) unsafe fn target(index: u32, query: bool) -> Option<ApiIndexTarget> {
     let _guard = reg::lock_registry(2)?;
     unsafe { reg::select_target(index, query) }
+}
+pub(super) unsafe fn target_by_name(name: Bytes, out: *mut ApiIndexTarget) -> i32 {
+    let Some(_guard) = reg::lock_registry(2) else {
+        return c::service_api_result_busy;
+    };
+    unsafe {
+        let Some(slot) = reg::find_name(name) else {
+            return c::service_api_result_not_found;
+        };
+        out.write(reg::target_for_slot(slot, NAMED_TARGET_INDEX));
+    }
+    c::service_api_result_ok
 }
 pub(super) unsafe fn entry_for_target(target: &ApiIndexTarget) -> Option<Entry> {
     let _guard = reg::lock_registry(2)?;
@@ -425,36 +546,37 @@ pub(super) unsafe fn info(
     now: u64,
 ) -> i32 {
     unsafe {
-        let Some(mut guard) = reg::lock_registry(if operation == 3 { 1 } else { 2 }) else {
+        let opening = matches!(operation, 3 | 4);
+        let Some(mut guard) = reg::lock_registry(if opening { 1 } else { 2 }) else {
             return c::service_api_result_busy;
         };
         out.write(c::ServiceInfo::default());
         let selected = match operation {
             0 => reg::api_slot(index),
-            1 => reg::target_slot(&*target, true),
+            1 | 4 => reg::target_slot(&*target, true),
             2 | 3 => reg::find_name(name),
             _ => unreachable!(),
         };
         let Some(slot) = selected else {
             return match operation {
                 0 => 0,
-                1 => c::service_api_result_busy,
+                1 | 4 => c::service_api_result_busy,
                 _ => c::service_api_result_not_found,
             };
         };
         fill_entry(slot, &mut *out, now);
-        if operation == 3 {
+        if opening {
             let e = reg::entry(slot);
             if (*e).state != STATE_RUNNING || (*e).instance_id == 0 {
                 return c::service_api_result_not_running;
             }
         }
         let identity = reg::endpoint_for_slot(slot).map(|i| reg::identity(reg::endpoint(i)));
-        if operation == 3 && identity.is_none() {
+        if opening && identity.is_none() {
             return c::service_api_result_no_endpoint;
         }
         guard.release();
-        if operation == 3 {
+        if opening {
             let Some(lease) = reg::lock_identity(identity.expect("Admitted service endpoint"), 4)
             else {
                 return c::service_api_result_not_running;
@@ -510,13 +632,13 @@ pub(super) unsafe fn detail(
 }
 pub(super) unsafe fn register_endpoint(
     name: Bytes,
-    id: u32,
+    process: c::ProgramProcessHandle,
     flags: u32,
     out: *mut c::ServiceInfo,
     now: u64,
 ) -> i32 {
     unsafe {
-        if id == 0 {
+        if process.instance_id == 0 || process.generation == 0 || process.reserved != 0 {
             return c::service_api_result_invalid;
         }
         loop {
@@ -529,7 +651,13 @@ pub(super) unsafe fn register_endpoint(
             };
             fill_entry(slot, &mut *out, now);
             let e = reg::entry(slot);
-            if (*e).state != STATE_RUNNING || (*e).instance_id != id {
+            if (*e).state != STATE_RUNNING
+                || (*e).instance_id != process.instance_id
+                || (*e).binding.process.instance_id != process.instance_id
+                || (*e).binding.process.generation != process.generation
+                || (*e).binding.process.reserved != process.reserved
+                || (*e).binding.id == 0
+            {
                 return c::service_api_result_not_running;
             }
             let Some(i) = reg::endpoint_for_slot(slot).or_else(|| reg::free_endpoint()) else {

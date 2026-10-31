@@ -1,6 +1,6 @@
 //! Fixed private service records; original fixtures lend the same layouts.
-use crate::build_config::config;
 use crate::sched::sync_types::{Mutex, Semaphore, Text, WaitQueue};
+use crate::{build_config::config, contract as c};
 pub const MAX_SERVICES: usize = 16;
 pub const MAX_ENDPOINTS: usize = MAX_SERVICES;
 pub const DEPTH: usize = crate::contract::service_api_endpoint_queue_depth;
@@ -10,6 +10,7 @@ pub const TIMING_STRIDE: u64 = 64;
 pub const REQUEST_BLOCK: u32 = 256;
 pub const REQUEST_MAX: u32 = 0x7fff_fffe;
 pub const INVALID_SLOT: u8 = 255;
+pub const NAMED_TARGET_INDEX: u32 = u32::MAX;
 pub const FOREVER: u64 = u64::MAX;
 pub const STATE_EMPTY: u8 = 0;
 pub const STATE_STOPPED: u8 = 1;
@@ -23,6 +24,14 @@ pub const REQUEST_FREE: u8 = 0;
 pub const REQUEST_QUEUED: u8 = 1;
 pub const REQUEST_DELIVERED: u8 = 2;
 pub const REQUEST_RESPONDED: u8 = 3;
+pub const EMPTY_BINDING: c::ProgramObservationHandle = c::ProgramObservationHandle {
+    process: c::ProgramProcessHandle {
+        instance_id: 0,
+        reserved: 0,
+        generation: 0,
+    },
+    id: 0,
+};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LockTiming {
@@ -104,6 +113,10 @@ pub struct Entry {
     pub description_len: usize,
     pub last_error: [u8; 64],
     pub last_error_len: usize,
+    // The actual launch identity and its detached completion lease survive
+    // starter exit/owner reap. A stopped slot keeps its last real evidence
+    // until the next start/remove releases it outside this registry owner.
+    pub binding: c::ProgramObservationHandle,
 }
 impl Entry {
     pub const EMPTY: Self = Self {
@@ -125,6 +138,7 @@ impl Entry {
         description_len: 0,
         last_error: [0; 64],
         last_error_len: 0,
+        binding: EMPTY_BINDING,
     };
 }
 impl Default for Entry {
@@ -142,6 +156,8 @@ pub struct ApiIndexTarget {
     pub state: u8,
     pub name: [u8; 32],
     pub name_len: usize,
+    pub start_generation: u64,
+    pub binding: c::ProgramObservationHandle,
 }
 impl ApiIndexTarget {
     pub const EMPTY: Self = Self {
@@ -152,6 +168,8 @@ impl ApiIndexTarget {
         state: 0,
         name: [0; 32],
         name_len: 0,
+        start_generation: 0,
+        binding: EMPTY_BINDING,
     };
 }
 impl Default for ApiIndexTarget {
@@ -423,12 +441,14 @@ pub struct StartReservation {
     pub slot: usize,
     pub generation: u64,
     pub entry: Entry,
+    pub registry_generation: u64,
 }
 impl StartReservation {
     pub const EMPTY: Self = Self {
         slot: 0,
         generation: 0,
         entry: Entry::EMPTY,
+        registry_generation: 0,
     };
 }
 impl Default for StartReservation {
@@ -498,7 +518,8 @@ const _: () = {
     assert!(core::mem::offset_of!(Entry, description_len) == 1296);
     assert!(core::mem::offset_of!(Entry, last_error) == 1304);
     assert!(core::mem::offset_of!(Entry, last_error_len) == 1368);
-    assert!(core::mem::size_of::<Entry>() == 1376);
+    assert!(core::mem::offset_of!(Entry, binding) == 1376);
+    assert!(core::mem::size_of::<Entry>() == 1400);
     assert!(core::mem::align_of::<Entry>() == 8);
     assert!(core::mem::offset_of!(ApiIndexTarget, registry_generation) == 0);
     assert!(core::mem::offset_of!(ApiIndexTarget, api_index) == 8);
@@ -507,7 +528,9 @@ const _: () = {
     assert!(core::mem::offset_of!(ApiIndexTarget, state) == 28);
     assert!(core::mem::offset_of!(ApiIndexTarget, name) == 29);
     assert!(core::mem::offset_of!(ApiIndexTarget, name_len) == 64);
-    assert!(core::mem::size_of::<ApiIndexTarget>() == 72);
+    assert!(core::mem::offset_of!(ApiIndexTarget, start_generation) == 72);
+    assert!(core::mem::offset_of!(ApiIndexTarget, binding) == 80);
+    assert!(core::mem::size_of::<ApiIndexTarget>() == 104);
     assert!(core::mem::align_of::<ApiIndexTarget>() == 8);
     assert!(core::mem::offset_of!(RequestSlot, state) == 0);
     assert!(core::mem::offset_of!(RequestSlot, request_id) == 4);
@@ -618,7 +641,8 @@ const _: () = {
     assert!(core::mem::offset_of!(StartReservation, slot) == 0);
     assert!(core::mem::offset_of!(StartReservation, generation) == 8);
     assert!(core::mem::offset_of!(StartReservation, entry) == 16);
-    assert!(core::mem::size_of::<StartReservation>() == 1392);
+    assert!(core::mem::offset_of!(StartReservation, registry_generation) == 1416);
+    assert!(core::mem::size_of::<StartReservation>() == 1424);
     assert!(core::mem::align_of::<StartReservation>() == 8);
     assert!(core::mem::offset_of!(QueueCounts, queued) == 0);
     assert!(core::mem::offset_of!(QueueCounts, delivered) == 4);

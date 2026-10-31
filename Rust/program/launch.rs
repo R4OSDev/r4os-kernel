@@ -831,6 +831,7 @@ pub(super) fn options() -> Options {
         forced_cpu: 0,
         forced_cpu_present: false,
         reserved: 0,
+        service_start: ptr::null_mut(),
     }
 }
 /// # Safety
@@ -934,6 +935,38 @@ pub unsafe extern "C" fn r4os_rust_program_launch_path(
             }
         } else {
             result as i32
+        }
+    }
+}
+/// Managed services bind the exact published process and retained completion
+/// before their task can run. The synchronous reservation pointer is kept only
+/// in this construction frame; all ordinary launch paths retain their defaults.
+pub(super) unsafe fn service_path(
+    drive: *const Drive,
+    path: Bytes,
+    args: Bytes,
+    working: *mut Drive,
+    handle: *mut crate::contract::ProgramProcessHandle,
+    reservation: *mut super::service_api::Reservation,
+) -> i32 {
+    unsafe {
+        let Some(file) = resolve(drive, path, false) else {
+            return crate::contract::service_api_result_bad_path;
+        };
+        let mut error = 0;
+        let mut options = options();
+        options.owner = true;
+        options.owner_handle_present = true;
+        options.legacy_id = true;
+        options.out_handle = handle;
+        options.error_out = &mut error;
+        options.service_start = reservation;
+        if run(&file, 2, 0, args, working, 0, &options) == 0 {
+            0
+        } else if error == -5 {
+            crate::contract::service_api_result_busy
+        } else {
+            crate::contract::service_api_result_spawn_failed
         }
     }
 }

@@ -2,8 +2,8 @@
 //! The service registry/endpoint state stays with its separately assigned owner.
 //! No program registry guard or record borrow crosses a blocking peer operation.
 use super::{
-    completions, context, exit_state, info, launch, launch_lifetime, payload_types, process,
-    process_data, program_api, registry, util,
+    context, exit_state, launch, observations, payload_types, process, process_data, program_api,
+    registry, util,
 };
 use crate::{
     contract as c,
@@ -42,6 +42,7 @@ pub struct Entry {
     name: [u8; 32],
     path: [u8; 1024],
     args: [u8; 96],
+    binding: c::ProgramObservationHandle,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -54,28 +55,22 @@ pub struct Target {
     state: u32,
     reserved: u32,
     name: [u8; 32],
+    start_generation: u64,
+    binding: c::ProgramObservationHandle,
 }
 #[repr(C)]
 #[derive(Default)]
 pub struct Reservation {
     slot: usize,
     generation: u64,
+    registry_generation: u64,
+    binding: c::ProgramObservationHandle,
 }
 
 fn span(s: &[u8]) -> Bytes {
     Bytes {
         data: s.as_ptr(),
         len: s.len(),
-    }
-}
-unsafe fn entry(name: &[u8]) -> Option<Entry> {
-    unsafe {
-        let mut out = MaybeUninit::uninit();
-        if crate::program::service_api::native_service_entry(span(name), out.as_mut_ptr()) {
-            Some(out.assume_init())
-        } else {
-            None
-        }
     }
 }
 unsafe fn target_entry(target: &Target) -> Option<Entry> {
@@ -140,147 +135,135 @@ unsafe fn report(op: u8, name: &[u8], stage: &[u8]) {
         }
     }
 }
-unsafe fn status(name: &[u8], out: *mut c::ServiceInfo) -> i32 {
-    unsafe { program_service_info(0, span(name), ptr::null(), out, timer::tick_count()) }
-}
-unsafe fn mutate(op: u8, name: &[u8], code: i32, text: &[u8]) -> i32 {
-    unsafe {
-        crate::program::service_api::native_service_name_mutate(op, span(name), code, span(text))
-    }
-}
 unsafe fn mark_target(op: u8, target: &Target, code: i32, text: &[u8]) -> bool {
     unsafe { program_service_target_mutate(op, target, code, span(text)) == 0 }
 }
-unsafe fn old_exit(id: u32, stopping: bool) -> Option<i32> {
-    unsafe {
-        let mut code = if stopping { 0 } else { -1 };
-        let mut history = 0;
-        if process::r4os_rust_program_process_history(id, &mut history) {
-            code = history;
-        }
-        let mut handle = c::ProgramProcessHandle::default();
-        if process::r4os_rust_program_process_open(id, &mut handle) == 0 {
-            let mut completion = c::ProgramProcessCompletion::default();
-            let result = process::r4os_rust_program_process_reap(&handle, &mut completion);
-            if result == -5 {
-                return None;
-            }
-            if result == 0 {
-                code = completion.exit_code;
-            }
-        }
-        Some(code)
+unsafe fn named_target(name: &[u8]) -> Result<Target, i32> {
+    let mut raw = st::ApiIndexTarget::EMPTY;
+    let result = unsafe { sf::service_target_by_name(span(name), &mut raw) };
+    if result == 0 {
+        Ok(target_value(raw))
+    } else {
+        Err(result)
     }
 }
-unsafe fn refresh_name(name: &[u8]) {
-    unsafe {
-        let Some(entry) = entry(name) else {
-            return;
-        };
-        if entry.id == 0 {
-            return;
-        }
-        let name = &entry.name[..entry.name_len];
-        let mut snapshot = MaybeUninit::uninit();
-        if info::r4os_rust_program_info_snapshot(entry.id, snapshot.as_mut_ptr()) {
-            let snapshot = snapshot.assume_init();
-            if snapshot.app_class != 2 {
-                mutate(2, name, -2, b"instance class mismatch");
-            } else if snapshot.state == 2 {
-                process::r4os_rust_program_process_finish(entry.id);
-                if entry.state == STOPPING || snapshot.exit_code == 0 {
-                    mutate(1, name, snapshot.exit_code, b"");
-                } else {
-                    mutate(2, name, snapshot.exit_code, b"service exited");
-                }
-            } else if snapshot.close_requested && entry.state != STOPPING {
-                mutate(0, name, 0, b"");
-            }
-            return;
-        }
-        let Some(code) = old_exit(entry.id, entry.state == STOPPING) else {
-            return;
-        };
-        if entry.state == STOPPING || code == 0 {
-            mutate(1, name, code, b"");
-        } else {
-            mutate(2, name, code, b"service exited");
-        }
-    }
+
+fn same_binding(a: c::ProgramObservationHandle, b: c::ProgramObservationHandle) -> bool {
+    a.id == b.id && registry::equal(a.process, b.process)
 }
+
+/// Unlocked work always uses this binding's exact retained process. Neither
+/// a diagnostic history row nor logical callback return can finish a service.
 unsafe fn refresh_target(target: &mut Target) -> bool {
     unsafe {
         let Some(entry) = target_entry(target) else {
             return false;
         };
+        target.id = entry.id;
+        target.state = u32::from(entry.state);
         if entry.id == 0 {
             return true;
         }
-        if !program_service_target_note(target) {
+        if entry.binding.id == 0 {
             return false;
         }
-        let mut snapshot = MaybeUninit::uninit();
-        if info::r4os_rust_program_info_snapshot(entry.id, snapshot.as_mut_ptr()) {
-            let snapshot = snapshot.assume_init();
-            if snapshot.app_class != 2 {
-                if !mark_target(2, target, -2, b"instance class mismatch") {
-                    return false;
-                }
-                target.id = 0;
-                target.state = u32::from(FAILED);
-            } else if snapshot.state == 2 {
-                let code = snapshot.exit_code;
-                process::r4os_rust_program_process_finish(entry.id);
-                let Some(current) = target_entry(target) else {
-                    return false;
-                };
-                if current.state == STOPPING || code == 0 {
-                    if !mark_target(1, target, code, b"") {
-                        return false;
-                    }
-                    target.state = u32::from(if current.mode == MODE_DISABLED {
-                        DISABLED
-                    } else {
-                        STOPPED
-                    });
-                } else {
-                    if !mark_target(2, target, code, b"service exited") {
-                        return false;
-                    }
-                    target.state = u32::from(FAILED);
-                }
-                target.id = 0;
-            } else if snapshot.close_requested && entry.state != STOPPING {
-                if !mark_target(0, target, 0, b"") {
-                    return false;
-                }
-                target.state = u32::from(STOPPING);
-            }
-            return target_entry(target).is_some();
+        if target.index != st::NAMED_TARGET_INDEX && !program_service_target_note(target) {
+            return false;
         }
-        let Some(code) = old_exit(entry.id, entry.state == STOPPING) else {
-            return target_entry(target).is_some();
-        };
+        let mut completion = c::ProgramProcessCompletion::default();
+        let mut close_requested = false;
+        let observed =
+            observations::service_state(entry.binding, &mut completion, &mut close_requested);
+        if observed == 0 {
+            if !registry::equal(completion.handle, entry.binding.process)
+                || completion.app_class != 2
+            {
+                return false;
+            }
+            // The managed service is the existing completion owner. Consume
+            // only this exact physical ACK so its legacy ID becomes reusable;
+            // the private observation keeps detached terminal metadata alive.
+            let mut consumed = c::ProgramProcessCompletion::default();
+            match process::r4os_rust_program_process_reap(&entry.binding.process, &mut consumed) {
+                c::program_handle_ok => {
+                    if !registry::equal(consumed.handle, completion.handle)
+                        || consumed.app_class != completion.app_class
+                        || consumed.exit_code != completion.exit_code
+                    {
+                        return false;
+                    }
+                }
+                // Another observer may already have consumed the same ACK.
+                // The retained record above still proves this generation.
+                c::program_handle_error_not_found | c::program_handle_error_stale => {}
+                _ => return false,
+            }
+            if !mark_target(9, target, completion.exit_code, b"") {
+                return false;
+            }
+        } else if observed == -5
+            && close_requested
+            && entry.state != STOPPING
+            && !mark_target(0, target, 0, b"")
+        {
+            return false;
+        }
+        // Missing/pending evidence remains unknown. A same-binding terminal
+        // transition by another observer can be adopted; a newer lease cannot.
         let Some(current) = target_entry(target) else {
             return false;
         };
-        if current.state == STOPPING || code == 0 {
-            if !mark_target(1, target, code, b"") {
-                return false;
-            }
-            target.state = u32::from(if current.mode == MODE_DISABLED {
-                DISABLED
-            } else {
-                STOPPED
-            });
+        target.id = current.id;
+        target.state = u32::from(current.state);
+        target.start_generation = current.start_generation;
+        true
+    }
+}
+
+unsafe fn refreshed_target(name: &[u8]) -> Result<Target, i32> {
+    unsafe {
+        let mut target = named_target(name)?;
+        if refresh_target(&mut target) {
+            Ok(target)
         } else {
-            if !mark_target(2, target, code, b"service exited") {
-                return false;
+            Err(BUSY)
+        }
+    }
+}
+
+unsafe fn bound_status(target: &Target, out: *mut c::ServiceInfo) -> i32 {
+    unsafe {
+        out.write(c::ServiceInfo::default());
+        let result = program_service_info(2, span(b""), target, out, timer::tick_count());
+        if result == 1 { 0 } else { result }
+    }
+}
+
+/// Release detached terminal evidence with no service/endpoint owner held.
+/// If clear loses admission after release, the terminal slot keeps the closed
+/// token: a subsequent attempt can observe -2 and finish the exact clear.
+unsafe fn clear_terminal_binding(target: &mut Target) -> i32 {
+    unsafe {
+        let Some(entry) = target_entry(target) else {
+            return BUSY;
+        };
+        if entry.id != 0 || matches!(entry.state, RUNNING | STARTING | STOPPING) {
+            return BUSY;
+        }
+        if entry.binding.id != 0 {
+            let released = observations::release_service(entry.binding);
+            if released != 0 && released != -2 {
+                return BUSY;
             }
-            target.state = u32::from(FAILED);
+            if !mark_target(4, target, 0, b"") {
+                return BUSY;
+            }
+            target.binding = st::EMPTY_BINDING;
         }
         target.id = 0;
-        true
+        target.state = u32::from(entry.state);
+        target.start_generation = entry.start_generation;
+        0
     }
 }
 struct Registry;
@@ -289,15 +272,15 @@ impl Drop for Registry {
         registry::unlock();
     }
 }
-unsafe fn descends(id: u32) -> bool {
+unsafe fn descends(handle: c::ProgramProcessHandle) -> bool {
     unsafe {
-        if id == 0 {
+        if !registry::valid(handle) {
             return false;
         }
         let Some(caller) = context::handle() else {
             return false;
         };
-        if caller.instance_id == id {
+        if registry::equal(caller, handle) {
             return true;
         }
         if !registry::lock() {
@@ -306,7 +289,7 @@ unsafe fn descends(id: u32) -> bool {
         let _guard = Registry;
         let mut current = caller;
         while registry::valid(current) {
-            if current.instance_id == id {
+            if registry::equal(current, handle) {
                 return true;
             }
             let mut parent = c::ProgramProcessHandle::default();
@@ -389,133 +372,272 @@ unsafe fn dos_path<'a>(drive: *mut Drive, path: &[u8], output: &'a mut [u8]) -> 
         Some(&output[..len])
     }
 }
-struct Unwind(task_context::Unwind);
-impl Drop for Unwind {
-    fn drop(&mut self) {
-        unsafe {
-            task_context::leave(self.0);
-        }
-    }
-}
 unsafe fn start(name: &[u8], out: *mut c::ServiceInfo) -> i32 {
     unsafe {
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
         out.write(c::ServiceInfo::default());
-        report(0, name, b"");
-        refresh_name(name);
-        let Some(current) = entry(name) else {
-            return NOT_FOUND;
+        let mut target = match named_target(name) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        start_bound(&mut target, out)
+    }
+}
+
+unsafe fn started_target(name: &[u8], identity: &Reservation) -> Result<Target, i32> {
+    let target = unsafe { named_target(name)? };
+    if target.registry_generation != identity.registry_generation
+        || target.slot != identity.slot
+        || identity.binding.id == 0
+        || !same_binding(target.binding, identity.binding)
+    {
+        Err(BUSY)
+    } else {
+        Ok(target)
+    }
+}
+
+unsafe fn fail_reservation(
+    target: &mut Target,
+    identity: &Reservation,
+    code: i32,
+    text: &[u8],
+) -> bool {
+    if !unsafe { program_service_fail(identity, code, span(text)) } {
+        return false;
+    }
+    target.id = 0;
+    target.state = u32::from(FAILED);
+    target.start_generation = 0;
+    true
+}
+
+unsafe fn start_bound(target: &mut Target, out: *mut c::ServiceInfo) -> i32 {
+    unsafe {
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
+        out.write(c::ServiceInfo::default());
+        if !refresh_target(target) {
+            return BUSY;
+        }
+        let Some(current) = target_entry(target) else {
+            return BUSY;
         };
         if current.state == RUNNING {
-            return status(name, out);
+            return bound_status(target, out);
         }
-        let _unwind = Unwind(task_context::enter());
+        let clear = clear_terminal_binding(target);
+        if clear != 0 {
+            return clear;
+        }
+        report(0, &target.name[..target.name_len], b"");
         let mut identity = Reservation::default();
         let mut raw = MaybeUninit::<Entry>::uninit();
-        let reserved = program_service_begin(span(name), &mut identity, raw.as_mut_ptr());
+        let reserved = program_service_begin(target, &mut identity, raw.as_mut_ptr());
         if reserved != 0 {
-            status(name, out);
-            report(3, name, b"");
+            bound_status(target, out);
             return reserved;
         }
+        target.start_generation = identity.generation;
+        target.state = u32::from(STARTING);
         let entry = raw.assume_init();
         let name = &entry.name[..entry.name_len];
         report(1, name, b"Pfad pruefen");
         let mut path = [MaybeUninit::<u8>::uninit(); 1024];
-        let Some(target) = resolve(&entry.path[..entry.path_len], path.as_mut_ptr().cast()) else {
-            program_service_fail(&identity, -1, span(b"path invalid or not service R4X"));
-            status(name, out);
+        let Some(resolved) = resolve(&entry.path[..entry.path_len], path.as_mut_ptr().cast())
+        else {
+            if !fail_reservation(target, &identity, -1, b"path invalid or not service R4X") {
+                return BUSY;
+            }
+            bound_status(target, out);
             report(3, name, b"");
             return c::service_api_result_bad_path;
         };
         report(1, name, b"laden");
         let mut handle = c::ProgramProcessHandle::default();
-        let raw_id = launch::r4os_rust_program_launch_path(
-            2,
-            target.drive,
-            target.path,
+        let launched = launch::service_path(
+            resolved.drive,
+            resolved.path,
             span(&entry.args[..entry.args_len]),
-            target.drive,
-            0,
+            resolved.drive,
             &mut handle,
+            &mut identity,
         );
-        if raw_id <= 0 {
-            program_service_fail(&identity, raw_id, span(b"spawn failed"));
-            status(name, out);
+        if launched != 0 {
+            if identity.binding.id == 0 {
+                if !fail_reservation(target, &identity, launched, b"spawn failed") {
+                    return BUSY;
+                }
+                bound_status(target, out);
+            } else {
+                // Publication failure may still be physically retiring. Keep
+                // its binding until the actual retained resource ACK arrives.
+                *target = match started_target(name, &identity) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                if !refresh_target(target) {
+                    return BUSY;
+                }
+                bound_status(target, out);
+            }
             report(3, name, b"");
-            return c::service_api_result_spawn_failed;
+            return launched;
         }
-        if !program_service_complete(&identity, handle.instance_id, timer::tick_count()) {
-            launch_lifetime::cancel_published(handle);
-            completions::r4os_rust_program_completion_access(4, handle, ptr::null_mut());
-            status(name, out);
-            report(3, name, b"");
+        *target = match started_target(name, &identity) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        if !refresh_target(target) {
             return BUSY;
         }
-        report(1, name, b"gestartet");
-        status(name, out)
+        let result = bound_status(target, out);
+        if result != 0 {
+            report(3, name, b"");
+        }
+        result
     }
 }
+
+fn stop_deadline(timeout: u64) -> Option<u64> {
+    (timeout != c::io_wait_forever).then(|| timer::tick_count().saturating_add(timeout))
+}
+
 unsafe fn stop(name: &[u8], out: *mut c::ServiceInfo, timeout: u64) -> i32 {
-    // One budget covers status/close work and every subsequent wait. Forever
-    // is a separate mode; a saturated finite deadline must remain finite.
-    let deadline =
-        (timeout != c::io_wait_forever).then(|| timer::tick_count().saturating_add(timeout));
+    // Preserve69: one absolute entry budget includes owner/status/Close work.
+    let deadline = stop_deadline(timeout);
     unsafe {
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
         out.write(c::ServiceInfo::default());
-        refresh_name(name);
-        let Some(entry) = entry(name) else {
-            return NOT_FOUND;
+        let mut target = match named_target(name) {
+            Ok(t) => t,
+            Err(e) => return e,
         };
-        let name = &entry.name[..entry.name_len];
+        stop_bound(&mut target, out, deadline)
+    }
+}
+
+/// # Safety
+/// Resident name, valid aligned expected handle and disjoint writable status
+/// through this call. A changed binding returns BUSY before requesting Close.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_program_service_stop_bound(
+    name: *const u8,
+    expected: *const c::ProgramProcessHandle,
+    out: *mut c::ServiceInfo,
+    timeout: u64,
+) -> i32 {
+    let deadline = stop_deadline(timeout);
+    unsafe {
+        if expected.is_null() || out.is_null() {
+            return INVALID;
+        }
+        let expected = expected.read();
+        if !registry::valid(expected) {
+            return INVALID;
+        }
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
+        out.write(c::ServiceInfo::default());
+        let mut buffer = [MaybeUninit::uninit(); 32];
+        let Some(name) = zcopy(name, &mut buffer) else {
+            return INVALID;
+        };
+        let mut target = match named_target(name) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        if !registry::equal(target.binding.process, expected) {
+            return BUSY;
+        }
+        stop_bound(&mut target, out, deadline)
+    }
+}
+
+unsafe fn stop_bound(target: &mut Target, out: *mut c::ServiceInfo, deadline: Option<u64>) -> i32 {
+    unsafe {
+        if !refresh_target(target) {
+            return BUSY;
+        }
+        let Some(entry) = target_entry(target) else {
+            return BUSY;
+        };
         if entry.state == STARTING && entry.id == 0 {
-            program_service_cancel(span(name), entry.start_generation);
-        }
-        if matches!(entry.state, DISABLED | STOPPED | FAILED) || entry.id == 0 {
-            return status(name, out);
-        }
-        mutate(0, name, 0, b"");
-        let close = process::r4os_rust_program_process_legacy(0, entry.id);
-        refresh_name(name);
-        let Some(after) = self::entry(name) else {
-            return NOT_FOUND;
-        };
-        if matches!(after.state, STOPPED | DISABLED) {
-            return status(name, out);
-        }
-        if close != 0 {
-            let mut handle = c::ProgramProcessHandle::default();
-            let mut info = c::ProgramInstanceInfo::default();
-            let terminal = process::r4os_rust_program_process_open(entry.id, &mut handle) == 0
-                && info::r4os_rust_program_info_handle(&handle, &mut info) == 0
-                && info.state != 0;
-            if !terminal {
-                status(name, out);
-                return c::service_api_result_stop_failed;
+            if !mark_target(8, target, 0, b"") {
+                return BUSY;
             }
+            target.start_generation = 0;
+            target.state = u32::from(if entry.mode == MODE_DISABLED {
+                DISABLED
+            } else {
+                STOPPED
+            });
+            return bound_status(target, out);
+        }
+        if entry.id == 0 && matches!(entry.state, DISABLED | STOPPED | FAILED) {
+            return bound_status(target, out);
+        }
+        if entry.binding.id == 0 {
+            return BUSY;
+        }
+        if descends(entry.binding.process) {
+            return c::service_api_result_self_restart;
+        }
+        if !mark_target(0, target, 0, b"") {
+            return BUSY;
+        }
+        target.state = u32::from(STOPPING);
+        let close = process::r4os_rust_program_process_close(&entry.binding.process);
+        if !refresh_target(target) {
+            return BUSY;
+        }
+        let Some(after) = target_entry(target) else {
+            return BUSY;
+        };
+        if after.id == 0 && matches!(after.state, STOPPED | DISABLED) {
+            return bound_status(target, out);
+        }
+        if close != 0 && close != c::program_handle_error_not_running {
+            bound_status(target, out);
+            return if close == c::program_handle_error_would_block {
+                BUSY
+            } else {
+                c::service_api_result_stop_failed
+            };
         }
         loop {
-            refresh_name(name);
-            let Some(current) = self::entry(name) else {
-                return NOT_FOUND;
-            };
-            if matches!(current.state, STOPPED | DISABLED) {
-                return status(name, out);
+            if !refresh_target(target) {
+                return BUSY;
             }
-            if current.state == FAILED {
-                status(name, out);
+            let Some(current) = target_entry(target) else {
+                return BUSY;
+            };
+            if current.id == 0 && matches!(current.state, STOPPED | DISABLED) {
+                return bound_status(target, out);
+            }
+            if current.id == 0 && current.state == FAILED {
+                bound_status(target, out);
                 return c::service_api_result_stop_failed;
             }
-            // Real completion observed at the boundary wins. Only positive
-            // remaining integral ticks permit the existing one-tick wait;
-            // delayed scheduling or status work cannot renew the budget.
+            // Actual retained completion wins the boundary. Unknown evidence
+            // never becomes completion merely because the wait budget ended.
             if deadline.is_some_and(|end| timer::tick_count() >= end) {
-                break;
+                let status = bound_status(target, out);
+                return if status == 0 {
+                    c::service_api_result_timeout
+                } else {
+                    status
+                };
             }
             let mut queue = WaitQueue::default();
             sync_wait::r4os_rust_sync_timer(&mut queue, 1, b"service-stop".as_ptr(), 12);
         }
-        status(name, out);
-        c::service_api_result_timeout
     }
 }
 /// # Safety
@@ -529,6 +651,9 @@ pub unsafe extern "C" fn r4os_rust_program_service_info(
         if out.is_null() {
             return INVALID;
         }
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
         for attempt in 0..3 {
             let mut target = MaybeUninit::uninit();
             if !program_service_index(attempt != 0, index, target.as_mut_ptr()) {
@@ -560,6 +685,9 @@ pub unsafe extern "C" fn r4os_rust_program_service_detail(
         if out.is_null() {
             return INVALID;
         }
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
         for attempt in 0..3 {
             let mut target = MaybeUninit::uninit();
             if !program_service_index(attempt != 0, index, target.as_mut_ptr()) {
@@ -595,6 +723,9 @@ pub unsafe extern "C" fn r4os_rust_program_service_named(
         if op != 7 && out.is_null() {
             return INVALID;
         }
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
         let mode = if op == 6 {
             let Some(mode) = mode(mode_raw) else {
                 return INVALID;
@@ -607,80 +738,135 @@ pub unsafe extern "C" fn r4os_rust_program_service_named(
         let Some(name) = zcopy(name, &mut buffer) else {
             return INVALID;
         };
+        if op != 7 {
+            out.write(c::ServiceInfo::default());
+        }
         match op {
             0 | 1 => {
-                refresh_name(name);
-                program_service_info(op, span(name), ptr::null(), out, timer::tick_count())
+                let target = match refreshed_target(name) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                if op == 0 {
+                    bound_status(&target, out)
+                } else {
+                    program_service_info(3, span(b""), &target, out, timer::tick_count())
+                }
             }
             2 => start(name, out),
-            3 => {
-                if let Some(entry) = entry(name)
-                    && descends(entry.id)
-                {
-                    return c::service_api_result_self_restart;
-                }
-                stop(name, out, timeout)
-            }
+            3 => stop(name, out, timeout),
             4 => {
-                refresh_name(name);
-                let Some(entry) = entry(name) else {
-                    return NOT_FOUND;
+                let mut target = match refreshed_target(name) {
+                    Ok(t) => t,
+                    Err(e) => return e,
                 };
-                let name = &entry.name[..entry.name_len];
-                if descends(entry.id) {
+                let Some(entry) = target_entry(&target) else {
+                    return BUSY;
+                };
+                if entry.id != 0 && descends(entry.binding.process) {
                     return c::service_api_result_self_restart;
                 }
                 if matches!(entry.state, RUNNING | STARTING | STOPPING) {
-                    let result = stop(name, out, 40);
+                    let result = stop_bound(&mut target, out, stop_deadline(40));
                     if result < 0 {
                         return result;
                     }
                 }
-                mutate(3, name, 0, b"");
-                start(name, out)
+                let clear = clear_terminal_binding(&mut target);
+                if clear != 0 {
+                    return clear;
+                }
+                if !mark_target(5, &target, 0, b"") {
+                    return BUSY;
+                }
+                start_bound(&mut target, out)
             }
             6 => {
-                refresh_name(name);
-                let Some(entry) = entry(name) else {
-                    return NOT_FOUND;
+                let mut target = match refreshed_target(name) {
+                    Ok(t) => t,
+                    Err(e) => return e,
                 };
-                let name = &entry.name[..entry.name_len];
-                if mode == MODE_DISABLED && descends(entry.id) {
+                let Some(entry) = target_entry(&target) else {
+                    return BUSY;
+                };
+                if mode == MODE_DISABLED && entry.id != 0 && descends(entry.binding.process) {
                     return c::service_api_result_self_restart;
                 }
                 if mode == MODE_DISABLED && matches!(entry.state, RUNNING | STARTING | STOPPING) {
-                    let result = stop(name, out, 40);
+                    let result = stop_bound(&mut target, out, stop_deadline(40));
                     if result < 0 {
                         return result;
                     }
                 }
-                let result = program_service_mode(span(name), mode);
-                if result != 0 {
-                    return registry_result(result);
+                if mode == MODE_DISABLED {
+                    let clear = clear_terminal_binding(&mut target);
+                    if clear != 0 {
+                        return clear;
+                    }
                 }
-                status(name, out)
+                if !mark_target(6, &target, i32::from(mode), b"") {
+                    return BUSY;
+                }
+                bound_status(&target, out)
             }
             7 => {
-                refresh_name(name);
-                let Some(entry) = entry(name) else {
-                    return NOT_FOUND;
+                let mut target = match refreshed_target(name) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let Some(entry) = target_entry(&target) else {
+                    return BUSY;
                 };
                 if matches!(entry.state, RUNNING | STARTING | STOPPING) {
                     return c::service_api_result_running;
                 }
-                let result = mutate(4, &entry.name[..entry.name_len], 0, b"");
-                if result != 0 {
-                    registry_result(result)
-                } else {
+                let clear = clear_terminal_binding(&mut target);
+                if clear != 0 {
+                    return clear;
+                }
+                if mark_target(7, &target, 0, b"") {
                     0
+                } else {
+                    BUSY
                 }
             }
             _ => unreachable!(),
         }
     }
 }
+
+unsafe fn bound_detail(
+    name: &[u8],
+    out: *mut c::ServiceDetail,
+    process: *mut c::ProgramProcessHandle,
+) -> i32 {
+    unsafe {
+        out.write(c::ServiceDetail::default());
+        if !process.is_null() {
+            process.write(c::ProgramProcessHandle::default());
+        }
+        let target = match refreshed_target(name) {
+            Ok(t) => t,
+            Err(e) => return e,
+        };
+        let result = program_service_detail(false, span(b""), &target, out, timer::tick_count());
+        if result != 1 {
+            return result;
+        }
+        if target_entry(&target).is_none() {
+            out.write(c::ServiceDetail::default());
+            return BUSY;
+        }
+        // A terminal service retains its last bound identity until next start
+        // or removal. This is a borrowed identity value, not an app-owned lease.
+        if !process.is_null() {
+            process.write(target.binding.process);
+        }
+        0
+    }
+}
 /// # Safety
-/// Original NUL name and canonical detail output remain resident through refresh.
+/// Resident original name/detail output through the exact refresh transaction.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_program_service_detail_name(
     name: *const u8,
@@ -690,12 +876,37 @@ pub unsafe extern "C" fn r4os_rust_program_service_detail_name(
         if out.is_null() {
             return INVALID;
         }
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
         let mut buffer = [MaybeUninit::uninit(); 32];
         let Some(name) = zcopy(name, &mut buffer) else {
             return INVALID;
         };
-        refresh_name(name);
-        program_service_detail(true, span(name), ptr::null(), out, timer::tick_count())
+        bound_detail(name, out, ptr::null_mut())
+    }
+}
+/// # Safety
+/// Resident NUL name and disjoint aligned detail/process outputs through the
+/// call. Both output values refer to the same validated service generation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_program_service_bound_detail(
+    name: *const u8,
+    out: *mut c::ServiceDetail,
+    process: *mut c::ProgramProcessHandle,
+) -> i32 {
+    unsafe {
+        if out.is_null() || process.is_null() {
+            return INVALID;
+        }
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
+        let mut buffer = [MaybeUninit::uninit(); 32];
+        let Some(name) = zcopy(name, &mut buffer) else {
+            return INVALID;
+        };
+        bound_detail(name, out, process)
     }
 }
 /// # Safety
@@ -713,6 +924,9 @@ pub unsafe extern "C" fn r4os_rust_program_service_install(
         if out.is_null() {
             return INVALID;
         }
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
         let Some(mode) = mode(mode_raw) else {
             return INVALID;
         };
@@ -746,18 +960,20 @@ pub unsafe extern "C" fn r4os_rust_program_service_install(
             report(3, name, b"");
             return c::service_api_result_bad_path;
         };
+        let mut installed = MaybeUninit::<Target>::uninit();
         let result = crate::program::service_api::native_service_install(
             span(name),
             span(full),
             span(args),
             mode,
             span(description),
+            installed.as_mut_ptr(),
         );
         if result < 0 {
             report(3, name, b"");
             return registry_result(result);
         }
-        let status = status(name, out);
+        let status = bound_status(&installed.assume_init(), out);
         if status != 0 {
             report(3, name, b"");
         }
@@ -776,16 +992,21 @@ pub unsafe extern "C" fn r4os_rust_program_service_register(
         if out.is_null() {
             return INVALID;
         }
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
         let instance = context::current();
         if instance.is_null() || (*instance).app_class != 2 {
             return INVALID;
         }
-        let id = (*instance).id;
+        let Some(handle) = context::handle() else {
+            return INVALID;
+        };
         let mut buffer = [MaybeUninit::uninit(); 32];
         let Some(name) = zcopy(name, &mut buffer) else {
             return INVALID;
         };
-        program_service_endpoint_register(span(name), id, flags, out, timer::tick_count())
+        program_service_endpoint_register(span(name), handle, flags, out, timer::tick_count())
     }
 }
 /// # Safety
@@ -866,26 +1087,33 @@ pub unsafe extern "C" fn r4os_rust_program_service_lifecycle(
 /// registry reference or Runtime owner survives its bounded waits. A policy
 /// service cannot synchronously stop itself/its ancestor to authorize reset.
 pub(crate) fn prepare_cpu_power_stop(timeout: u64) -> bool {
+    let deadline = stop_deadline(timeout);
     unsafe {
-        let name = b"POWERSVC";
-        refresh_name(name);
-        let Some(current) = entry(name) else {
-            return true;
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return false;
         };
-        if current.id != 0 && descends(current.id) {
+        let mut target = match refreshed_target(b"POWERSVC") {
+            Ok(t) => t,
+            Err(NOT_FOUND) => return true,
+            Err(_) => return false,
+        };
+        let Some(current) = target_entry(&target) else {
+            return false;
+        };
+        if current.id != 0 && descends(current.binding.process) {
             return false;
         }
         let mut out = c::ServiceInfo::default();
-        stop(name, &mut out, timeout) == c::service_api_result_ok
-            && (out.state == u32::from(STOPPED)
-                || out.state == u32::from(DISABLED)
-                || out.state == u32::from(FAILED))
+        stop_bound(&mut target, &mut out, deadline) == c::service_api_result_ok
+            && matches!(out.state, x if x == u32::from(STOPPED)
+                || x == u32::from(DISABLED) || x == u32::from(FAILED))
     }
 }
+
 const _: () = {
-    assert!(mem::size_of::<Entry>() == 1192);
-    assert!(mem::size_of::<Target>() == 72);
-    assert!(mem::size_of::<Reservation>() == 16);
+    assert!(mem::size_of::<Entry>() == 1216);
+    assert!(mem::size_of::<Target>() == 104);
+    assert!(mem::size_of::<Reservation>() == 48);
 };
 
 const _: () = {
@@ -900,6 +1128,7 @@ const _: () = {
     assert!(mem::offset_of!(Entry, name) == 40);
     assert!(mem::offset_of!(Entry, path) == 72);
     assert!(mem::offset_of!(Entry, args) == 1096);
+    assert!(mem::offset_of!(Entry, binding) == 1192);
     assert!(mem::offset_of!(Target, registry_generation) == 0);
     assert!(mem::offset_of!(Target, slot) == 8);
     assert!(mem::offset_of!(Target, name_len) == 16);
@@ -908,8 +1137,12 @@ const _: () = {
     assert!(mem::offset_of!(Target, state) == 32);
     assert!(mem::offset_of!(Target, reserved) == 36);
     assert!(mem::offset_of!(Target, name) == 40);
+    assert!(mem::offset_of!(Target, start_generation) == 72);
+    assert!(mem::offset_of!(Target, binding) == 80);
     assert!(mem::offset_of!(Reservation, slot) == 0);
     assert!(mem::offset_of!(Reservation, generation) == 8);
+    assert!(mem::offset_of!(Reservation, registry_generation) == 16);
+    assert!(mem::offset_of!(Reservation, binding) == 24);
 };
 
 use crate::service::{ffi as sf, registry_types as st};
@@ -932,6 +1165,7 @@ fn entry_value(v: st::Entry) -> Entry {
         name: v.name,
         path: v.path,
         args: v.args,
+        binding: v.binding,
     }
 }
 unsafe fn target_native(p: *const Target) -> st::ApiIndexTarget {
@@ -945,6 +1179,8 @@ unsafe fn target_native(p: *const Target) -> st::ApiIndexTarget {
             state: u8::try_from(t.state).unwrap(),
             name: t.name,
             name_len: t.name_len,
+            start_generation: t.start_generation,
+            binding: t.binding,
         }
     }
 }
@@ -958,6 +1194,8 @@ fn target_value(t: st::ApiIndexTarget) -> Target {
         state: u32::from(t.state),
         reserved: 0,
         name: t.name,
+        start_generation: t.start_generation,
+        binding: t.binding,
     }
 }
 unsafe fn reservation_native(p: *const Reservation) -> st::StartReservation {
@@ -965,6 +1203,7 @@ unsafe fn reservation_native(p: *const Reservation) -> st::StartReservation {
         st::StartReservation {
             slot: (*p).slot,
             generation: (*p).generation,
+            registry_generation: (*p).registry_generation,
             ..Default::default()
         }
     }
@@ -988,35 +1227,18 @@ pub(crate) unsafe fn native_service_install(
     args: Bytes,
     mode: u8,
     description: Bytes,
+    out_target: *mut Target,
 ) -> i32 {
-    unsafe { sf::r4os_rust_services_register(name, path, args, mode, description) }
-}
-
-pub(crate) unsafe fn native_service_name_mutate(
-    op: u8,
-    name: Bytes,
-    code: i32,
-    text: Bytes,
-) -> i32 {
-    let operation = match op {
-        0 => 4,
-        1 => 5,
-        2 => 6,
-        3 => 7,
-        4 => 0,
-        _ => panic!("Invalid service name change"),
+    let mut target = st::ApiIndexTarget::EMPTY;
+    let result = unsafe {
+        sf::r4os_rust_services_register(name, path, args, mode, description, &mut target)
     };
-    unsafe {
-        sf::r4os_rust_services_name(
-            operation,
-            name,
-            0,
-            0,
-            if matches!(op, 1 | 2) { code } else { 0 },
-            0,
-            if op == 2 { text } else { empty_service_bytes() },
-        )
+    if result >= 0 {
+        unsafe {
+            out_target.write(target_value(target));
+        }
     }
+    result
 }
 
 unsafe fn program_service_index(retry: bool, index: u32, out: *mut Target) -> bool {
@@ -1071,13 +1293,13 @@ unsafe fn program_service_target_mutate(
     code: i32,
     text: Bytes,
 ) -> i32 {
-    assert!(op <= 2);
+    assert!(op <= 9);
     let t = unsafe { target_native(target) };
     unsafe {
         sf::r4os_rust_services_target(
             op,
             &t,
-            if op == 0 { 0 } else { code },
+            if matches!(op, 1 | 2 | 6 | 9) { code } else { 0 },
             if op == 2 { text } else { empty_service_bytes() },
         )
     }
@@ -1097,6 +1319,10 @@ unsafe fn program_service_info(
             2 => {
                 let t = target_native(target);
                 sf::r4os_rust_services_info(1, 0, empty_service_bytes(), &t, out, ticks)
+            }
+            3 => {
+                let t = target_native(target);
+                sf::r4os_rust_services_info(4, 0, empty_service_bytes(), &t, out, ticks)
             }
             _ => panic!("Invalid service info query"),
         }
@@ -1120,15 +1346,32 @@ unsafe fn program_service_detail(
     }
 }
 
-unsafe fn program_service_begin(name: Bytes, identity: *mut Reservation, entry: *mut Entry) -> i32 {
+unsafe fn program_service_begin(
+    target: *const Target,
+    identity: *mut Reservation,
+    entry: *mut Entry,
+) -> i32 {
     let mut r = st::StartReservation::default();
-    let result =
-        unsafe { sf::r4os_rust_services_start(0, name, &mut r, 0, 0, 0, empty_service_bytes()) };
+    let target = unsafe { target_native(target) };
+    let result = unsafe {
+        sf::r4os_rust_services_start(
+            0,
+            empty_service_bytes(),
+            &mut r,
+            st::EMPTY_BINDING,
+            0,
+            0,
+            empty_service_bytes(),
+            &target,
+        )
+    };
     if result == 0 {
         unsafe {
             identity.write(Reservation {
                 slot: r.slot,
                 generation: r.generation,
+                registry_generation: r.registry_generation,
+                binding: st::EMPTY_BINDING,
             });
             entry.write(entry_value(r.entry));
         }
@@ -1136,46 +1379,51 @@ unsafe fn program_service_begin(name: Bytes, identity: *mut Reservation, entry: 
     result
 }
 
-unsafe fn program_service_complete(identity: *const Reservation, id: u32, ticks: u64) -> bool {
+pub(super) unsafe fn bind_start(
+    identity: *mut Reservation,
+    handle: c::ProgramProcessHandle,
+) -> i32 {
+    let mut r = unsafe { reservation_native(identity) };
+    unsafe {
+        observations::retain_service(handle, ptr::addr_of_mut!((*identity).binding), |binding| {
+            sf::r4os_rust_services_start(
+                1,
+                empty_service_bytes(),
+                &mut r,
+                binding,
+                timer::tick_count(),
+                0,
+                empty_service_bytes(),
+                ptr::null(),
+            ) != 0
+        })
+    }
+}
+
+unsafe fn program_service_fail(identity: *const Reservation, code: i32, text: Bytes) -> bool {
     let mut r = unsafe { reservation_native(identity) };
     unsafe {
         sf::r4os_rust_services_start(
-            1,
+            2,
             empty_service_bytes(),
             &mut r,
-            id,
-            ticks,
+            st::EMPTY_BINDING,
             0,
-            empty_service_bytes(),
+            code,
+            text,
+            ptr::null(),
         ) != 0
     }
 }
 
-unsafe fn program_service_fail(identity: *const Reservation, code: i32, text: Bytes) {
-    let mut r = unsafe { reservation_native(identity) };
-    unsafe {
-        sf::r4os_rust_services_start(2, empty_service_bytes(), &mut r, 0, 0, code, text);
-    }
-}
-
-unsafe fn program_service_cancel(name: Bytes, generation: u64) {
-    unsafe {
-        sf::r4os_rust_services_name(9, name, 0, 0, 0, generation, empty_service_bytes());
-    }
-}
-
-unsafe fn program_service_mode(name: Bytes, mode: u8) -> i32 {
-    unsafe { sf::r4os_rust_services_name(8, name, mode, 0, 0, 0, empty_service_bytes()) }
-}
-
 unsafe fn program_service_endpoint_register(
     name: Bytes,
-    id: u32,
+    process: c::ProgramProcessHandle,
     flags: u32,
     out: *mut c::ServiceInfo,
     ticks: u64,
 ) -> i32 {
-    unsafe { sf::r4os_rust_services_endpoint_register(name, id, flags, out, ticks) }
+    unsafe { sf::r4os_rust_services_endpoint_register(name, process, flags, out, ticks) }
 }
 
 unsafe fn program_service_endpoint_control(op: u8, handle: u32, timeout: u64) -> i32 {

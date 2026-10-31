@@ -24,8 +24,9 @@ pub unsafe extern "C" fn r4os_rust_services_register(
     args: Bytes,
     mode: u8,
     description: Bytes,
+    out_target: *mut ApiIndexTarget,
 ) -> i32 {
-    unsafe { api::register(name, path, args, mode, description) }
+    unsafe { api::register(name, path, args, mode, description, out_target) }
 }
 /// # Safety
 /// Original name/text lifetimes include lifecycle contention waits. No borrowed
@@ -84,6 +85,15 @@ pub unsafe extern "C" fn r4os_rust_services_target(
             1 => api::change(key, Change::Finish(false, code, text)),
             2 => api::change(key, Change::Finish(true, code, text)),
             3 => i32::from(api::note_instance(&*target)),
+            4 => api::change(key, Change::ClearBinding),
+            5 => api::change(key, Change::RestartCount),
+            6 => api::change(
+                key,
+                Change::Mode(u8::try_from(code).expect("service start mode")),
+            ),
+            7 => api::change(key, Change::Unregister),
+            8 => api::change(key, Change::CancelStart),
+            9 => api::change(key, Change::Complete(code)),
             _ => panic!("Invalid private service target operation"),
         }
     }
@@ -92,26 +102,38 @@ pub unsafe extern "C" fn r4os_rust_services_target(
 /// Reservation/output and text retain their original caller lifetime. Exact
 /// slot/start-generation validation precedes completion or failure mutation.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn r4os_rust_services_start(
     operation: u8,
     name: Bytes,
     reservation: *mut StartReservation,
-    id: u32,
+    binding: c::ProgramObservationHandle,
     ticks: u64,
     code: i32,
     text: Bytes,
+    target: *const ApiIndexTarget,
 ) -> i32 {
     unsafe {
         match operation {
-            0 => api::change(Key::Name(name), Change::Begin(reservation)),
-            1 => i32::from(api::complete_start(reservation, id, ticks)),
-            2 => {
-                api::fail_start(reservation, code, text);
-                0
-            }
+            0 => api::change(
+                if target.is_null() {
+                    Key::Name(name)
+                } else {
+                    Key::Target(target.read())
+                },
+                Change::Begin(reservation),
+            ),
+            1 => i32::from(api::complete_start(reservation, binding, ticks)),
+            2 => i32::from(api::fail_start(reservation, code, text)),
             _ => panic!("Invalid private service start operation"),
         }
     }
+}
+/// # Safety
+/// Resident name/output. One exact owner selection, without indexed-enumeration
+/// accounting; admission failure is BUSY and cannot be mistaken for absence.
+pub(crate) unsafe fn service_target_by_name(name: Bytes, out: *mut ApiIndexTarget) -> i32 {
+    unsafe { api::target_by_name(name, out) }
 }
 /// # Safety
 /// Selected output is exclusive resident C storage. Optional input target/name
@@ -187,12 +209,12 @@ pub unsafe extern "C" fn r4os_rust_services_detail(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_services_endpoint_register(
     name: Bytes,
-    id: u32,
+    process: c::ProgramProcessHandle,
     flags: u32,
     out: *mut c::ServiceInfo,
     now: u64,
 ) -> i32 {
-    unsafe { api::register_endpoint(name, id, flags, out, now) }
+    unsafe { api::register_endpoint(name, process, flags, out, now) }
 }
 /// # Safety
 /// Handle/request identity follows the original owner contract; waits keep no
