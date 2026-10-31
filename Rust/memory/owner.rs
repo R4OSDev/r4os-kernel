@@ -125,6 +125,22 @@ pub fn prepare_stack() {
     // A synchronous stack-growth fault may have changed resident metadata.
     core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
+// These observer writes run only after the actual state CAS, during nested
+// ownership, or before the final Release. Passive readers remain atomic.
+// order_violations also has unadmitted writers and keeps its genuine RMWs.
+#[inline]
+fn add_owned(counter: &AtomicU64, amount: u64) {
+    counter.store(
+        counter.load(Ordering::Relaxed).wrapping_add(amount),
+        Ordering::Relaxed,
+    );
+}
+#[inline]
+fn max_owned(counter: &AtomicU64, value: u64) {
+    if value > counter.load(Ordering::Relaxed) {
+        counter.store(value, Ordering::Relaxed);
+    }
+}
 impl Lock {
     /// Native owner storage, matching the original zeroed C lock initializer.
     pub(crate) const fn new(class: u8, rank: u8) -> Self {
@@ -156,8 +172,8 @@ impl Lock {
         let depth = unsafe { self.depth[slot].get().read() };
         if self.owner_cpu_plus_one.load(Ordering::Acquire) == owner && depth != 0 {
             unsafe { self.depth[slot].get().write(depth.saturating_add(1)) };
-            self.nested_acquisitions.fetch_add(1, Ordering::Relaxed);
-            self.acquisitions.fetch_add(1, Ordering::Relaxed);
+            add_owned(&self.nested_acquisitions, 1);
+            add_owned(&self.acquisitions, 1);
             return Token {
                 flags: saved,
                 cpu_index: slot as u32,
@@ -199,13 +215,13 @@ impl Lock {
             }
         }
         if collided {
-            self.collisions.fetch_add(1, Ordering::Relaxed);
+            add_owned(&self.collisions, 1);
         }
         if config::ENABLE_METRICS && collided {
-            self.wait_spins.fetch_add(spins, Ordering::Relaxed);
-            self.max_wait_spins.fetch_max(spins, Ordering::Relaxed);
+            add_owned(&self.wait_spins, spins);
+            max_owned(&self.max_wait_spins, spins);
         }
-        self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        add_owned(&self.acquisitions, 1);
         self.owner_cpu_plus_one.store(owner, Ordering::Release);
         unsafe { self.depth[slot].get().write(1) };
         if config::ENABLE_METRICS {
@@ -231,8 +247,8 @@ impl Lock {
         let depth = unsafe { self.depth[slot].get().read() };
         if self.owner_cpu_plus_one.load(Ordering::Acquire) == owner && depth != 0 {
             unsafe { self.depth[slot].get().write(depth.saturating_add(1)) };
-            self.nested_acquisitions.fetch_add(1, Ordering::Relaxed);
-            self.acquisitions.fetch_add(1, Ordering::Relaxed);
+            add_owned(&self.nested_acquisitions, 1);
+            add_owned(&self.acquisitions, 1);
             return Some(Token {
                 flags: saved,
                 cpu_index: slot as u32,
@@ -249,7 +265,7 @@ impl Lock {
             restore(saved);
             return None;
         }
-        self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        add_owned(&self.acquisitions, 1);
         self.owner_cpu_plus_one.store(owner, Ordering::Release);
         unsafe { self.depth[slot].get().write(1) };
         if config::ENABLE_METRICS {
@@ -279,8 +295,8 @@ impl Lock {
         if depth == 1 {
             if config::ENABLE_METRICS {
                 let elapsed = tsc().wrapping_sub(unsafe { self.acquired_tsc[slot].get().read() });
-                self.hold_cycles.fetch_add(elapsed, Ordering::Relaxed);
-                self.max_hold_cycles.fetch_max(elapsed, Ordering::Relaxed);
+                add_owned(&self.hold_cycles, elapsed);
+                max_owned(&self.max_hold_cycles, elapsed);
             }
             HELD_RANK[slot].store(token.previous_rank, Ordering::Relaxed);
             self.owner_cpu_plus_one.store(0, Ordering::Release);

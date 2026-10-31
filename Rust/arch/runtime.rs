@@ -12,7 +12,13 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOCK: AtomicU8 = AtomicU8::new(0);
 static OWNER_CPU_PLUS_ONE: AtomicU8 = AtomicU8::new(0);
 static ACQUIRED_TSC: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-static ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+// Each dense CPU slot has one writer with local IF=0 at the exact original
+// admission-count point. Readers retain atomic storage, including offline
+// slots. Padding separates the normal writers without changing CpuLocal.
+#[repr(align(64))]
+struct AcquisitionCount(AtomicU64);
+static ACQUISITIONS: [AcquisitionCount; MAX_CPUS] =
+    [const { AcquisitionCount(AtomicU64::new(0)) }; MAX_CPUS];
 static NESTED: AtomicU64 = AtomicU64::new(0);
 static COLLISIONS: AtomicU64 = AtomicU64::new(0);
 static CPU_COLLISIONS: AtomicU64 = AtomicU64::new(0);
@@ -85,7 +91,7 @@ pub(crate) fn save_local() -> u64 {
 // reaches zero during a switch. The only reset precedes AP startup. Passive
 // snapshots still use atomic loads, so keep atomic storage but avoid a second
 // locked read/modify/write while admission already excludes other writers.
-// ACQUISITIONS is deliberately excluded: contenders update it before LOCK.
+// ACQUISITIONS has separate CPU-local writer admission before LOCK below.
 #[inline]
 fn add_owned(counter: &AtomicU64, amount: u64) {
     counter.store(
@@ -99,6 +105,17 @@ fn max_owned(counter: &AtomicU64, value: u64) {
         counter.store(value, Ordering::Relaxed);
     }
 }
+/// Local IF=0 excludes another returning writer on this CPU. Blocking
+/// admission records here before any interrupt-enabled contention window;
+/// try admission calls it only after success. No callback or reschedule.
+#[inline]
+fn record_acquisition(cpu: usize) {
+    let counter = &ACQUISITIONS[cpu].0;
+    counter.store(
+        counter.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+}
 fn acquire(saved: u64) {
     if !enabled() {
         return;
@@ -106,7 +123,7 @@ fn acquire(saved: u64) {
     let cpu = current_cpu();
     let slot = cpu as usize;
     let depth = depth();
-    ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+    record_acquisition(slot);
     // SAFETY: this raw slot belongs to the current CPU with IF=0. TLB IPIs
     // may run while contending but never mutate runtime depth or switch tasks.
     // No Rust reference survives a callback, IRQ or eventual context switch.
@@ -207,8 +224,12 @@ fn enable_runtime() {
     for value in &ACQUIRED_TSC {
         value.store(0, Ordering::Relaxed);
     }
+    // The only reset precedes AP publication; CPU lifecycle never clears an
+    // observation slot. Passive readers continue to include every slot.
+    for value in &ACQUISITIONS {
+        value.0.store(0, Ordering::Relaxed);
+    }
     for value in [
-        &ACQUISITIONS,
         &NESTED,
         &COLLISIONS,
         &CPU_COLLISIONS,
@@ -281,7 +302,7 @@ impl RuntimeGuard {
                 }
                 unsafe { pointer.write(1) };
             }
-            ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+            record_acquisition(cpu as usize);
         }
         Some(Self {
             flags: saved,
@@ -345,7 +366,11 @@ pub extern "C" fn r4os_rust_runtime_control(operation: u8, saved: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_runtime_stats(output: *mut Stats) {
     let value = Stats {
-        acquisitions: ACQUISITIONS.load(Ordering::Relaxed),
+        // A passive field snapshot, not a cross-CPU transaction. This cold
+        // projection pays for all slots, including offline CPU observations.
+        acquisitions: ACQUISITIONS.iter().fold(0u64, |sum, counter| {
+            sum.wrapping_add(counter.0.load(Ordering::Relaxed))
+        }),
         nested_acquisitions: NESTED.load(Ordering::Relaxed),
         collisions: COLLISIONS.load(Ordering::Relaxed),
         cpu_collisions: CPU_COLLISIONS.load(Ordering::Relaxed),
