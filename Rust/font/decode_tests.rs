@@ -28,6 +28,46 @@ fn cache(bytes: &[u8]) -> Box<CachedFont> {
 }
 
 #[test]
+fn unicode82_endash_coverage_and_missing_glyph_are_only_rendering_decisions() {
+    static EMPTY: CatalogState = CatalogState::EMPTY;
+    let stock = font("TERMINAL8.R4F");
+    let capable = include_bytes!("../../Tests/Fixture/Unicode82/Z82EN.R4F");
+    for (bytes, has_endash) in [(&stock[..], false), (&capable[..], true)] {
+        let mut state = Box::<CatalogState>::new_uninit();
+        unsafe { core::ptr::copy_nonoverlapping(&EMPTY, state.as_mut_ptr(), 1) };
+        let mut state = unsafe { state.assume_init() };
+        let mut storage = Box::<CachedFont>::new_uninit();
+        state.cached_fonts = storage.as_mut_ptr();
+        state.cached_fonts_len = 1;
+        assert!(state.register(b"/R4OS/FONTS/UNICODE82.R4F", bytes));
+        let cached = unsafe { storage.assume_init() };
+        assert_eq!(
+            indexed_id(&cached.index, 0x2013, None).is_some(),
+            has_endash
+        );
+        assert!(indexed_id(&cached.index, u32::from(b'-'), None).is_some());
+        assert!(indexed_id(&cached.index, 0xe4, None).is_some());
+        let glyph = state.glyph_bitmap_for_font(1, 0x2013);
+        assert_eq!(glyph.fallback, !has_endash);
+        for row in 0..8 {
+            let expected = if has_endash {
+                if row == 3 { 0x7e } else { 0 }
+            } else {
+                super::super::builtin::row_mask(u32::from(b'?'), row)
+            };
+            assert_eq!(glyph.rows[row as usize], expected);
+            for col in 0..8 {
+                assert_eq!(
+                    state.glyph_pixel_for_font(1, 0x2013, row, col),
+                    expected & (1 << col) != 0
+                );
+            }
+        }
+        assert!(state.glyph_bitmap_for_font(1, 0x10fffd).fallback);
+    }
+}
+
+#[test]
 fn all_stock_faces_load_real_maps_and_bitmap_rows() {
     let mut count = 0;
     for file in fs::read_dir(assets()).unwrap() {
