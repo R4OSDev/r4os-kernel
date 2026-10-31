@@ -1,4 +1,5 @@
-//! Derived VM admission totals. The VM range owner publishes every delta;
+//! Derived VM admission totals and resident high-water accounting.
+//! The VM range owner publishes every delta;
 //! ranges remain authoritative. No resource, reservation or I/O lives here.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -11,6 +12,7 @@ pub(crate) struct Usage {
 pub(super) struct Contribution {
     pub usage: Usage,
     pub application: Option<u64>,
+    pub process: Option<u64>,
     pub pending_resident: u64,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -48,16 +50,21 @@ struct Entry {
     owner: u64,
     ranges: usize,
     bytes: Total,
+    resident: u128,
+    peak_resident: u128,
 }
 impl Entry {
     const EMPTY: Self = Self {
         owner: 0,
         ranges: 0,
         bytes: Total::ZERO,
+        resident: 0,
+        peak_resident: 0,
     };
 }
 pub(super) struct Ledger<const N: usize> {
     bytes: Total,
+    peak_resident: u128,
     applications: [Entry; N],
 }
 impl<const N: usize> Ledger<N> {
@@ -65,11 +72,13 @@ impl<const N: usize> Ledger<N> {
         assert!(N.is_power_of_two());
         Self {
             bytes: Total::ZERO,
+            peak_resident: 0,
             applications: [Entry::EMPTY; N],
         }
     };
     pub fn reset(&mut self) {
         self.bytes = Total::ZERO;
+        self.peak_resident = 0;
         // Initialize resident storage in place, without an N-entry stack value.
         self.applications.fill(Entry::EMPTY);
     }
@@ -90,7 +99,15 @@ impl<const N: usize> Ledger<N> {
         }
         None
     }
-    fn insert(&mut self, owner: u64, usage: Usage, pending: u64) {
+    fn application_contribution(c: Contribution) -> (Usage, u64) {
+        if c.application.is_some() {
+            (c.usage, c.pending_resident)
+        } else {
+            (Usage::default(), 0)
+        }
+    }
+    fn insert(&mut self, owner: u64, contribution: Contribution) {
+        let (usage, pending) = Self::application_contribution(contribution);
         let home = Self::home(owner);
         for distance in 0..N {
             let entry = &mut self.applications[(home + distance) & (N - 1)];
@@ -99,23 +116,27 @@ impl<const N: usize> Ledger<N> {
                 entry.ranges += 1;
                 entry.bytes.replace(Usage::default(), usage);
                 entry.bytes.pending_replace(0, pending);
+                entry.resident += u128::from(contribution.usage.resident);
+                entry.peak_resident = entry.peak_resident.max(entry.resident);
                 return;
             }
         }
-        // At most one distinct application key per live range. A range slot
+        // At most one distinct process key per live range. A range slot
         // must be available before reserve can publish another contribution.
         unreachable!("VM budget keys exceed live range capacity");
     }
-    fn remove(&mut self, owner: u64, usage: Usage, pending: u64) {
+    fn remove(&mut self, owner: u64, contribution: Contribution) {
+        let (usage, pending) = Self::application_contribution(contribution);
         let at = self.find(owner).expect("published VM budget owner");
         let entry = &mut self.applications[at];
         entry.bytes.replace(usage, Usage::default());
         entry.bytes.pending_replace(pending, 0);
+        entry.resident -= u128::from(contribution.usage.resident);
         entry.ranges -= 1;
         if entry.ranges != 0 {
             return;
         }
-        assert!(entry.bytes == Total::ZERO);
+        assert!(entry.bytes == Total::ZERO && entry.resident == 0);
         self.applications[at] = Entry::EMPTY;
         let mut hole = at;
         // Close the probe cluster instead of accumulating tombstones over
@@ -141,22 +162,25 @@ impl<const N: usize> Ledger<N> {
         self.bytes.replace(before.usage, after.usage);
         self.bytes
             .pending_replace(before.pending_resident, after.pending_resident);
-        match (before.application, after.application) {
+        self.peak_resident = self.peak_resident.max(self.bytes.0[2]);
+        match (before.process, after.process) {
             (Some(old), Some(new)) if old == new => {
                 let at = self.find(old).expect("published VM budget owner");
-                self.applications[at]
-                    .bytes
-                    .replace(before.usage, after.usage);
-                self.applications[at]
-                    .bytes
-                    .pending_replace(before.pending_resident, after.pending_resident);
+                let (old_usage, old_pending) = Self::application_contribution(before);
+                let (new_usage, new_pending) = Self::application_contribution(after);
+                let entry = &mut self.applications[at];
+                entry.bytes.replace(old_usage, new_usage);
+                entry.bytes.pending_replace(old_pending, new_pending);
+                entry.resident = entry.resident - u128::from(before.usage.resident)
+                    + u128::from(after.usage.resident);
+                entry.peak_resident = entry.peak_resident.max(entry.resident);
             }
             (old, new) => {
                 if let Some(owner) = old {
-                    self.remove(owner, before.usage, before.pending_resident);
+                    self.remove(owner, before);
                 }
                 if let Some(owner) = new {
-                    self.insert(owner, after.usage, after.pending_resident);
+                    self.insert(owner, after);
                 }
             }
         }
@@ -169,6 +193,20 @@ impl<const N: usize> Ledger<N> {
             self.applications[at].bytes.admitted_usage()
         })
     }
+    fn peak(value: u128) -> (u64, bool) {
+        (
+            value.min(u128::from(u64::MAX)) as u64,
+            value > u128::from(u64::MAX),
+        )
+    }
+    pub fn global_peak(&self) -> (u64, bool) {
+        Self::peak(self.peak_resident)
+    }
+    pub fn process_peak(&self, owner: u64) -> (u64, bool) {
+        self.find(owner).map_or((0, false), |at| {
+            Self::peak(self.applications[at].peak_resident)
+        })
+    }
     /// Existing explicit diagnostics may scan ranges. This is never used by
     /// admission and keeps verification scratch independent of range capacity.
     pub fn matches(&self, range: impl Fn(usize) -> Contribution) -> bool {
@@ -177,18 +215,18 @@ impl<const N: usize> Ledger<N> {
             let contribution = range(slot);
             global.replace(Usage::default(), contribution.usage);
             global.pending_replace(0, contribution.pending_resident);
-            if let Some(owner) = contribution.application
+            if let Some(owner) = contribution.process
                 && self.find(owner).is_none()
             {
                 return false;
             }
         }
-        if self.bytes != global {
+        if self.bytes != global || self.peak_resident < global.0[2] {
             return false;
         }
         for (at, entry) in self.applications.iter().enumerate() {
             if entry.ranges == 0 {
-                if entry.bytes != Total::ZERO {
+                if entry.bytes != Total::ZERO || entry.resident != 0 || entry.peak_resident != 0 {
                     return false;
                 }
                 continue;
@@ -198,15 +236,23 @@ impl<const N: usize> Ledger<N> {
             }
             let mut bytes = Total::ZERO;
             let mut ranges = 0;
+            let mut resident = 0;
             for slot in 0..N {
                 let contribution = range(slot);
                 if contribution.application == Some(entry.owner) {
                     bytes.replace(Usage::default(), contribution.usage);
                     bytes.pending_replace(0, contribution.pending_resident);
+                }
+                if contribution.process == Some(entry.owner) {
                     ranges += 1;
+                    resident += u128::from(contribution.usage.resident);
                 }
             }
-            if entry.bytes != bytes || entry.ranges != ranges {
+            if entry.bytes != bytes
+                || entry.ranges != ranges
+                || entry.resident != resident
+                || entry.peak_resident < resident
+            {
                 return false;
             }
         }

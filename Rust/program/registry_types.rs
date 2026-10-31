@@ -171,6 +171,7 @@ pub struct ProgramCompletionNode {
     pub exit_reason: u8,
     pub observation_refs: u32,
     pub text_info: contract::ConsoleTextInfo,
+    pub memory_peak_resident_bytes: u64,
 }
 
 /// One independent observer binding; its target is completion storage only.
@@ -339,7 +340,8 @@ const _: () = {
     assert!(core::mem::offset_of!(ProgramCompletionNode, role) == 170);
     assert!(core::mem::offset_of!(ProgramCompletionNode, exit_reason) == 171);
     assert!(core::mem::offset_of!(ProgramCompletionNode, text_info) == 176);
-    assert!(core::mem::size_of::<ProgramCompletionNode>() == 208);
+    assert!(core::mem::offset_of!(ProgramCompletionNode, memory_peak_resident_bytes) == 208);
+    assert!(core::mem::size_of::<ProgramCompletionNode>() == 216);
     assert!(core::mem::offset_of!(ProgramCompletionNode, observation_refs) == 172);
     assert!(core::mem::size_of::<ProgramObservationNode>() == 56);
     assert!(core::mem::align_of::<ProgramCompletionNode>() == 8);

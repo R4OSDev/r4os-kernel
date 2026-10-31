@@ -144,9 +144,11 @@ fn stats() -> Stats {
             range.failed_faults,
             &mut stats.overflow,
         );
-        stats.peak_resident_bytes = stats.peak_resident_bytes.max(range.peak_resident_bytes);
         add(&mut stats.guard_bytes, range.guard_len, &mut stats.overflow);
     }
+    let (peak, overflow) = vm_ranges::global_resident_peak();
+    stats.peak_resident_bytes = peak;
+    stats.overflow |= overflow;
     for window in 0..9 {
         let (base, len) = largest(window);
         if len > stats.largest_free_virtual_len {
@@ -164,11 +166,18 @@ fn stats() -> Stats {
         .saturating_sub(APP_SYSTEM_RESERVE_FRAMES);
     stats
 }
-fn owner_stats(owner: u8, owner_id: u64, window: u8, kind: u8) -> OwnerStats {
+fn owner_stats_with_stack(
+    owner: u8,
+    owner_id: u64,
+    window: u8,
+    kind: u8,
+    main_stack: u32,
+) -> (OwnerStats, [u64; 2]) {
     let _owner = Guard::acquire(5);
     let mut stats = OwnerStats::default();
+    let mut stack = [0; 2];
     if !vm_transactions::r4os_rust_vm_initialized() {
-        return stats;
+        return (stats, stack);
     }
     for slot in 0..vm_ranges::RANGES {
         let range = vm_ranges::read(slot);
@@ -180,6 +189,9 @@ fn owner_stats(owner: u8, owner_id: u64, window: u8, kind: u8) -> OwnerStats {
         }
         if kind != u8::MAX && range.kind != kind {
             continue;
+        }
+        if main_stack != 0 && range.id == main_stack {
+            stack = [range.len, range.committed_bytes];
         }
         stats.active_ranges += 1;
         add(&mut stats.reserved_bytes, range.len, &mut stats.overflow);
@@ -205,7 +217,33 @@ fn owner_stats(owner: u8, owner_id: u64, window: u8, kind: u8) -> OwnerStats {
         );
         stats.peak_resident_bytes = stats.peak_resident_bytes.max(range.peak_resident_bytes);
     }
-    stats
+    if owner == crate::contract::memory_owner_r4x_instance && window == u8::MAX && kind == u8::MAX {
+        let (peak, overflow) = vm_ranges::process_resident_peak(owner_id);
+        stats.peak_resident_bytes = peak;
+        stats.overflow |= overflow;
+    }
+    (stats, stack)
+}
+fn owner_stats(owner: u8, owner_id: u64, window: u8, kind: u8) -> OwnerStats {
+    owner_stats_with_stack(owner, owner_id, window, kind, 0).0
+}
+/// Process totals and its main-stack subset share the same VM-owner snapshot.
+pub(crate) fn process_stats(owner: u64, main_stack: u32) -> (OwnerStats, [u64; 2]) {
+    owner_stats_with_stack(
+        crate::contract::memory_owner_r4x_instance,
+        owner,
+        u8::MAX,
+        u8::MAX,
+        main_stack,
+    )
+}
+/// Narrow lifetime-retention view; no range walk or budget admission changes.
+pub(crate) fn process_resident_peak(owner: u64) -> u64 {
+    let _owner = Guard::acquire(5);
+    if !vm_transactions::r4os_rust_vm_initialized() {
+        return 0;
+    }
+    vm_ranges::process_resident_peak(owner).0
 }
 /// # Safety
 /// output is exclusive live C stats storage.

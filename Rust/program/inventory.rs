@@ -199,7 +199,11 @@ unsafe fn scan(after: u64, items: *mut Selection, len: usize, diagnostics: bool)
                                 version: u32::from(contract::program_inventory_version),
                                 size: mem::size_of::<Snapshot>() as u32,
                                 handle: h,
-                                info: info::completion_info(node),
+                                info: if diagnostics {
+                                    info::completion_info(node)
+                                } else {
+                                    info::completion_lifecycle_info(node)
+                                },
                                 state_generation: h.generation,
                             },
                         );
@@ -230,7 +234,11 @@ unsafe fn scan(after: u64, items: *mut Selection, len: usize, diagnostics: bool)
                             version: u32::from(contract::program_inventory_version),
                             size: mem::size_of::<Snapshot>() as u32,
                             handle: h,
-                            info: info::completion_info(node),
+                            info: if diagnostics {
+                                info::completion_info(node)
+                            } else {
+                                info::completion_lifecycle_info(node)
+                            },
                             state_generation: h.generation,
                         },
                     );

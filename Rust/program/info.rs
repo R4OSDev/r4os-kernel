@@ -84,7 +84,10 @@ pub(super) unsafe fn lifecycle_info(instance: *const ProgramInstance) -> Info {
 pub(super) unsafe fn instance_info(instance: *const ProgramInstance) -> Info {
     unsafe {
         let mut out = lifecycle_info(instance);
-        let usage = vm_stats(instance, false);
+        let (usage, stack) = vm_query::process_stats(
+            u64::from((*instance).id),
+            (*instance).program_stack_range_id,
+        );
         out.memory_profile = (*instance).memory_profile;
         out.reserved0 = [0; 3];
         out.memory_reserved_limit = (*instance).memory_limits.vm_reserve_limit;
@@ -94,13 +97,13 @@ pub(super) unsafe fn instance_info(instance: *const ProgramInstance) -> Info {
         out.memory_committed_bytes = usage.committed_bytes;
         out.memory_resident_bytes = usage.resident_bytes;
         out.memory_peak_resident_bytes = usage.peak_resident_bytes;
-        out.stack_reserved_bytes = (*instance).program_stack_reserve_size;
-        out.stack_committed_bytes = (*instance).program_stack_committed_size;
+        out.stack_reserved_bytes = stack[0];
+        out.stack_committed_bytes = stack[1];
         out.memory_tag = (*instance).memory_tag;
         out
     }
 }
-pub(super) unsafe fn completion_info(node: *const ProgramCompletionNode) -> Info {
+pub(super) unsafe fn completion_lifecycle_info(node: *const ProgramCompletionNode) -> Info {
     unsafe {
         Info {
             id: (*node).handle.instance_id,
@@ -112,6 +115,53 @@ pub(super) unsafe fn completion_info(node: *const ProgramCompletionNode) -> Info
             ..Info::default()
         }
     }
+}
+pub(super) unsafe fn completion_info(node: *const ProgramCompletionNode) -> Info {
+    unsafe {
+        let mut info = completion_lifecycle_info(node);
+        info.memory_peak_resident_bytes = (*node).memory_peak_resident_bytes;
+        // Registry admission retains the exact node. An attached completion
+        // keeps its public ID occupied, so the VM key cannot name a newer
+        // process generation. Detached nodes use only their retained receipt.
+        if (*node).slot_attached {
+            info.memory_peak_resident_bytes =
+                info.memory_peak_resident_bytes
+                    .max(vm_query::process_resident_peak(u64::from(
+                        (*node).handle.instance_id,
+                    )));
+        }
+        info
+    }
+}
+/// The exact retirement worker snapshots history before any image/stack or
+/// remaining-owner release can destroy the last VM accounting entry.
+pub(super) unsafe fn retain_resident_peak(
+    slot: *mut ProgramRegistrySlot,
+    handle: Handle,
+    node: *mut ProgramCompletionNode,
+) -> bool {
+    let peak = vm_query::process_resident_peak(u64::from(handle.instance_id));
+    if !registry::lock() {
+        return false;
+    }
+    let valid = unsafe {
+        let current = registry::lookup_handle(handle, true);
+        !current.is_null()
+            && current == slot
+            && (*current).state == 6
+            && (*current).retire_in_progress
+            && (*current).pin_count == 0
+            && (*current).retire_phase == 4
+            && (*current).completion == node
+            && registry::equal((*node).handle, handle)
+    };
+    if valid {
+        unsafe {
+            (*node).memory_peak_resident_bytes = (*node).memory_peak_resident_bytes.max(peak);
+        }
+    }
+    registry::unlock();
+    valid
 }
 unsafe fn by_id(id: u32) -> *mut ProgramInstance {
     if !registry::lock() {

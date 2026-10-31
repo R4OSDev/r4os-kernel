@@ -231,6 +231,9 @@ unsafe fn reap_slot(slot: *mut ProgramRegistrySlot, notify: bool) -> u8 {
                 }
                 4 => {
                     program_reap_report(report, 5);
+                    if !super::info::retain_resident_peak(slot, handle, node) {
+                        return deferred(handle, retire_phase::pin_wait(handle), notify);
+                    }
                     if !(*slot).retire_image_stack_released {
                         if !action(12, handle, slot, node, report) {
                             let instance = ptr::addr_of!((*slot).instance);

@@ -139,6 +139,7 @@ fn contribution(range: &Range) -> vm_budget::Contribution {
             && range.window == contract::memory_window_r4x_vm
             && range.kind == contract::memory_kind_virtual_range)
             .then_some(range.owner_id),
+        process: (range.owner == contract::memory_owner_r4x_instance).then_some(range.owner_id),
         pending_resident: u64::from(range.pager_in_count) * 4096,
     }
 }
@@ -162,6 +163,12 @@ pub(super) fn budget_global() -> vm_budget::Usage {
 }
 pub(super) fn budget_application(owner: u64) -> vm_budget::Usage {
     unsafe { (&*BUDGETS.0.get()).application(owner) }
+}
+pub(super) fn global_resident_peak() -> (u64, bool) {
+    unsafe { (&*BUDGETS.0.get()).global_peak() }
+}
+pub(super) fn process_resident_peak(owner: u64) -> (u64, bool) {
+    unsafe { (&*BUDGETS.0.get()).process_peak(owner) }
 }
 pub(super) fn budget_invariant() -> bool {
     unsafe { (&*BUDGETS.0.get()).matches(|index| contribution(&read(index))) }
