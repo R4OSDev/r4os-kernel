@@ -98,6 +98,12 @@ pub struct RsdpResponse {
     pub address: u64,
 }
 #[repr(C)]
+pub struct SmbiosResponse {
+    pub revision: u64,
+    pub entry_32: u64,
+    pub entry_64: u64,
+}
+#[repr(C)]
 pub struct HhdmResponse {
     pub revision: u64,
     pub offset: u64,
@@ -144,6 +150,11 @@ pub static mut rsdp_request: Request<RsdpResponse> =
 #[used]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".limine_reqs_m_data")]
+pub static mut smbios_request: Request<SmbiosResponse> =
+    Request::new(0x9e9046f11e095391, 0xaa4a520fefbde5ee);
+#[used]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".limine_reqs_m_data")]
 pub static mut hhdm_request: Request<HhdmResponse> =
     Request::new(0x48dcf1cb8ad2b852, 0x63984e959a98244b);
 
@@ -166,6 +177,7 @@ pub unsafe fn keep_requests() {
         let _ = read_volatile(addr_of!(module_request).cast::<u64>());
         let _ = read_volatile(addr_of!(executable_file_request).cast::<u64>());
         let _ = read_volatile(addr_of!(rsdp_request).cast::<u64>());
+        let _ = read_volatile(addr_of!(smbios_request).cast::<u64>());
         let _ = read_volatile(addr_of!(hhdm_request).cast::<u64>());
         let _ = read_volatile(addr_of!(requests_end_marker).cast::<u64>());
     }
@@ -189,6 +201,7 @@ pub extern "C" fn r4os_rust_limine_response(kind: u32) -> *const core::ffi::c_vo
             3 => read_volatile(addr_of_mut!(executable_file_request.response)).cast(),
             4 => read_volatile(addr_of_mut!(rsdp_request.response)).cast(),
             5 => read_volatile(addr_of_mut!(hhdm_request.response)).cast(),
+            6 => read_volatile(addr_of_mut!(smbios_request.response)).cast(),
             _ => core::ptr::null(),
         }
     }

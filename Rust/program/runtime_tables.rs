@@ -1197,6 +1197,8 @@ fn configure_dev() {
     const CPU_ACCELERATION_WORK: c::R4DevFns::cpu_acceleration_work =
         r4dev::cpu_capabilities::acceleration_work;
     const FPU_OBSERVATION: c::R4DevFns::fpu_observation = r4dev::fpu_observation::call;
+    const FIRMWARE_SYSTEM_UUID: c::R4DevFns::firmware_system_uuid =
+        r4dev::devices::r4os_rust_r4dev_firmware_system_uuid;
     r4dev::providers::install();
     let value = c::R4XStartR4Dev {
         serial_count: super::serial_api::count as c::R4DevFns::serial_count as *const () as usize,
@@ -1322,13 +1324,14 @@ fn configure_dev() {
         cpu_acceleration_info: CPU_ACCELERATION_INFO as *const () as usize,
         cpu_acceleration_work: CPU_ACCELERATION_WORK as *const () as usize,
         fpu_observation: FPU_OBSERVATION as *const () as usize,
+        firmware_system_uuid: FIRMWARE_SYSTEM_UUID as *const () as usize,
         ..Default::default()
     };
     DEV.configure(value);
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 728);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 736);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_microcode_info) == 672);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_pmu_info) == 680);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_pmu_measure) == 688);
@@ -1336,6 +1339,8 @@ const _: () = {
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_acceleration_info) == 704);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_acceleration_work) == 712);
     assert!(mem::offset_of!(c::R4XStartR4Dev, fpu_observation) == 720);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, firmware_system_uuid) == 728);
+    assert!(mem::size_of::<c::FirmwareSystemUuidInfo>() == 32);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_machine_info) == 656);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_machine_bank) == 664);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_idle_info) == 648);

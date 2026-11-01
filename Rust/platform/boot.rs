@@ -1,7 +1,7 @@
 //! Existing platform boot order and its immutable cached ACPI/PCI views.
 //! The BSP publishes completion only after final mappings and enumeration;
 //! no orchestration-state borrow spans a memory/diagnostic callback.
-use super::{acpi, pci_inventory, pcie};
+use super::{acpi, pci_inventory, pcie, smbios};
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, Ordering},
@@ -30,6 +30,7 @@ pub fn init() -> bool {
         return step(3, core::ptr::null());
     }
     let info = acpi::inspect();
+    smbios::inspect();
     pcie::configure(
         info.mcfg_base,
         info.mcfg_segment,

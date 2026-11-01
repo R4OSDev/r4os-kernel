@@ -31,6 +31,7 @@ pub mod pci;
 pub mod pci_inventory;
 pub mod pci_scan;
 pub mod pcie;
+pub(crate) mod smbios;
 pub mod time;
 pub mod timer;
 pub(crate) mod timer_arm;

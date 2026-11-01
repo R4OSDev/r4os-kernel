@@ -1,7 +1,7 @@
 //! Passive cached device/hardware inventory. No new scans, logging or I/O.
 use crate::{
     contract as c,
-    platform::{acpi, cpu, device_inventory as inventory, irq, pci_inventory},
+    platform::{acpi, cpu, device_inventory as inventory, irq, pci_inventory, smbios},
     storage::{block_diagnostics, block_registry},
     usb::{core as usb, host_controller as host},
 };
@@ -26,6 +26,29 @@ pub unsafe extern "C" fn r4os_rust_r4dev_device_inventory_record(
 fn has_bus(bus: u8) -> bool {
     (0..block_registry::slot_count())
         .any(|i| block_diagnostics::device_snapshot(i).is_some_and(|d| d.bus == bus))
+}
+/// # Safety
+/// Caller owns one aligned output. Refusal leaves the entire record untouched.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_r4dev_firmware_system_uuid(
+    out: *mut c::FirmwareSystemUuidInfo,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let Some(uuid) = smbios::system_uuid() else {
+        return -2;
+    };
+    unsafe {
+        out.write(c::FirmwareSystemUuidInfo {
+            version: 1,
+            size: 32,
+            source: 1,
+            reserved: 0,
+            uuid,
+        });
+    }
+    0
 }
 /// # Safety
 /// Exclusive aligned canonical output for cached read-only hardware facts.
