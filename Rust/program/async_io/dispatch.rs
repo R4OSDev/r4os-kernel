@@ -42,6 +42,9 @@ impl Lane {
         assert!(self.notified & bit == 0, "async credited receiver parking");
         self.waiting |= bit;
     }
+    pub(crate) fn parked(&self, slot: usize) -> bool {
+        self.waiting & Self::bit(slot) != 0
+    }
     pub(crate) fn unreserved(&self) -> bool {
         self.queued > self.notified.count_ones() as usize
     }
@@ -80,6 +83,8 @@ impl ReceiverHints {
     }
     const MASK: u32 = (1 << WIDTH) - 1;
     const CURSOR: usize = 2 * WIDTH;
+    const PREFERRED: usize = Self::CURSOR + 2;
+    const PREFERRED_MASK: u32 = 7 << Self::PREFERRED;
     fn bit(slot: usize) -> u32 {
         u32::from(Lane::bit(slot))
     }
@@ -102,6 +107,38 @@ impl ReceiverHints {
             & (bit << WIDTH)
             != 0
     }
+    /// A finite-wait receiver preference, not a Request identity or credit.
+    /// The Async owner binds the actual worker generation separately.
+    pub(crate) fn prefer(&self, slot: Option<usize>) {
+        let value = slot.map_or(0, |slot| {
+            assert!(slot < WIDTH);
+            (slot + 1) as u32
+        });
+        self.state
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                Some((state & !Self::PREFERRED_MASK) | (value << Self::PREFERRED))
+            })
+            .unwrap();
+    }
+    /// Coordinate a finite-wait change with an existing notification. A
+    /// credited receiver already has a signal in flight or consumed it before
+    /// its final check. A withdrawn receiver may still need retirement wake.
+    pub(crate) fn notify(&self, slot: usize) -> bool {
+        let bit = Self::bit(slot);
+        let old = self
+            .state
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+                if state & (bit << WIDTH) != 0 {
+                    return None;
+                }
+                Some(if state & bit != 0 {
+                    (state & !bit) | (bit << WIDTH)
+                } else {
+                    state
+                })
+            });
+        old.is_ok()
+    }
     /// Coalesced scout uses limit1. Only the Async owner can establish a larger
     /// demand from actual detached continuation candidates. Existing credits
     /// reserve retries until the receiver's next check or exact retirement.
@@ -113,9 +150,15 @@ impl ReceiverHints {
                 return None;
             }
             let cursor = (observed >> Self::CURSOR) as usize % WIDTH;
-            let slot = (0..WIDTH)
-                .map(|offset| (cursor + offset) % WIDTH)
-                .find(|&slot| observed & Self::bit(slot) != 0)?;
+            let preferred = ((observed & Self::PREFERRED_MASK) >> Self::PREFERRED)
+                .checked_sub(1)
+                .map(|slot| slot as usize)
+                .filter(|&slot| slot < WIDTH && observed & Self::bit(slot) != 0);
+            let slot = preferred.or_else(|| {
+                (0..WIDTH)
+                    .map(|offset| (cursor + offset) % WIDTH)
+                    .find(|&slot| observed & Self::bit(slot) != 0)
+            })?;
             let bit = Self::bit(slot);
             let next = ((observed & !bit) | (bit << WIDTH)) & !(3 << Self::CURSOR)
                 | (((slot + 1) % WIDTH) as u32) << Self::CURSOR;
@@ -141,6 +184,41 @@ mod receiver_tests {
             assert!(!hints.enroll(slot));
         }
         hints
+    }
+    #[test]
+    fn finite_waiter_preference_keeps_one_scout_credit() {
+        let hints = parked();
+        hints.prefer(Some(3));
+        assert_eq!(hints.reserve(1), Some(3));
+        assert!(!hints.notify(3));
+        assert_eq!(hints.reserve(1), None);
+        assert!(hints.enroll(3));
+        hints.prefer(None);
+        assert_eq!(hints.reserve(1), Some(0));
+    }
+    #[test]
+    fn deadline_change_and_endpoint_callback_share_notification() {
+        let hints = parked();
+        assert!(hints.notify(2));
+        assert!(!hints.notify(2));
+        assert_eq!(hints.reserve(1), None);
+        assert!(hints.enroll(2));
+        assert!(hints.notify(2));
+        assert!(hints.withdraw(2));
+        // Retirement may need an Event wake after enrollment was withdrawn.
+        assert!(hints.notify(2));
+        assert!(!hints.enroll(2));
+    }
+    #[test]
+    fn withdrawn_preference_and_existing_credit_do_not_hide_another_waiter() {
+        let hints = parked();
+        hints.prefer(Some(0));
+        assert!(!hints.withdraw(0));
+        assert_eq!(hints.reserve(1), Some(1));
+        hints.prefer(Some(2));
+        assert_eq!(hints.reserve(1), None);
+        assert!(hints.enroll(1));
+        assert_eq!(hints.reserve(1), Some(2));
     }
     #[test]
     fn one_scout_coalesces_until_real_resumption() {

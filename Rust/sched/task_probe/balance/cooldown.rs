@@ -142,7 +142,7 @@ fn cleanup(abort: bool) -> bool {
     }
     valid && unsafe { helpers::queue_valid() }
 }
-fn body(ready_path: bool, end: u64) -> Option<(u32, u32, u64, u64)> {
+fn body(ready_path: bool, end: u64) -> Option<(u32, u32, u64, u64, u32)> {
     let t = ACTOR.load(Ordering::Acquire);
     PHASE.store(1, Ordering::Relaxed);
     if !wait(end, true, || enrolled(0)) {
@@ -182,43 +182,65 @@ fn body(ready_path: bool, end: u64) -> Option<(u32, u32, u64, u64)> {
         return None;
     }
     PHASE.store(3, Ordering::Relaxed);
-    let exception_stamp = {
-        let _runtime = RuntimeGuard::acquire();
-        unsafe {
-            let c = registry::core(t);
-            let now = timer::tick_count();
-            if now.saturating_sub(first_stamp) >= scheduler::PLACEMENT_COOLDOWN {
-                return None;
-            }
-            if ready_path {
-                (*c).cpu_affinity_bound = true;
-                crate::sched::task::balance::note_ready_publication(t);
-            }
-            WAKES[1].store(now, Ordering::Release);
-            sync_objects::r4os_rust_sync_event(SIGNAL.0.get(), 0, 0);
-            let before = facts(t);
-            if ready_path {
-                if (*c).home_cpu != first as u8 {
+    let mut capacity_waits = 0;
+    let exception_stamp = loop {
+        let attempt = {
+            let _runtime = RuntimeGuard::acquire();
+            unsafe {
+                let c = registry::core(t);
+                let now = timer::tick_count();
+                if now.saturating_sub(first_stamp) >= scheduler::PLACEMENT_COOLDOWN {
                     return None;
                 }
-                (*c).cpu_affinity_bound = false;
-                crate::sched::task::balance::note_ready_publication(t);
-                scheduler::notify_ready(t.cast());
-                if facts(t) != before {
-                    return None;
+                // A running owned competitor establishes source pressure only.
+                // The positive exception also requires a genuinely empty allowed
+                // physical core now. Observe that canonical decision before waking
+                // the actor, in the same Runtime admission as the actual wake.
+                if crate::sched::task::diagnostic::cooldown_targets(t, now) == 0 {
+                    None
+                } else {
+                    if ready_path {
+                        (*c).cpu_affinity_bound = true;
+                        crate::sched::task::balance::note_ready_publication(t);
+                    }
+                    WAKES[1].store(now, Ordering::Release);
+                    sync_objects::r4os_rust_sync_event(SIGNAL.0.get(), 0, 0);
+                    let before = facts(t);
+                    if ready_path {
+                        if (*c).home_cpu != first as u8 {
+                            return None;
+                        }
+                        (*c).cpu_affinity_bound = false;
+                        crate::sched::task::balance::note_ready_publication(t);
+                        scheduler::notify_ready(t.cast());
+                        if facts(t) != before {
+                            return None;
+                        }
+                    }
+                    if (*c).home_cpu == first as u8
+                        || (*c).last_migration_exception_tick == 0
+                        || (*c).last_migration_exception_tick != (*c).last_migration_tick
+                        || ((*c).role == Role::ShortCompletion
+                            && ((*c).role_budget_ticks_remaining == 0
+                                || (*c).role_budget_dispatches_remaining == 0))
+                    {
+                        return None;
+                    }
+                    Some((*c).last_migration_exception_tick)
                 }
             }
-            if (*c).home_cpu == first as u8
-                || (*c).last_migration_exception_tick == 0
-                || (*c).last_migration_exception_tick != (*c).last_migration_tick
-                || ((*c).role == Role::ShortCompletion
-                    && ((*c).role_budget_ticks_remaining == 0
-                        || (*c).role_budget_dispatches_remaining == 0))
-            {
-                return None;
-            }
-            (*c).last_migration_exception_tick
+        };
+        if let Some(stamp) = attempt {
+            break stamp;
         }
+        capacity_waits += 1;
+        if kernel_check::cancelled() || timer::tick_count() >= end {
+            return None;
+        }
+        // The actor remains enrolled, so no exception/counter/age is consumed.
+        // Real foreign work runs normally; the original cooldown and overall
+        // deadline are not extended, reset or supplied synthetic clock values.
+        wait_capacity(b"spectra-cooldown-capacity");
     };
     PHASE.store(4, Ordering::Relaxed);
     if !wait(end, false, || enrolled(2)) {
@@ -272,7 +294,7 @@ fn body(ready_path: bool, end: u64) -> Option<(u32, u32, u64, u64)> {
     if control_delay <= bypass_delay || ERRORS.load(Ordering::Acquire) != 0 {
         return None;
     }
-    Some((first, second, bypass_delay, control_delay))
+    Some((first, second, bypass_delay, control_delay, capacity_waits))
 }
 pub(super) fn run() -> bool {
     if percpu::r4os_rust_percpu_control(14, 0, 0, 0) != 15 {
@@ -333,7 +355,7 @@ pub(super) fn run() -> bool {
             }
         }
         let clean = cleanup(result.is_none());
-        let Some((first, second, bypass, control)) = result else {
+        let Some((first, second, bypass, control, capacity_waits)) = result else {
             return helpers::fail(b"cooldown-live-boundary");
         };
         if !clean {
@@ -349,6 +371,8 @@ pub(super) fn run() -> bool {
         helpers::dec(bypass);
         helpers::puts(b" control_ticks=");
         helpers::dec(control);
+        helpers::puts(b" capacity_waits=");
+        helpers::dec(u64::from(capacity_waits));
         helpers::puts(b" exception=1 budget=preserved fpu+unwind=3 own=retired\r\n");
     }
     true

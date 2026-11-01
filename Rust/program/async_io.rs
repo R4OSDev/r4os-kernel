@@ -233,6 +233,7 @@ struct State {
     cursor: [usize; 2],
     close_cursor: usize,
     lanes: [Lane; 2],
+    service_deadline_waiter: Option<service::DeadlineWaiter>,
     creations: u64,
     processed: u64,
     ranges: [Range; 64],
@@ -252,6 +253,7 @@ static STATE: Cell<State> = Cell(UnsafeCell::new(State {
     cursor: [0; 2],
     close_cursor: 0,
     lanes: [Lane::EMPTY; 2],
+    service_deadline_waiter: None,
     creations: 0,
     processed: 0,
     ranges: [const { Range::EMPTY }; 64],
@@ -465,6 +467,7 @@ pub(super) unsafe fn execution() -> Option<super::context::AsyncExecution> {
 unsafe fn ensure_workers(service: bool) -> bool {
     unsafe {
         let mut available = false;
+        let mut replaced = false;
         for index in 0..WORKERS {
             if (index >= WORKERS / 2) != service {
                 continue;
@@ -513,6 +516,7 @@ unsafe fn ensure_workers(service: bool) -> bool {
                 (*worker).task_id = (*core).id;
                 (*worker).task_generation = (*core).generation;
                 (*worker).service = service;
+                replaced = true;
                 (*state()).creations = (*state()).creations.wrapping_add(1);
                 assert!(
                     crate::sched::scheduler::publish_created(task),
@@ -520,6 +524,9 @@ unsafe fn ensure_workers(service: bool) -> bool {
                 );
             }
             available = true;
+        }
+        if service && replaced {
+            service::refresh_deadline();
         }
         available
     }
@@ -545,12 +552,12 @@ unsafe fn wake_workers(service: bool) {
         }
     }
 }
-unsafe fn take_request(worker: *mut Worker) -> *mut Request {
+unsafe fn take_request(worker: *mut Worker) -> (*mut Request, bool) {
     unsafe {
         let lane = usize::from((*worker).service);
         let queued = (*state()).lanes[lane].unreserved();
         if !(*worker).service && !queued {
-            return ptr::null_mut();
+            return (ptr::null_mut(), false);
         }
         let now = if (*worker).service {
             timer::tick_count()
@@ -577,7 +584,8 @@ unsafe fn take_request(worker: *mut Worker) -> *mut Request {
             } else {
                 0
             };
-            let resume = suspended && ((*req).service_epoch != epoch || service::expired(req, now));
+            let deadline_selected = (*worker).service && service::expired(req, now);
+            let resume = suspended && ((*req).service_epoch != epoch || deadline_selected);
             if !first && !resume {
                 continue;
             }
@@ -596,9 +604,9 @@ unsafe fn take_request(worker: *mut Worker) -> *mut Request {
             }
             (*worker).request.store(req, Ordering::Release);
             (*state()).cursor[lane] = (index + 1) % CAPACITY;
-            return req;
+            return (req, deadline_selected);
         }
-        ptr::null_mut()
+        (ptr::null_mut(), false)
     }
 }
 unsafe extern "C" fn worker_main() {
@@ -630,21 +638,31 @@ unsafe extern "C" fn worker_main() {
                 threads::exit_task();
             }
             let notified = (*worker).service && service::enroll(slot);
-            let req = take_request(worker);
+            let (req, deadline_selected) = take_request(worker);
             if req.is_null() {
                 (*state()).lanes[lane].park(slot);
-                let timeout = if (*worker).service {
-                    service::wait_ticks()
+                let deadline = if (*worker).service {
+                    service::park_deadline(slot)
                 } else {
                     u64::MAX
                 };
                 drop(guard);
+                // Preserve the absolute functional deadline across the
+                // unlock-to-physical-wait interval. The AUTO Event is sticky.
+                let timeout = if deadline == u64::MAX {
+                    u64::MAX
+                } else {
+                    deadline.saturating_sub(timer::tick_count())
+                };
                 sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker).event), 2, timeout);
                 continue;
             }
             if (*worker).service {
                 let during_check = service::withdraw(slot);
-                if notified || during_check {
+                service::deadline_changed(Some(slot));
+                if notified || during_check || deadline_selected {
+                    // A real expired selection also fans out other actual
+                    // expired continuations, including the all-busy handoff.
                     service::wake_pending();
                 }
             }
@@ -676,6 +694,7 @@ unsafe extern "C" fn worker_main() {
                 (*worker).request.store(ptr::null_mut(), Ordering::Release);
                 (*req).task_id = 0;
                 (*req).task_generation = 0;
+                service::deadline_changed(Some(slot));
                 wake_workers(true);
                 drop(guard);
                 scheduler::safe_reschedule();
@@ -717,6 +736,9 @@ unsafe extern "C" fn worker_main() {
             (*req).task_id = 0;
             (*req).task_generation = 0;
             (*req).completed_tick = timer::tick_count();
+            if (*worker).service {
+                service::deadline_changed(Some(slot));
+            }
             // The actual terminal native result, before its existing waiter
             // publication; this observer owns no request or cancellation duty.
             crate::sched::worker_observation::finish(observation, result, true);
@@ -1275,6 +1297,7 @@ unsafe fn retire(value: Claim) -> bool {
             (*state()).lanes[usize::from((*worker).service)].withdraw(i % dispatch::WIDTH);
             if (*worker).service {
                 service::withdraw(i % dispatch::WIDTH);
+                service::refresh_deadline();
                 service::wake_pending();
             }
             wake_workers((*worker).service);
@@ -1460,7 +1483,11 @@ pub unsafe extern "C" fn r4os_rust_program_async_request(
 }
 unsafe fn cancel_queued(req: *mut Request) {
     unsafe {
+        let pending_deadline = service::deadline_pending(req);
         (*req).cancel_requested = true;
+        if pending_deadline {
+            service::deadline_changed(None);
+        }
         if (*req).state != 1 {
             return;
         }

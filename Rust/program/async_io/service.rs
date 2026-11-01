@@ -122,27 +122,137 @@ pub(super) unsafe fn expired(req: *const Request, now: u64) -> bool {
 }
 /// Async mutex held. Only detached pending continuations contribute a deadline;
 /// an active worker owns its own bounded attempt and cancellation lifetime.
-pub(super) unsafe fn wait_ticks() -> u64 {
+pub(super) unsafe fn deadline_pending(req: *const Request) -> bool {
+    unsafe {
+        (*req).used
+            && (*req).kind == Kind::Service
+            && (*req).state == 2
+            && (*req).task_id == 0
+            && !(*req).cancel_requested
+            && (*req).service_timeout != 0
+            && (*req).service_timeout != u64::MAX
+    }
+}
+unsafe fn pending_deadline() -> u64 {
     unsafe {
         let mut earliest = u64::MAX;
         for i in 0..CAPACITY {
             let req = ptr::addr_of!((*state()).requests[i]);
-            if (*req).used
-                && (*req).kind == Kind::Service
-                && (*req).state == 2
-                && (*req).task_id == 0
-                && !(*req).cancel_requested
-                && (*req).service_timeout != 0
-                && (*req).service_timeout != u64::MAX
-            {
+            if deadline_pending(req) {
                 earliest = earliest.min((*req).service_deadline);
             }
         }
-        if earliest == u64::MAX {
-            u64::MAX
+        earliest
+    }
+}
+// Async-owner hint describing which resident receiver is responsible for a
+// finite wait. Actual Requests and the existing Timer owner remain truth.
+#[derive(Clone, Copy)]
+pub(super) struct DeadlineWaiter {
+    slot: usize,
+    task_id: u32,
+    task_generation: u64,
+    deadline: u64,
+}
+unsafe fn same_worker(hint: DeadlineWaiter) -> bool {
+    unsafe {
+        let worker = ptr::addr_of!((*state()).workers[dispatch::WIDTH + hint.slot]);
+        (*worker).task_id == hint.task_id
+            && (*worker).task_generation == hint.task_generation
+            && hint.task_id != 0
+            && hint.task_generation != 0
+    }
+}
+unsafe fn eligible(slot: usize) -> bool {
+    unsafe {
+        let worker = ptr::addr_of!((*state()).workers[dispatch::WIDTH + slot]);
+        (*worker).service
+            && !(*worker).retiring
+            && (*worker).task_id != 0
+            && (*worker).task_generation != 0
+            && (*worker).request.load(Ordering::Acquire).is_null()
+            && (*state()).lanes[1].parked(slot)
+    }
+}
+/// Async mutex held. Revoke obsolete waits through their resident Event,
+/// whose real Runtime wake removes that exact Task's old timeout enrollment.
+/// No callback or caller buffer participates in this responsibility hint.
+unsafe fn reconcile_deadline(current: Option<usize>) -> u64 {
+    unsafe {
+        let earliest = pending_deadline();
+        let old = (*state()).service_deadline_waiter;
+        let selected = if earliest == u64::MAX {
+            None
         } else {
-            earliest.saturating_sub(timer::tick_count())
+            old.filter(|hint| same_worker(*hint) && eligible(hint.slot))
+                .map(|hint| hint.slot)
+                .or_else(|| current.filter(|&slot| eligible(slot)))
+                .or_else(|| (0..dispatch::WIDTH).find(|&slot| eligible(slot)))
+        };
+        let next = selected.map(|slot| {
+            let worker = ptr::addr_of!((*state()).workers[dispatch::WIDTH + slot]);
+            DeadlineWaiter {
+                slot,
+                task_id: (*worker).task_id,
+                task_generation: (*worker).task_generation,
+                deadline: earliest,
+            }
+        });
+        let unchanged = match (old, next) {
+            (Some(a), Some(b)) => {
+                a.slot == b.slot
+                    && a.task_id == b.task_id
+                    && a.task_generation == b.task_generation
+                    && a.deadline == b.deadline
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        let mut signals = 0u8;
+        if !unchanged {
+            if let Some(hint) = old
+                && same_worker(hint)
+                && current != Some(hint.slot)
+            {
+                signals |= 1 << hint.slot;
+            }
+            if let Some(hint) = next
+                && current != Some(hint.slot)
+            {
+                signals |= 1 << hint.slot;
+            }
         }
+        (*state()).service_deadline_waiter = next;
+        if old.map(|hint| hint.slot) != next.map(|hint| hint.slot) {
+            RECEIVERS.prefer(next.map(|hint| hint.slot));
+        }
+        for slot in 0..dispatch::WIDTH {
+            if signals & (1 << slot) != 0 && RECEIVERS.notify(slot) {
+                signal(slot);
+            }
+        }
+        next.filter(|hint| current == Some(hint.slot))
+            .map_or(u64::MAX, |hint| hint.deadline)
+    }
+}
+/// Called after this exact receiver's empty final check and lane enrollment.
+/// Return an absolute deadline: remaining ticks are computed just before Wait.
+pub(super) unsafe fn park_deadline(slot: usize) -> u64 {
+    unsafe { reconcile_deadline(Some(slot)) }
+}
+/// A mutation cannot obsolete a physical finite wait when no hint exists.
+/// A newly available receiver will establish one at its actual next park.
+pub(super) unsafe fn deadline_changed(current: Option<usize>) {
+    unsafe {
+        if (*state()).service_deadline_waiter.is_some() {
+            reconcile_deadline(current);
+        }
+    }
+}
+/// Exact worker retirement/replacement also covers the all-busy handoff case.
+pub(super) unsafe fn refresh_deadline() {
+    unsafe {
+        reconcile_deadline(None);
     }
 }
 /// The exact worker still owns req. Cancellation retains the ID until the

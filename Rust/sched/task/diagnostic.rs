@@ -6,6 +6,21 @@ use super::{
 };
 use crate::{arch::runtime::RuntimeGuard, platform::timer, sched::scheduler};
 use core::ptr;
+/// # Safety
+/// Explicit diagnostic caller holds uninterrupted Runtime admission and retains
+/// this exact owned saved task. This is the canonical migration owner's
+/// current target decision, not a cached load or a parallel exception policy.
+pub(crate) unsafe fn cooldown_targets(task: *mut Task, now: u64) -> u64 {
+    unsafe {
+        super::migration::targets(
+            task,
+            u32::from((*registry::core(task)).home_cpu),
+            now,
+            scheduler::PLACEMENT_COOLDOWN,
+        )
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Record {
     task: *mut Task,
