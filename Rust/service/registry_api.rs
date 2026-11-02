@@ -55,9 +55,7 @@ unsafe fn apply(key: Key, slot: usize, change: Change) -> i32 {
         let r = reg::raw();
         match change {
             Change::Unregister => {
-                let name = (*reg::entry(slot)).name;
-                let len = (*reg::entry(slot)).name_len;
-                let result = reg::unregister_in(&mut (*r).entries, &name[..len]);
+                let result = if (*r).entries.remove(slot) { 0 } else { -4 };
                 if result == 0 {
                     reg::structure_changed();
                 }
@@ -67,20 +65,14 @@ unsafe fn apply(key: Key, slot: usize, change: Change) -> i32 {
                 let Key::Name(name) = key else {
                     unreachable!();
                 };
-                reg::set_state_in(
-                    &mut (*r).entries,
-                    reg::bytes(name),
-                    state,
-                    id,
-                    code,
-                    reg::bytes(text),
-                )
+                let _ = name;
+                reg::set_state_in(slot, state, id, code, reg::bytes(text))
             }
             Change::Begin(out) => {
-                (*r).next_start_generation = (*r).next_start_generation.wrapping_add(1);
-                if (*r).next_start_generation == 0 {
-                    (*r).next_start_generation = 1;
-                }
+                let Some(generation) = (*r).next_start_generation.checked_add(1) else {
+                    return c::service_api_result_exhausted;
+                };
+                (*r).next_start_generation = generation;
                 let e = reg::entry(slot);
                 (*e).start_generation = (*r).next_start_generation;
                 (*e).state = STATE_STARTING;
@@ -105,6 +97,12 @@ unsafe fn apply(key: Key, slot: usize, change: Change) -> i32 {
             }
             Change::Mode(mode) => {
                 let e = &mut *reg::entry(slot);
+                if e.start_mode != mode {
+                    let Some(revision) = (*r).inventory_revision.checked_add(1) else {
+                        return c::service_api_result_exhausted;
+                    };
+                    (*r).inventory_revision = revision;
+                }
                 e.start_mode = mode;
                 if mode == MODE_DISABLED {
                     e.state = STATE_DISABLED;
@@ -177,6 +175,12 @@ pub(super) unsafe fn change(key: Key, action: Change) -> i32 {
                     -4
                 };
             };
+            if matches!(action, Change::Unregister)
+                && ((*reg::raw()).generation == u64::MAX
+                    || (*reg::raw()).inventory_revision == u64::MAX)
+            {
+                return c::service_api_result_exhausted;
+            }
             let retire = {
                 let e = &*reg::entry(slot);
                 match action {
@@ -257,8 +261,9 @@ pub(super) unsafe fn change(key: Key, action: Change) -> i32 {
             if retire && let Some(i) = reg::endpoint_for_slot(slot) {
                 let ep = reg::endpoint(i);
                 let Some(mut endpoint_guard) = reg::endpoint_lock(ep, 3, true) else {
+                    let identity = reg::identity(ep);
                     guard.release();
-                    if !reg::wait_lifecycle(ep) {
+                    if !reg::wait_lifecycle(identity) {
                         return admission_error;
                     }
                     continue;
@@ -267,10 +272,12 @@ pub(super) unsafe fn change(key: Key, action: Change) -> i32 {
                 let result = apply(key, slot, action);
                 endpoint_guard.release();
                 guard.release();
+                reg::collect();
                 return result;
             }
             let result = apply(key, slot, action);
             guard.release();
+            reg::collect();
             return result;
         }
     }
@@ -284,22 +291,53 @@ pub(super) unsafe fn register(
     out_target: *mut ApiIndexTarget,
 ) -> i32 {
     unsafe {
-        let Some(_guard) = reg::lock_registry(0) else {
-            return -1;
-        };
-        let result = reg::register_in(
-            &mut (*reg::raw()).entries,
+        let mut value = Entry::EMPTY;
+        let result = reg::make_entry(
+            &mut value,
             reg::bytes(name),
             reg::bytes(path),
             reg::bytes(args),
             mode,
             reg::bytes(description),
         );
-        if result >= 0 {
-            reg::structure_changed();
-            out_target.write(reg::target_for_slot(result as usize, NAMED_TARGET_INDEX));
+        if result < 0 {
+            return result;
         }
-        result
+        {
+            let Some(_guard) = reg::lock_registry(0) else {
+                return -1;
+            };
+            if reg::find_name(name).is_some() {
+                return -3;
+            }
+            if (*reg::raw()).generation == u64::MAX
+                || (*reg::raw()).inventory_revision == u64::MAX
+                || (*reg::raw()).entries.serial == usize::MAX
+            {
+                return c::service_api_result_exhausted;
+            }
+        }
+        reg::collect();
+        let Some(mut prepared) = reg::prepare_entry(value) else {
+            return c::service_api_result_memory;
+        };
+        let Some(mut guard) = reg::lock_registry(0) else {
+            return -1;
+        };
+        if reg::find_name(name).is_some() {
+            return -3;
+        }
+        if (*reg::raw()).generation == u64::MAX || (*reg::raw()).inventory_revision == u64::MAX {
+            return c::service_api_result_exhausted;
+        }
+        let Some(slot) = (*reg::raw()).entries.insert(prepared.pointer()) else {
+            return c::service_api_result_exhausted;
+        };
+        prepared.publish();
+        reg::structure_changed();
+        out_target.write(reg::target_for_slot(slot, NAMED_TARGET_INDEX));
+        guard.release();
+        0
     }
 }
 pub(super) unsafe fn running(name: Bytes, id: u32, ticks: u64) -> i32 {
@@ -307,7 +345,10 @@ pub(super) unsafe fn running(name: Bytes, id: u32, ticks: u64) -> i32 {
         let Some(_guard) = reg::lock_registry(0) else {
             return -1;
         };
-        reg::running_in(&mut (*reg::raw()).entries, reg::bytes(name), id, ticks)
+        let Some(slot) = reg::find_name(name) else {
+            return -4;
+        };
+        reg::running_in(slot, id, ticks)
     }
 }
 pub(super) unsafe fn restart_count(name: Bytes) -> i32 {
@@ -327,7 +368,7 @@ unsafe fn start_entry(reservation: *const StartReservation) -> Option<usize> {
     unsafe {
         let slot = (*reservation).slot;
         let generation = (*reservation).generation;
-        if slot >= MAX_SERVICES || generation == 0 {
+        if !reg::entry_exists(slot) || generation == 0 {
             return None;
         }
         let e = &*reg::entry(slot);
@@ -419,7 +460,7 @@ pub(super) unsafe fn cancel_start(name: Bytes, generation: u64) {
 }
 pub(super) unsafe fn entry_at(index: usize) -> Option<Entry> {
     let _guard = reg::lock_registry(2)?;
-    unsafe { (index < MAX_SERVICES && (*reg::entry(index)).used).then(|| reg::entry(index).read()) }
+    unsafe { reg::api_slot(u32::try_from(index).ok()?).map(|slot| reg::entry(slot).read()) }
 }
 pub(super) unsafe fn entry_by_name(name: Bytes) -> Option<Entry> {
     let _guard = reg::lock_registry(2)?;
@@ -464,9 +505,9 @@ pub(super) fn count() -> usize {
     };
     unsafe { reg::count(&(*reg::raw()).entries) }
 }
-unsafe fn fill_entry(slot: usize, out: &mut c::ServiceInfo, now: u64) {
+pub(super) unsafe fn fill_entry(slot: usize, out: &mut c::ServiceInfo, now: u64) {
     *out = c::ServiceInfo::default();
-    if slot >= MAX_SERVICES {
+    if !reg::entry_exists(slot) {
         return;
     }
     unsafe {
@@ -487,15 +528,18 @@ unsafe fn fill_entry(slot: usize, out: &mut c::ServiceInfo, now: u64) {
         out.last_error[..e.last_error_len].copy_from_slice(&e.last_error[..e.last_error_len]);
     }
 }
-unsafe fn fill_detail(slot: usize, out: &mut c::ServiceDetail, now: u64) {
+unsafe fn fill_detail(slot: usize, out: &mut c::ServiceDetail, now: u64) -> bool {
     *out = c::ServiceDetail::default();
-    if slot >= MAX_SERVICES {
-        return;
+    if !reg::entry_exists(slot) {
+        return false;
     }
     unsafe {
         let e = &*reg::entry(slot);
         if !e.used {
-            return;
+            return false;
+        }
+        if e.path_len >= out.path.len() {
+            return false;
         }
         fill_entry(slot, &mut out.info, now);
         // Keep the original checked public128-byte detail window. A private
@@ -503,6 +547,7 @@ unsafe fn fill_detail(slot: usize, out: &mut c::ServiceDetail, now: u64) {
         out.path[..e.path_len].copy_from_slice(&e.path[..e.path_len]);
         out.args[..e.args_len].copy_from_slice(&e.args[..e.args_len]);
         out.description[..e.description_len].copy_from_slice(&e.description[..e.description_len]);
+        true
     }
 }
 pub(super) unsafe fn fill_endpoint(ep: *mut Endpoint, out: &mut c::ServiceInfo) {
@@ -530,7 +575,7 @@ pub(super) unsafe fn fill_endpoint(ep: *mut Endpoint, out: &mut c::ServiceInfo) 
         out.cancellations = (*ep).cancellations;
     }
 }
-unsafe fn append_endpoint(identity: Option<Identity>, out: *mut c::ServiceInfo) {
+pub(super) unsafe fn append_endpoint(identity: Option<Identity>, out: *mut c::ServiceInfo) {
     if let Some(id) = identity
         && let Some(lease) = reg::lock_identity(id, 6)
     {
@@ -619,7 +664,9 @@ pub(super) unsafe fn detail(
                 _ => c::service_api_result_not_found,
             };
         };
-        fill_detail(slot, &mut *out, now);
+        if !fill_detail(slot, &mut *out, now) {
+            return c::service_api_result_buffer_too_small;
+        }
         let identity = reg::endpoint_for_slot(slot).map(|i| reg::identity(reg::endpoint(i)));
         guard.release();
         append_endpoint(identity, ptr::addr_of_mut!((*out).info));
@@ -641,6 +688,7 @@ pub(super) unsafe fn register_endpoint(
         if process.instance_id == 0 || process.generation == 0 || process.reserved != 0 {
             return c::service_api_result_invalid;
         }
+        let mut prepared = None;
         loop {
             let Some(mut guard) = reg::lock_registry(0) else {
                 return c::service_api_result_busy;
@@ -660,30 +708,35 @@ pub(super) unsafe fn register_endpoint(
             {
                 return c::service_api_result_not_running;
             }
-            let Some(i) = reg::endpoint_for_slot(slot).or_else(|| reg::free_endpoint()) else {
-                return c::service_api_result_full;
+            let ep = if let Some(i) = reg::endpoint_for_slot(slot) {
+                reg::endpoint(i)
+            } else {
+                if prepared.is_none() {
+                    guard.release();
+                    prepared = Some(match reg::prepare_endpoint() {
+                        Some(value) => value,
+                        None => return c::service_api_result_memory,
+                    });
+                    continue;
+                }
+                let allocation = prepared.as_mut().expect("Prepared service endpoint");
+                let node = allocation.pointer();
+                let r = reg::raw();
+                (*node).endpoint.service_slot = slot;
+                if (*r).endpoints.insert(node).is_none() {
+                    return c::service_api_result_exhausted;
+                }
+                allocation.publish();
+                node.cast::<Endpoint>()
             };
-            let ep = reg::endpoint(i);
             let Some(mut endpoint_guard) = reg::endpoint_lock(ep, 3, true) else {
+                let identity = reg::identity(ep);
                 guard.release();
-                if !reg::wait_lifecycle(ep) {
+                if !reg::wait_lifecycle(identity) {
                     return c::service_api_result_busy;
                 }
                 continue;
             };
-            if !(*ep).used {
-                endpoint::reset_metadata(ep, true);
-                endpoint::advance(ep);
-                (*ep).used = true;
-                (*ep).service_slot = slot;
-                let r = reg::raw();
-                let handle = (*r).next_endpoint_handle;
-                (*r).next_endpoint_handle = (*r).next_endpoint_handle.wrapping_add(1);
-                if (*r).next_endpoint_handle == 0 {
-                    (*r).next_endpoint_handle = 1;
-                }
-                (*ep).handle = if handle == 0 { 1 } else { handle };
-            }
             (*ep).flags = flags;
             fill_endpoint(ep, &mut *out);
             endpoint_guard.release();
@@ -703,8 +756,9 @@ pub(super) unsafe fn unregister_endpoint(handle: u32) -> i32 {
             };
             let ep = reg::endpoint(i);
             let Some(mut endpoint_guard) = reg::endpoint_lock(ep, 3, true) else {
+                let identity = reg::identity(ep);
                 guard.release();
-                if !reg::wait_lifecycle(ep) {
+                if !reg::wait_lifecycle(identity) {
                     return c::service_api_result_busy;
                 }
                 continue;
@@ -712,6 +766,7 @@ pub(super) unsafe fn unregister_endpoint(handle: u32) -> i32 {
             endpoint::retire(ep, 3);
             endpoint_guard.release();
             guard.release();
+            reg::collect();
             return c::service_api_result_ok;
         }
     }

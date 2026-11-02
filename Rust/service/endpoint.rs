@@ -125,8 +125,8 @@ pub(super) unsafe fn wake_waiters(ep: *mut Endpoint, result: u32) {
 }
 pub(super) unsafe fn retire(ep: *mut Endpoint, result: u32) {
     unsafe {
+        reg::retire_endpoint(ep);
         wake_waiters(ep, result);
-        reset_metadata(ep, true);
     }
 }
 pub(super) unsafe fn advance(ep: *mut Endpoint) {
@@ -508,7 +508,7 @@ pub(super) unsafe fn submit_wait(
             predicate: None,
             context: ptr::null_mut(),
             release: Some(reg::release_for_wait),
-            release_context: ptr::from_mut(&mut lease.guard).cast(),
+            release_context: ptr::from_mut(&mut lease).cast(),
             flags: 0,
             consume_runtime: false,
         };
@@ -731,7 +731,7 @@ pub(super) unsafe fn wait_endpoint(handle: u32, timeout: u64) -> i32 {
             ptr::from_mut(&mut context).cast(),
         );
         request.release = Some(reg::release_for_wait);
-        request.release_context = ptr::from_mut(&mut lease.guard).cast();
+        request.release_context = ptr::from_mut(&mut lease).cast();
         // The original sync transport releases the exact mutex and evaluates
         // this predicate under one runtime admission. No new producer can
         // acquire that mutex between release, predicate and enrollment.
@@ -795,7 +795,7 @@ pub(super) unsafe fn wait_response(handle: u32, id: u32, timeout: u64) -> i32 {
             ptr::from_mut(&mut context).cast(),
         );
         request.release = Some(reg::release_for_wait);
-        request.release_context = ptr::from_mut(&mut lease.guard).cast();
+        request.release_context = ptr::from_mut(&mut lease).cast();
         let result = sync_wait::r4os_rust_sync_wait(
             ptr::addr_of_mut!((*context.slot).response_available),
             &request,

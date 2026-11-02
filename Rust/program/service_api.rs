@@ -112,6 +112,8 @@ fn registry_result(result: i32) -> i32 {
         -2 => c::service_api_result_full,
         -3 => c::service_api_result_duplicate,
         -4 => NOT_FOUND,
+        c::service_api_result_memory => c::service_api_result_memory,
+        c::service_api_result_exhausted => c::service_api_result_exhausted,
         _ => INVALID,
     }
 }
@@ -227,6 +229,142 @@ unsafe fn refreshed_target(name: &[u8]) -> Result<Target, i32> {
             Ok(target)
         } else {
             Err(BUSY)
+        }
+    }
+}
+
+pub(crate) unsafe fn refresh_inventory_target(raw: &mut st::ApiIndexTarget) -> bool {
+    let mut target = target_value(*raw);
+    if !unsafe { refresh_target(&mut target) } {
+        return false;
+    }
+    *raw = unsafe { target_native(&target) };
+    true
+}
+
+struct CollectServices;
+impl Drop for CollectServices {
+    fn drop(&mut self) {
+        crate::service::registry::collect();
+    }
+}
+
+unsafe fn restart_target(target: &mut Target, out: *mut c::ServiceInfo) -> i32 {
+    unsafe {
+        let Some(entry) = target_entry(target) else {
+            return BUSY;
+        };
+        if entry.id != 0 && descends(entry.binding.process) {
+            return c::service_api_result_self_restart;
+        }
+        if matches!(entry.state, RUNNING | STARTING | STOPPING) {
+            let result = stop_bound(target, out, stop_deadline(40));
+            if result < 0 {
+                return result;
+            }
+        }
+        let clear = clear_terminal_binding(target);
+        if clear != 0 {
+            return clear;
+        }
+        if !mark_target(5, target, 0, b"") {
+            return BUSY;
+        }
+        start_bound(target, out)
+    }
+}
+
+unsafe fn mode_target(target: &mut Target, mode: u8, out: *mut c::ServiceInfo) -> i32 {
+    unsafe {
+        let Some(entry) = target_entry(target) else {
+            return BUSY;
+        };
+        if mode == MODE_DISABLED && entry.id != 0 && descends(entry.binding.process) {
+            return c::service_api_result_self_restart;
+        }
+        if mode == MODE_DISABLED && matches!(entry.state, RUNNING | STARTING | STOPPING) {
+            let result = stop_bound(target, out, stop_deadline(40));
+            if result < 0 {
+                return result;
+            }
+        }
+        if mode == MODE_DISABLED {
+            let clear = clear_terminal_binding(target);
+            if clear != 0 {
+                return clear;
+            }
+        }
+        if !mark_target(6, target, i32::from(mode), b"") {
+            return BUSY;
+        }
+        bound_status(target, out)
+    }
+}
+
+unsafe fn remove_target(target: &mut Target) -> i32 {
+    unsafe {
+        let Some(entry) = target_entry(target) else {
+            return BUSY;
+        };
+        if matches!(entry.state, RUNNING | STARTING | STOPPING) {
+            return c::service_api_result_running;
+        }
+        let clear = clear_terminal_binding(target);
+        if clear != 0 {
+            return clear;
+        }
+        if mark_target(7, target, 0, b"") {
+            0
+        } else {
+            BUSY
+        }
+    }
+}
+
+/// # Safety
+/// The caller lends one readable fixed request for the call. No request
+/// pointer or obsolete name/index is retained across the original operation.
+pub unsafe extern "C" fn control_bound(request: *const c::ServiceControlRequest) -> i32 {
+    unsafe {
+        if request.is_null() {
+            return INVALID;
+        }
+        let request = request.read();
+        let deadline = stop_deadline(request.timeout_ticks);
+        if !(c::service_control_start..=c::service_control_remove).contains(&request.operation)
+            || (request.operation != c::service_control_mode && request.mode != 0)
+            || (request.operation != c::service_control_stop && request.timeout_ticks != 0)
+        {
+            return INVALID;
+        }
+        let mode = if request.operation == c::service_control_mode {
+            let Some(value) = mode(request.mode) else {
+                return INVALID;
+            };
+            value
+        } else {
+            0
+        };
+        let Some(_call) = task_context::Admission::acquire(false) else {
+            return BUSY;
+        };
+        let _collection = CollectServices;
+        let raw = match crate::service::inventory::control_target(&request) {
+            Ok(target) => target,
+            Err(error) => return error,
+        };
+        let mut target = target_value(raw);
+        if !refresh_target(&mut target) {
+            return BUSY;
+        }
+        let mut info = c::ServiceInfo::default();
+        match request.operation {
+            c::service_control_start => start_bound(&mut target, &mut info),
+            c::service_control_stop => stop_bound(&mut target, &mut info, deadline),
+            c::service_control_restart => restart_target(&mut target, &mut info),
+            c::service_control_mode => mode_target(&mut target, mode, &mut info),
+            c::service_control_remove => remove_target(&mut target),
+            _ => INVALID,
         }
     }
 }
@@ -726,6 +864,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_named(
         let Some(_call) = task_context::Admission::acquire(false) else {
             return BUSY;
         };
+        let _collection = CollectServices;
         let mode = if op == 6 {
             let Some(mode) = mode(mode_raw) else {
                 return INVALID;
@@ -760,75 +899,21 @@ pub unsafe extern "C" fn r4os_rust_program_service_named(
                     Ok(t) => t,
                     Err(e) => return e,
                 };
-                let Some(entry) = target_entry(&target) else {
-                    return BUSY;
-                };
-                if entry.id != 0 && descends(entry.binding.process) {
-                    return c::service_api_result_self_restart;
-                }
-                if matches!(entry.state, RUNNING | STARTING | STOPPING) {
-                    let result = stop_bound(&mut target, out, stop_deadline(40));
-                    if result < 0 {
-                        return result;
-                    }
-                }
-                let clear = clear_terminal_binding(&mut target);
-                if clear != 0 {
-                    return clear;
-                }
-                if !mark_target(5, &target, 0, b"") {
-                    return BUSY;
-                }
-                start_bound(&mut target, out)
+                restart_target(&mut target, out)
             }
             6 => {
                 let mut target = match refreshed_target(name) {
                     Ok(t) => t,
                     Err(e) => return e,
                 };
-                let Some(entry) = target_entry(&target) else {
-                    return BUSY;
-                };
-                if mode == MODE_DISABLED && entry.id != 0 && descends(entry.binding.process) {
-                    return c::service_api_result_self_restart;
-                }
-                if mode == MODE_DISABLED && matches!(entry.state, RUNNING | STARTING | STOPPING) {
-                    let result = stop_bound(&mut target, out, stop_deadline(40));
-                    if result < 0 {
-                        return result;
-                    }
-                }
-                if mode == MODE_DISABLED {
-                    let clear = clear_terminal_binding(&mut target);
-                    if clear != 0 {
-                        return clear;
-                    }
-                }
-                if !mark_target(6, &target, i32::from(mode), b"") {
-                    return BUSY;
-                }
-                bound_status(&target, out)
+                mode_target(&mut target, mode, out)
             }
             7 => {
                 let mut target = match refreshed_target(name) {
                     Ok(t) => t,
                     Err(e) => return e,
                 };
-                let Some(entry) = target_entry(&target) else {
-                    return BUSY;
-                };
-                if matches!(entry.state, RUNNING | STARTING | STOPPING) {
-                    return c::service_api_result_running;
-                }
-                let clear = clear_terminal_binding(&mut target);
-                if clear != 0 {
-                    return clear;
-                }
-                if mark_target(7, &target, 0, b"") {
-                    0
-                } else {
-                    BUSY
-                }
+                remove_target(&mut target)
             }
             _ => unreachable!(),
         }

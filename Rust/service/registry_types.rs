@@ -1,15 +1,12 @@
-//! Fixed private service records; original fixtures lend the same layouts.
+//! Private service records; address-stable dynamic storage owns their lifetime.
 use crate::sched::sync_types::{Mutex, Semaphore, Text, WaitQueue};
 use crate::{build_config::config, contract as c};
-pub const MAX_SERVICES: usize = 16;
-pub const MAX_ENDPOINTS: usize = MAX_SERVICES;
 pub const DEPTH: usize = crate::contract::service_api_endpoint_queue_depth;
 pub const PAYLOAD: usize = crate::contract::service_api_max_payload;
 pub const FAMILIES: usize = 7;
 pub const TIMING_STRIDE: u64 = 64;
 pub const REQUEST_BLOCK: u32 = 256;
 pub const REQUEST_MAX: u32 = 0x7fff_fffe;
-pub const INVALID_SLOT: u8 = 255;
 pub const NAMED_TARGET_INDEX: u32 = u32::MAX;
 pub const FOREVER: u64 = u64::MAX;
 pub const STATE_EMPTY: u8 = 0;
@@ -350,7 +347,8 @@ pub struct PerformanceSummary {
 }
 impl PerformanceSummary {
     pub const EMPTY: Self = Self {
-        max_services: MAX_SERVICES as u32,
+        // Zero denotes dynamic resource-limited admission, not zero capacity.
+        max_services: 0,
         used_services: 0,
         running_services: 0,
         endpoints_used: 0,

@@ -19,14 +19,17 @@ pub(super) unsafe fn snapshot() -> PerformanceSummary {
         let Some(mut guard) = reg::lock_registry(2) else {
             return out;
         };
-        for i in 0..MAX_SERVICES {
-            let e = reg::entry(i);
-            if !(*e).used {
-                continue;
+        let mut previous = 0;
+        loop {
+            let node = (*reg::raw()).entries.after(previous);
+            if node.is_null() {
+                break;
             }
-            out.used_services += 1;
+            previous = (*node).index.key as usize;
+            let e = ptr::addr_of!((*node).entry);
+            out.used_services = out.used_services.saturating_add(1);
             if (*e).state == STATE_RUNNING {
-                out.running_services += 1;
+                out.running_services = out.running_services.saturating_add(1);
             }
         }
         let r = reg::raw();
@@ -43,12 +46,37 @@ pub(super) unsafe fn snapshot() -> PerformanceSummary {
                 reg::timing_snapshot(ptr::addr_of_mut!((*r).timing).cast::<LockTiming>().add(i)),
             );
         }
+        let t = (*r).retired_lifetime;
+        out.payload_copy_bytes = t.payload_copy_bytes;
+        out.payload_clear_bytes = t.payload_clear_bytes;
+        out.slot_metadata_resets = t.slot_metadata_resets;
+        out.endpoint_metadata_resets = t.endpoint_metadata_resets;
+        out.endpoint_payload_reset_bytes = t.endpoint_payload_reset_bytes;
+        out.queue_scan_passes = t.queue_scan_passes;
+        out.queue_scan_slots = t.queue_scan_slots;
+        out.endpoint_revalidations = t.revalidations;
+        out.endpoint_stale_rejections = t.stale_rejections;
+        for family in 3..FAMILIES {
+            add_timing(&mut out, family, (*r).retired_timing[family]);
+        }
         guard.release();
-        for i in 0..MAX_ENDPOINTS {
-            let ep = reg::endpoint(i);
-            let Some(_guard) = reg::endpoint_lock(ep, 6, false) else {
+        let mut previous = 0;
+        loop {
+            let identity = {
+                let Some(_registry) = reg::lock_registry(2) else {
+                    break;
+                };
+                let node = (*reg::raw()).endpoints.after(previous);
+                if node.is_null() {
+                    break;
+                }
+                reg::identity(node.cast())
+            };
+            previous = identity.handle;
+            let Some(lease) = reg::lock_identity(identity, 6) else {
                 continue;
             };
+            let ep = lease.endpoint;
             let t = (*ep).lifetime;
             out.payload_copy_bytes = out.payload_copy_bytes.wrapping_add(t.payload_copy_bytes);
             out.payload_clear_bytes = out.payload_clear_bytes.wrapping_add(t.payload_clear_bytes);
