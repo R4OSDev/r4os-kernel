@@ -16,7 +16,7 @@ test = false
 bench = false
 
 [dependencies]
-r4os-contract = { git = "https://github.com/R4OSDev/r4os-contract.git", rev = "33dc8c9176704e9d4c012000974e28d70d148270" }
+r4os-contract = { git = "https://github.com/R4OSDev/r4os-contract.git", rev = "f825a0877e50335df72aab01e13e256ec1dddd08" }
 
 r4os-text-core = { git = "https://github.com/R4OSDev/r4os-libraries.git", rev = "8bb663fa8cf2e002c585656974857f9fe2afcec3" }
 

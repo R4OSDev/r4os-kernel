@@ -19,12 +19,14 @@ use core::{
 };
 struct Fixtures {
     guard: UnwindGuard,
+    sibling: UnwindGuard,
     mutex: Mutex,
 }
 struct Storage(UnsafeCell<Fixtures>);
 unsafe impl Sync for Storage {}
 static FIX: Storage = Storage(UnsafeCell::new(Fixtures {
     guard: UnwindGuard::EMPTY,
+    sibling: UnwindGuard::EMPTY,
     mutex: Mutex::EMPTY,
 }));
 static TASKS: [AtomicPtr<Task>; 3] = [const { AtomicPtr::new(ptr::null_mut()) }; 3];
@@ -66,6 +68,7 @@ fn reset(mode: u32) -> bool {
     unsafe {
         FIX.0.get().write(Fixtures {
             guard: UnwindGuard::EMPTY,
+            sibling: UnwindGuard::EMPTY,
             mutex: Mutex::EMPTY,
         });
     }
@@ -226,6 +229,22 @@ fn handoff(mode: u32) -> bool {
                 && after.wake_one == before.wake_one + 1
                 && after.directed_scans == before.directed_scans
                 && queues_valid();
+            if ok {
+                // Real selected FIFO successor, still pinned by this probe's
+                // Runtime admission. A nested try must not consume its offer or
+                // grant unrelated ownership before the ordinary claim path.
+                let original = (*c).guard_offer;
+                let sibling = ptr::addr_of_mut!((*FIX.0.get()).sibling);
+                ok = !try_task_owned(sibling, task(0))
+                    && free(sibling)
+                    && (*sibling).owner_task.is_null()
+                    && (*c).guard_offer.guard == original.guard
+                    && (*c).guard_offer.queue_generation == original.queue_generation
+                    && (*c).guard_offer.epoch == original.epoch
+                    && offered(task(0), g)
+                    && (*c).unwind_guard_count == 0
+                    && ok;
+            }
             let id = (*c).id;
             let generation = (*c).generation;
             if mode == 0 {

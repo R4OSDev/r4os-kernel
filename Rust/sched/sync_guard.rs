@@ -88,11 +88,15 @@ pub(crate) unsafe fn guard_try(g: *mut UnwindGuard) -> bool {
     result
 }
 unsafe fn try_owned(g: *mut UnwindGuard) -> bool {
+    unsafe { try_task_owned(g, scheduler::current().cast()) }
+}
+// Runtime held. Kept separate so the existing native handoff probe can check
+// admission against its actual offered task before that task resumes/claims.
+unsafe fn try_task_owned(g: *mut UnwindGuard, t: *mut Task) -> bool {
     unsafe {
         if (*g).queue.core.closing {
             return false;
         }
-        let t = scheduler::current().cast::<Task>();
         if t.is_null() {
             if free(g) {
                 (*g).boot_owner = true;
@@ -107,10 +111,13 @@ unsafe fn try_owned(g: *mut UnwindGuard) -> bool {
         }
         let c = registry::core(t);
         if free(g) {
-            if (*c).unwind_guard_count == u32::MAX {
+            // A ready/current task may still have its original FIFO offer
+            // before claim. A nested nonblocking attempt cannot acquire a
+            // different guard in that interval; retain the offer for claim,
+            // timeout or cancellation and let this attempt report busy.
+            if (*c).unwind_guard_count == u32::MAX || !(*c).guard_offer.is_empty() {
                 return false;
             }
-            assert!((*c).guard_offer.is_empty());
             (*g).owner = (*c).id;
             (*g).owner_generation = (*c).generation;
             (*g).depth = 1;
