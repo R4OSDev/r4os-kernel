@@ -6,8 +6,14 @@ fn main() {
     let script = manifest.join("linker.ld");
     println!("cargo::rerun-if-changed=linker.ld");
     println!("cargo::rustc-link-arg-bin=r4os=-T{}", script.display());
-    println!("cargo::rustc-link-arg-bin=r4os=--build-id=none");
-    println!("cargo::rustc-link-arg-bin=r4os=-zmax-page-size=4096");
+    println!("cargo::rerun-if-env-changed=R4OS_KERNEL_LINKER_FLAGS");
+    for flag in env::var("R4OS_KERNEL_LINKER_FLAGS")
+        .expect("SDK-selected kernel linker flags")
+        .split('\u{1f}')
+    {
+        assert!(!flag.is_empty() && !flag.contains('\n'));
+        println!("cargo::rustc-link-arg-bin=r4os={flag}");
+    }
 
     println!("cargo::rerun-if-env-changed=R4OS_KERNEL_BUILD_CONFIG");
     println!("cargo::rerun-if-changed=VERSION.R4S");

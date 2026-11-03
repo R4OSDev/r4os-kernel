@@ -17,5 +17,18 @@ function Get-R4KernelBuildMetadata {
             throw 'Kernel Rust profile differs from its migration contract.'
         }
     }
+    if($metadata.ContainsKey('sdk_profile')){
+        $settings=@{}
+        foreach($line in [IO.File]::ReadAllLines((Join-Path $KernelRoot 'Settings.R4S'))){if($line -match '^([A-Z_]+)=(.+)$'){$settings[$Matches[1]]=$Matches[2]}}
+        $repositories=[IO.Path]::GetFullPath($settings.REPOSITORIES_ROOT.Replace('\','/'),$KernelRoot)
+        $sdk=[IO.Path]::GetFullPath($settings.SDK_ROOT.Replace('\','/'),$repositories)
+        . (Join-Path $sdk 'Tools/ProfileData.ps1')
+        $data=Read-R4SdkProfiles $sdk
+        if($metadata.sdk_profile.id -cne 'r4os-kernel-rust-v1'){throw 'KernelSdkProfileIdentityMismatch'}
+        foreach($name in $data.hashes.Keys){if($metadata.sdk_profile.hashes[$name] -cne $data.hashes[$name]){throw 'KernelSdkProfileSourceMismatch; rebuild Kernel with selected SDK.'}}
+        $codegen=$data.Build.codegen.kernel
+        if(($metadata.profiles.rust.rustflags -join [char]31) -cne ($codegen.rustflags -join [char]31) -or
+            ($metadata.profiles.rust.linker_flags -join [char]31) -cne ($codegen.linker_flags -join [char]31)) {throw 'KernelSdkFlagsMismatch'}
+    }
     return $metadata
 }
