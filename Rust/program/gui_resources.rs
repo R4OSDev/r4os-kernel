@@ -31,6 +31,7 @@ pub(super) fn kind(command: &Command) -> Option<u16> {
         | c::gui_frame_command_kind_path_stroke
         | c::gui_frame_command_kind_rounded_rect
         | c::gui_frame_command_kind_shadow
+        | c::gui_frame_command_kind_gradient_rounded_rect
         | c::gui_frame_command_kind_argb32 => 4,
         c::gui_frame_command_kind_indexed8 => 5,
         c::gui_frame_command_kind_xrgb32_nearest => 6,
@@ -407,6 +408,61 @@ pub(super) fn path(resource: &[u8], count: u32) -> Option<()> {
     }
     Some(())
 }
+fn gradient(resource: &[u8]) -> Option<()> {
+    type G = c::GuiGradientPaint;
+    if resource.len() < mem::size_of::<G>()
+        || field!(resource, G, version) != c::gui_gradient_resource_version
+        || field!(resource, G, size) as usize != mem::size_of::<G>()
+    {
+        return None;
+    }
+    let count = field!(resource, G, stop_count);
+    if !(2..=c::gui_gradient_max_stops).contains(&count)
+        || resource.len()
+            != mem::size_of::<G>() + count as usize * mem::size_of::<c::GuiGradientStop>()
+    {
+        return None;
+    }
+    let sx = field!(resource, G, start_x_bits);
+    let sy = field!(resource, G, start_y_bits);
+    let ex = field!(resource, G, end_x_bits);
+    let ey = field!(resource, G, end_y_bits);
+    if ![sx, sy, ex, ey].into_iter().all(coordinate) {
+        return None;
+    }
+    let minimum = 1.0 / 256.0;
+    match field!(resource, G, kind) {
+        c::gui_gradient_kind_linear => {
+            let dx = float(ex)? - float(sx)?;
+            let dy = float(ey)? - float(sy)?;
+            if dx * dx + dy * dy < minimum * minimum {
+                return None;
+            }
+        }
+        c::gui_gradient_kind_radial => {
+            if float(ex)? < minimum || float(ey)? < minimum {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    let mut previous = -1.0;
+    for index in 0..count as usize {
+        let offset = mem::size_of::<G>() + index * mem::size_of::<c::GuiGradientStop>();
+        let position = float(read_u32(resource, offset)?)?;
+        if position < 0.0
+            || position > 1.0
+            || position <= previous
+            || (index == 0 && position != 0.0)
+            || (index + 1 == count as usize && position != 1.0)
+        {
+            return None;
+        }
+        previous = position;
+    }
+    Some(())
+}
+
 pub(super) fn shape(command: &Command, resource: &[u8]) -> Option<()> {
     type T = c::GuiShapeResource;
     if command.w == 0
@@ -441,7 +497,19 @@ pub(super) fn shape(command: &Command, resource: &[u8]) -> Option<()> {
         return None;
     }
     let segment_bytes = u64::from(count).checked_mul(u64::from(c::gui_path_segment_size))?;
-    let expected = u64::from(c::gui_shape_resource_size).checked_add(segment_bytes)?;
+    let extra = if command.kind == c::gui_frame_command_kind_gradient_rounded_rect {
+        if count != 0 || geometry != c::gui_shape_geometry_kind_rounded_rect {
+            return None;
+        }
+        let tail = &resource[mem::size_of::<T>()..];
+        gradient(tail)?;
+        tail.len() as u64
+    } else {
+        0
+    };
+    let expected = u64::from(c::gui_shape_resource_size)
+        .checked_add(segment_bytes)?
+        .checked_add(extra)?;
     if expected != resource.len() as u64 {
         return None;
     }
@@ -534,7 +602,8 @@ pub(super) fn shape(command: &Command, resource: &[u8]) -> Option<()> {
             && join != 0
             && cap != 0)
             .then_some(()),
-        c::gui_frame_command_kind_rounded_rect => {
+        c::gui_frame_command_kind_rounded_rect
+        | c::gui_frame_command_kind_gradient_rounded_rect => {
             (geometry == c::gui_shape_geometry_kind_rounded_rect).then_some(())
         }
         c::gui_frame_command_kind_shadow => Some(()),
@@ -661,7 +730,10 @@ pub(super) fn batch(command: &Command, resources: &[u8]) -> bool {
         c::gui_frame_command_kind_path_fill
         | c::gui_frame_command_kind_path_stroke
         | c::gui_frame_command_kind_rounded_rect
-        | c::gui_frame_command_kind_shadow => kind == 4 && shape(command, resource).is_some(),
+        | c::gui_frame_command_kind_shadow
+        | c::gui_frame_command_kind_gradient_rounded_rect => {
+            kind == 4 && shape(command, resource).is_some()
+        }
         _ => false,
     }
 }

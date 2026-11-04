@@ -265,6 +265,75 @@ pub(super) unsafe fn mixed_resources(id: u32, heap: &heap::Stats, base: &t::Stat
             && !super::super::gui_resources::batch(&value, &invalid_kind)
             && !super::super::gui_resources::batch(&value, &non_finite);
         let shape_cancelled = flow::cancel(&mut fake) == 0;
+        let gradient_frame = flow::replace(&mut fake, true);
+        if gradient_frame.is_null() {
+            return false;
+        }
+        let header = c::GuiShapeResource {
+            geometry_kind: c::gui_shape_geometry_kind_rounded_rect,
+            fill_rule: c::gui_shape_fill_rule_nonzero,
+            geometry_w_bits: 32.0f32.to_bits(),
+            geometry_h_bits: 16.0f32.to_bits(),
+            ..Default::default()
+        };
+        let paint = c::GuiGradientPaint {
+            kind: c::gui_gradient_kind_linear,
+            stop_count: 2,
+            end_x_bits: 32.0f32.to_bits(),
+            end_y_bits: 16.0f32.to_bits(),
+            ..Default::default()
+        };
+        let stops = [
+            c::GuiGradientStop {
+                position_bits: 0,
+                argb: 0xff112233,
+            },
+            c::GuiGradientStop {
+                position_bits: 1.0f32.to_bits(),
+                argb: 0xffaabbcc,
+            },
+        ];
+        let mut gradient = [0u8; 208];
+        gradient[..SHAPE].copy_from_slice(bytes_of(&header));
+        gradient[SHAPE..SHAPE + 32].copy_from_slice(bytes_of(&paint));
+        gradient[SHAPE + 32..].copy_from_slice(bytes_of(&stops));
+        let value = c::GuiFrameCommand {
+            kind: c::gui_frame_command_kind_gradient_rounded_rect,
+            w: 32,
+            h: 16,
+            resource_bytes: gradient.len() as u64,
+            ..Default::default()
+        };
+        let admitted = batch(&mut fake, &[value], &gradient) == 0;
+        gradient.fill(0x5a);
+        let mut observed = [0u8; 208];
+        let copied = view::resources(gradient_frame, 0, observed.as_mut_ptr(), 208) == 208
+            && observed[SHAPE + 36..SHAPE + 40] == 0xff112233u32.to_le_bytes();
+        let committed =
+            admitted && copied && life::valid(gradient_frame, id) && flow::commit(&mut fake) == 0;
+        if !committed {
+            storage::rollback(id, &mut storage);
+            return false;
+        }
+        let published = (*gui).committed_frame;
+        let published_hash = hash(published);
+        let building = flow::replace(&mut fake, true);
+        if building.is_null() {
+            return false;
+        }
+        let before = hash(building);
+        // A failed append taints this private transaction. It cannot publish,
+        // and must leave the previously committed gradient completely intact.
+        let mut invalid = observed;
+        invalid[SHAPE + 12..SHAPE + 16].copy_from_slice(&1u32.to_le_bytes());
+        let rejected = batch(&mut fake, &[value], &invalid) == c::gui_frame_error_invalid
+            && hash(building) == before
+            && (*building).command_count == 0
+            && flow::commit(&mut fake) == c::gui_frame_error_state
+            && (*gui).committed_frame == published
+            && hash(published) == published_hash
+            && flow::cancel(&mut fake) == 0;
+        let gradient_ok = committed && rejected;
         let argb_frame = flow::replace(&mut fake, true);
         if argb_frame.is_null() {
             return false;
@@ -326,6 +395,7 @@ pub(super) unsafe fn mixed_resources(id: u32, heap: &heap::Stats, base: &t::Stat
             && shape_ok
             && shape_negative
             && shape_cancelled
+            && gradient_ok
             && argb_ok
             && argb_negative
             && argb_cancelled

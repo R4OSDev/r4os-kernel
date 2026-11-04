@@ -230,6 +230,7 @@ pub(super) unsafe fn valid(frame: *const t::Frame, owner: u32) -> bool {
                     | contract::gui_frame_command_kind_path_stroke
                     | contract::gui_frame_command_kind_rounded_rect
                     | contract::gui_frame_command_kind_shadow
+                    | contract::gui_frame_command_kind_gradient_rounded_rect
                     | contract::gui_frame_command_kind_argb32 => 4,
                     contract::gui_frame_command_kind_indexed8 => 5,
                     contract::gui_frame_command_kind_xrgb32_nearest => 6,
