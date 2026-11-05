@@ -220,6 +220,9 @@ fn configure_sys() {
             as usize,
         service_inventory_page: crate::service::inventory::page as *const () as usize,
         service_control_bound: super::service_api::control_bound as *const () as usize,
+        system_update_target_supported:
+            crate::program::system::atomic::r4os_rust_sys_update_target_supported as *const ()
+                as usize,
         directory_batch: crate::program::system::directory::r4os_rust_sys_directory_batch
             as *const () as usize,
         drive_info_geometry: crate::program::system::directory::r4os_rust_sys_drive_info_geometry
@@ -333,7 +336,8 @@ fn configure_sys() {
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1408);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1416);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, system_update_target_supported) == 1408);
     assert!(mem::offset_of!(c::R4XStartR4Sys, service_inventory_page) == 1392);
     assert!(mem::offset_of!(c::R4XStartR4Sys, service_control_bound) == 1400);
     assert!(mem::offset_of!(c::R4XStartR4Sys, program_observation_retain) == 1336);

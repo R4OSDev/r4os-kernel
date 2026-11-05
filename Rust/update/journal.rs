@@ -378,7 +378,17 @@ pub fn parent_path(v: &[u8]) -> &[u8] {
 pub fn base_name(v: &[u8]) -> &[u8] {
     v.iter().rposition(|b| sep(*b)).map_or(v, |i| &v[i + 1..])
 }
-fn target_valid(v: &[u8]) -> bool {
+/// Ordinary R4X leaves may live in user-selected directories. BOOT keeps its
+/// explicit contract; structural/name checks precede this scope decision.
+fn application_target(v: &[u8]) -> bool {
+    v.len() >= 7
+        && v[0].is_ascii_alphabetic()
+        && v[1] == b':'
+        && v[2] == b'\\'
+        && suffix(v, b".R4X")
+        && !prefix(v, b"C:\\BOOT\\")
+}
+pub fn target_supported(v: &[u8]) -> bool {
     if super::paths::companion_kind(v).is_some()
         || same(v, b"\\boot\\r4os.elf")
         || same(v, b"C:\\CONFIG.R4S")
@@ -401,11 +411,12 @@ fn target_valid(v: &[u8]) -> bool {
             return true;
         }
     }
-    v.len() >= 4
-        && v[0].is_ascii_alphabetic()
-        && !v[0].eq_ignore_ascii_case(&b'C')
-        && v[1] == b':'
-        && v[2] == b'\\'
+    application_target(v)
+        || v.len() >= 4
+            && v[0].is_ascii_alphabetic()
+            && !v[0].eq_ignore_ascii_case(&b'C')
+            && v[1] == b':'
+            && v[2] == b'\\'
 }
 pub fn phase_text(v: u32) -> &'static [u8] {
     match v {
@@ -486,7 +497,7 @@ pub fn paths_valid(j: &Journal) -> bool {
         let Some(bn) = internal_name(&mut b, target, b'B', j.transaction_generation, i) else {
             return false;
         };
-        if !target_valid(target)
+        if !target_supported(target)
             || !short_name(base_name(stage))
             || !short_name(base_name(backup))
             || !same(parent_path(target), parent_path(stage))
@@ -531,10 +542,15 @@ fn component_valid(c: &Component) -> bool {
         || !version_valid(c.version())
         || target.is_empty()
         || target.len() >= MAX_PATH
-        || target[0] != b'/'
+        || !(target[0] == b'/'
+            || target.len() >= 4
+                && target[0].is_ascii_alphabetic()
+                && !target[0].eq_ignore_ascii_case(&b'C')
+                && &target[1..3] == b":/")
+        || core::str::from_utf8(target).is_err()
         || target
             .iter()
-            .any(|b| *b < 0x20 || *b >= 0x7f || b";=|\\".contains(b))
+            .any(|b| *b < 0x20 || *b == 0x7f || b";=|\\".contains(b))
     {
         return false;
     }

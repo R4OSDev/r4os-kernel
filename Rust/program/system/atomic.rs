@@ -15,6 +15,30 @@ macro_rules! some {
         }
     };
 }
+/// Read-only target-scope capability of the installed journal replay owner.
+/// This does not resolve a volume or admit an installation.
+///
+/// # Safety
+/// Caller retains a bounded NUL-terminated UTF8 path through return.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_update_target_supported(input: *const u8) -> i32 {
+    if input.is_null() {
+        return -1;
+    }
+    let mut raw = path::Buffer::<1024>::new();
+    let Some(value) = (unsafe { path::copy_z(input, &mut raw) }) else {
+        return -1;
+    };
+    if !path::valid_unicode(value) {
+        return -1;
+    }
+    let mut normalized = [0u8; 1024];
+    let Some(len) = crate::update::journal::normalize(&mut normalized, value) else {
+        return -1;
+    };
+    i32::from(crate::update::journal::target_supported(&normalized[..len]))
+}
+
 unsafe fn targets(
     buffers: &mut [PathBuffers; 3],
     inputs: [*const u8; 3],
