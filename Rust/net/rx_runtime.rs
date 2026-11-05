@@ -382,6 +382,9 @@ fn is_current() -> bool {
     let _critical = Critical::acquire();
     unsafe { identity == ((*state()).rx_task_id, (*state()).rx_task_generation) }
 }
+pub(super) fn is_worker_current() -> bool {
+    is_current() || is_ap_current()
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_net_rx_runtime_schedule(index: usize) -> bool {
     let Some(_callback) = CallbackGuard::acquire() else {

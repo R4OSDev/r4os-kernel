@@ -3,13 +3,15 @@
 //! caller output, polling and waits occur outside it. Cache methods reacquire
 //! the same network owner, never a different equal-ranked I/O owner.
 use super::{
-    arp, cache, config, core_bytes, ethernet, icmp, ipv4, r4p_contract as wire, timing, udp,
+    adapters, arp, cache, config, core_bytes, ethernet, icmp, ipv4, r4p_contract as wire,
+    rx_runtime, timing, udp,
 };
 use crate::{memory::owner::Guard, sched::sync_types::Text};
 use core::cell::UnsafeCell;
 struct Metadata {
     ethernet: ethernet::Stats,
     arp: arp::Stats,
+    arp_rx_next_request_tick: [u64; adapters::CAPACITY],
     ipv4: ipv4::Stats,
     icmp: icmp::Stats,
     udp: udp::Stats,
@@ -20,6 +22,7 @@ impl Metadata {
     const EMPTY: Self = Self {
         ethernet: ethernet::Stats::EMPTY,
         arp: arp::Stats::EMPTY,
+        arp_rx_next_request_tick: [0; adapters::CAPACITY],
         ipv4: ipv4::Stats::EMPTY,
         icmp: icmp::Stats::EMPTY,
         udp: udp::Stats::EMPTY,
@@ -255,6 +258,9 @@ pub unsafe extern "C" fn r4os_rust_net_arp_resolve(
     out: *mut [u8; 6],
     peers: *const ArpPeers,
 ) -> u8 {
+    if adapters::snapshot(index).is_none() {
+        return 1;
+    }
     let target = unsafe { *target };
     let peers = unsafe { &*peers };
     let route = core_bytes::route_ipv4_target(target);
@@ -278,6 +284,36 @@ pub unsafe extern "C" fn r4os_rust_net_arp_resolve(
             s.arp.last_error = Text::literal(b"cache-hit");
         });
         return 0;
+    }
+    // RX workers serialize protocol consumption. A synchronous ARP wait here
+    // prevents this consumer from reaching the queued reply, including when
+    // the AP worker owns frame dispatch instead of the BSP maintenance task.
+    // TCP retains unsent ACK/FIN/retransmit work when we return Busy; the
+    // outer drain can consume the reply before a later activation retries.
+    if rx_runtime::is_worker_current() {
+        let now = timing::now_ticks();
+        let request = metadata(|s| {
+            if now < s.arp_rx_next_request_tick[index] {
+                return false;
+            }
+            s.arp_rx_next_request_tick[index] =
+                now.saturating_add(timing::DEFAULT_ARP_RESOLVE_TIMEOUT_TICKS);
+            s.arp.pending_packets += 1;
+            s.arp.pending_queue_limit = 0;
+            s.arp.resolve_attempts += 1;
+            true
+        });
+        // Only resident pacing metadata is protected by the network owner;
+        // the driver/protocol callback must run after that admission ends.
+        if request {
+            let result = unsafe { (peers.request)(index, &route.next_hop_ip) };
+            if result != 0 {
+                metadata(|s| s.arp.pending_drops += 1);
+                return result;
+            }
+        }
+        arp_error(Text::literal(b"resolve-pending"));
+        return 3;
     }
     metadata(|s| {
         s.arp.pending_packets += 1;
@@ -360,8 +396,11 @@ pub extern "C" fn r4os_rust_net_arp_cache_expire_owned() {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_net_arp_cache_flush_owned() {
-    metadata(|s| unsafe {
-        cache::r4os_rust_arp_cache_flush(&mut s.arp);
+    metadata(|s| {
+        s.arp_rx_next_request_tick = [0; adapters::CAPACITY];
+        unsafe {
+            cache::r4os_rust_arp_cache_flush(&mut s.arp);
+        }
     });
 }
 #[unsafe(no_mangle)]
