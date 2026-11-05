@@ -1159,3 +1159,73 @@ unsafe fn orphan_host_inputs(host: Handle) {
 pub(super) unsafe fn revision() -> u64 {
     unsafe { (*root()).revision }
 }
+
+/// Read-only immutable appearance for this exact registered host's window.
+/// Registry precedes metadata0; neither guard spans output, allocation or I/O.
+pub(crate) unsafe extern "C" fn appearance(
+    request: *const c::GuiPointerWindowIdentity,
+    out: *mut c::GuiWindowAppearance,
+) -> i32 {
+    if request.is_null() || out.is_null() {
+        return c::gui_host_input_error_invalid;
+    }
+    let request = unsafe { request.read() };
+    if !valid(request.owner) || request.reserved != 0 || request.window_id < 0 || request.epoch == 0
+    {
+        return c::gui_host_input_error_invalid;
+    }
+    let Some(_caller) = admission() else {
+        return c::gui_host_input_error_context;
+    };
+    let Some(source) = (unsafe { context::handle() }) else {
+        return c::gui_host_input_error_context;
+    };
+    let Some(registry) = registry::Guard::acquire() else {
+        return c::gui_host_input_error_context;
+    };
+    let guard = Guard::acquire(0);
+    let result = unsafe {
+        (|| -> Result<c::GuiWindowAppearance, i32> {
+            if !same((*root()).host, source) {
+                return Err(c::gui_host_input_error_context);
+            }
+            let gui = destination(request.owner);
+            if gui.is_null() {
+                return Err(c::gui_host_input_error_stale);
+            }
+            let slot = registry::lookup_handle(request.owner, true);
+            if slot.is_null() {
+                return Err(c::gui_host_input_error_stale);
+            }
+            let instance = ptr::addr_of_mut!((*slot).instance);
+            let identity = own_window(instance, request.owner);
+            if !window_same(identity, request)
+                || !same((*gui).pointer.host, source)
+                || (*gui).pointer.host_epoch != (*root()).host_epoch
+            {
+                return Err(c::gui_host_input_error_stale);
+            }
+            let runtime = super::payload::runtime(instance);
+            if runtime.is_null() {
+                return Err(c::gui_host_input_error_context);
+            }
+            let appearance = (*runtime).appearance;
+            Ok(c::GuiWindowAppearance {
+                window: identity,
+                flags: appearance.flags,
+                title_background: appearance.background,
+                title_foreground: appearance.foreground,
+                reserved: 0,
+            })
+        })()
+    };
+    drop(guard);
+    drop(registry);
+    match result {
+        Ok(value) => {
+            unsafe { out.write(value) };
+            0
+        }
+        Err(error) => error,
+    }
+}

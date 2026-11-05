@@ -543,6 +543,7 @@ unsafe fn metadata(
         memory::r4os_rust_program_memory_contract(util::span(value), class, memory.as_mut_ptr())
             && policy::r4os_rust_program_parallel(value.as_ptr(), value.len()) != u8::MAX
             && policy::r4os_rust_program_desktop_host(value.as_ptr(), value.len()) != u8::MAX
+            && policy::title_appearance(value).is_some()
     }
 }
 pub(super) unsafe fn classify(file: &File, policy: u32) -> Option<u8> {

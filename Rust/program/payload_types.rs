@@ -31,6 +31,7 @@ pub struct Runtime {
     pub r4xstart_import_symbol_names: [[u8; 32]; 16],
     pub r4l_code_binding_count: u8,
     pub module_path: [u8; 128],
+    pub appearance: super::policy::Appearance,
 }
 
 #[repr(C)]
@@ -646,7 +647,7 @@ const _: () = {
     assert!(mem::offset_of!(Header, requested_bytes) == 8);
     assert!(mem::offset_of!(Header, kind) == 12);
     assert!(mem::offset_of!(Header, reserved) == 14);
-    assert!(mem::size_of::<Runtime>() == 2112);
+    assert!(mem::size_of::<Runtime>() == 2120);
     assert!(mem::align_of::<Runtime>() == 8);
     assert!(mem::offset_of!(Runtime, header) == 800);
     assert!(mem::offset_of!(Runtime, local_context) == 0);

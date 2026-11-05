@@ -60,6 +60,7 @@ pub struct Loaded {
     pub import_count: u32,
     pub section_count: u32,
     pub relocation_count: u32,
+    pub appearance: policy::Appearance,
 }
 #[repr(C)]
 pub struct Reader {
@@ -224,7 +225,11 @@ fn exports(r: &Request, sections: &[Section]) -> Option<(bool, bool)> {
     }
     Some((v1, v2))
 }
-fn metadata(r: &Request, v1: bool, v2: bool) -> Option<(memory::Contract, bool, bool, bool)> {
+fn metadata(
+    r: &Request,
+    v1: bool,
+    v2: bool,
+) -> Option<(memory::Contract, bool, bool, bool, policy::Appearance)> {
     let mut c = ReadContext {
         reader: r.reader,
         name: span(b"r4x-metadata-probe"),
@@ -260,11 +265,16 @@ fn metadata(r: &Request, v1: bool, v2: bool) -> Option<(memory::Contract, bool, 
     if desktop == u8::MAX {
         return None;
     }
+    let Some(appearance) = policy::title_appearance(meta) else {
+        log(b"Invalid R4X title color metadata\r\n");
+        return None;
+    };
     Some((
         memory,
         parallel == 1,
         workers == 1,
         desktop == 1 && r.app_class == 1,
+        appearance,
     ))
 }
 fn align(value: usize, alignment: usize) -> Option<usize> {
@@ -559,6 +569,7 @@ fn finish(
     parallel: bool,
     workers: bool,
     desktop: bool,
+    appearance: policy::Appearance,
 ) -> Option<Loaded> {
     if !payload(r, sections, offsets, image) {
         return None;
@@ -604,6 +615,7 @@ fn finish(
         import_count: r.header.import_count,
         section_count: r.header.section_count,
         relocation_count: r.header.reloc_count,
+        appearance,
     })
 }
 /// # Safety
@@ -626,7 +638,7 @@ pub unsafe extern "C" fn r4os_rust_program_image_load(
         log(b"Invalid R4M0 exports\r\n");
         return false;
     };
-    let Some((memory, parallel, workers, desktop)) = metadata(r, v1, v2) else {
+    let Some((memory, parallel, workers, desktop, appearance)) = metadata(r, v1, v2) else {
         return false;
     };
     let mut offsets = [0usize; 16];
@@ -644,7 +656,7 @@ pub unsafe extern "C" fn r4os_rust_program_image_load(
     let image = unsafe { image.assume_init() };
     unsafe { ptr::write_bytes(image.code, 0, image.len) };
     let Some(loaded) = finish(
-        r, sections, &offsets, image, memory, parallel, workers, desktop,
+        r, sections, &offsets, image, memory, parallel, workers, desktop, appearance,
     ) else {
         super::stack::r4os_rust_program_image_release(image.range_id);
         return false;
@@ -662,7 +674,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ImportSeed, module_name_len) == 64);
     assert!(core::mem::offset_of!(ImportSeed, symbol_name) == 72);
     assert!(core::mem::offset_of!(ImportSeed, symbol_name_len) == 104);
-    assert!(core::mem::size_of::<Loaded>() == 1920);
+    assert!(core::mem::size_of::<Loaded>() == 1928);
     assert!(core::mem::offset_of!(Loaded, imports) == 112);
     assert!(core::mem::size_of::<Request>() == 96);
     assert!(core::mem::offset_of!(Request, file_size) == 80);

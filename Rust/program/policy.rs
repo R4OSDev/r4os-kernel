@@ -103,9 +103,89 @@ pub extern "C" fn r4os_rust_program_natural_exit(
     exited && (execution_pinned || scheduler_task_present)
 }
 
+/// Immutable loaded R4X metadata, never a live window setter.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct Appearance {
+    pub flags: u32,
+    pub background: u32,
+    pub foreground: u32,
+}
+pub(super) fn title_appearance(metadata: &[u8]) -> Option<Appearance> {
+    let mut result = Appearance::default();
+    for item in metadata.split(|b| *b == 0) {
+        let eq = item.iter().position(|b| *b == b'=');
+        let key = &item[..eq.unwrap_or(item.len())];
+        for (index, expected) in [b"gui.title.background".as_slice(), b"gui.title.foreground"]
+            .iter()
+            .enumerate()
+        {
+            if !key.eq_ignore_ascii_case(expected) {
+                continue;
+            }
+            if key != *expected || eq.is_none() {
+                return None;
+            }
+            let bit = 1u32 << index;
+            if result.flags & bit != 0 {
+                return None;
+            }
+            let text = &item[eq? + 1..];
+            if text.len() != 6 {
+                return None;
+            }
+            let mut rgb = 0u32;
+            for ch in text {
+                let digit = match ch {
+                    b'0'..=b'9' => ch - b'0',
+                    b'a'..=b'f' => ch - b'a' + 10,
+                    b'A'..=b'F' => ch - b'A' + 10,
+                    _ => return None,
+                };
+                rgb = (rgb << 4) | u32::from(digit);
+            }
+            result.flags |= bit;
+            if index == 0 {
+                result.background = rgb;
+            } else {
+                result.foreground = rgb;
+            }
+        }
+    }
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parallel_owner;
+    use super::{Appearance, parallel_owner, title_appearance};
+    #[test]
+    fn immutable_title_color_admission() {
+        assert_eq!(
+            title_appearance(b"feature=ordinary"),
+            Some(Appearance::default())
+        );
+        assert_eq!(
+            title_appearance(b"gui.title.background=000000\0gui.title.foreground=FfEeDd"),
+            Some(Appearance {
+                flags: 3,
+                background: 0,
+                foreground: 0xffeedd
+            })
+        );
+        for invalid in [
+            b"gui.title.background=123456\0gui.title.background=123456".as_slice(),
+            b"GUI.title.background=123456",
+            b"gui.title.foreground=fff",
+            b"gui.title.foreground=#ffffff",
+            b"gui.title.foreground=12345g",
+            b"gui.title.foreground=ffffff00",
+            b"gui.title.foreground= ffffff",
+            b"gui.title.foreground=ffffff ",
+            b"gui.title.background",
+        ] {
+            assert_eq!(title_appearance(invalid), None);
+        }
+    }
     #[test]
     fn separate_main_and_worker_declarations() {
         let meta = b"runtime.parallel=bsp\0runtime.workers=owned-v1\0";
