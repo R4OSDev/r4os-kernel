@@ -310,6 +310,8 @@ pub(super) unsafe fn run() -> bool {
         check!(shared_lifecycle(&heap, &base));
         check!(stack_headroom());
         check!(generation2::providers());
+        check!(generation2::contexts(&heap, &base));
+        check!(generation2::query_admission());
         (*s).report = t::SelfTestReport {
             cases: case,
             failed_case: 0,

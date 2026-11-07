@@ -61,6 +61,7 @@ pub struct Loaded {
     pub section_count: u32,
     pub relocation_count: u32,
     pub appearance: policy::Appearance,
+    pub start_generation: u8,
 }
 #[repr(C)]
 pub struct Reader {
@@ -214,9 +215,8 @@ fn exports(r: &Request, sections: &[Section]) -> Option<(bool, bool)> {
         let v = record::<r4m::ExportRecord>(r, i, 3, b"r4x-export-table")?;
         let mut buf = [0u8; 128];
         let name = string(r, v.name_offset, &mut buf, b"r4x-export-name")?;
-        if name == b"R4XStart" {
-            v1 |= v.version >= 1;
-            v2 |= v.version >= 2;
+        if !policy::start_export(&mut v1, &mut v2, name, v.version) {
+            return None;
         }
         let section = sections.get(v.section as usize)?;
         if !section.loadable() || v.offset >= section.mem_size {
@@ -229,7 +229,7 @@ fn metadata(
     r: &Request,
     v1: bool,
     v2: bool,
-) -> Option<(memory::Contract, bool, bool, bool, policy::Appearance)> {
+) -> Option<(memory::Contract, bool, bool, bool, policy::Appearance, u8)> {
     let mut c = ReadContext {
         reader: r.reader,
         name: span(b"r4x-metadata-probe"),
@@ -242,16 +242,7 @@ fn metadata(
         return None;
     }
     let meta = &buf[s.offset..s.offset + s.len];
-    if !unsafe {
-        policy::r4os_rust_program_start_accepts(
-            meta.as_ptr(),
-            meta.len(),
-            v1 && !v2,
-            r.header.export_count,
-        )
-    } {
-        return None;
-    }
+    let generation = policy::start_generation(meta, v1, v2, r.header.export_count)?;
     let memory = memory::resolve(meta, r.app_class)?;
     let parallel = unsafe { policy::r4os_rust_program_parallel(meta.as_ptr(), meta.len()) };
     if parallel == u8::MAX {
@@ -275,6 +266,7 @@ fn metadata(
         workers == 1,
         desktop == 1 && r.app_class == 1,
         appearance,
+        generation,
     ))
 }
 fn align(value: usize, alignment: usize) -> Option<usize> {
@@ -331,7 +323,12 @@ fn copy_name(src: &[u8], out: &mut [u8; 32], len: &mut usize) -> bool {
     *len = src.len();
     true
 }
-fn imports(r: &Request, resolved: &mut [Resolved], seeds: &mut [ImportSeed]) -> bool {
+fn imports(
+    r: &Request,
+    generation: u8,
+    resolved: &mut [Resolved],
+    seeds: &mut [ImportSeed],
+) -> bool {
     if r.header.import_count as usize > resolved.len()
         || r.header.import_count as usize > seeds.len()
     {
@@ -350,6 +347,17 @@ fn imports(r: &Request, resolved: &mut [Resolved], seeds: &mut [ImportSeed]) -> 
             return false;
         };
         if !unsafe { r4m::r4os_rust_r4m_import(span(module), v.flags) } || v.min_version == 0 {
+            return false;
+        }
+        let platform = unsafe { modules::r4os_rust_mod_platform_group(span(module)) };
+        let query = if generation == 2 {
+            b"Query2".as_slice()
+        } else {
+            b"Query".as_slice()
+        };
+        if (platform != u64::MAX || symbol == b"Query" || symbol == b"Query2")
+            && (symbol != query || v.min_version != u32::from(generation))
+        {
             return false;
         }
         let mut result = MaybeUninit::<modules::ExportInfo>::uninit();
@@ -389,11 +397,6 @@ fn imports(r: &Request, resolved: &mut [Resolved], seeds: &mut [ImportSeed]) -> 
         resolved[i] = Resolved {
             address: result.address,
         };
-        let platform = if symbol == b"Query" {
-            unsafe { modules::r4os_rust_mod_platform_group(span(module)) }
-        } else {
-            u64::MAX
-        };
         let group = if platform == u64::MAX {
             0
         } else {
@@ -414,8 +417,12 @@ fn imports(r: &Request, resolved: &mut [Resolved], seeds: &mut [ImportSeed]) -> 
         {
             return false;
         }
-        if symbol == b"Query" {
-            let table = super::runtime_tables::interface(group) as u64;
+        if symbol == query {
+            let table = if generation == 2 {
+                super::runtime_tables::interface2(group)
+            } else {
+                super::runtime_tables::interface(group)
+            } as u64;
             if table != 0 {
                 seed.flags |= contract::r4xstart_import_flag_group_interface;
                 seed.table = table;
@@ -570,13 +577,14 @@ fn finish(
     workers: bool,
     desktop: bool,
     appearance: policy::Appearance,
+    generation: u8,
 ) -> Option<Loaded> {
     if !payload(r, sections, offsets, image) {
         return None;
     }
     let mut resolved = [Resolved { address: 0 }; 16];
     let mut seeds = [ImportSeed::EMPTY; 16];
-    if !imports(r, &mut resolved, &mut seeds) {
+    if !imports(r, generation, &mut resolved, &mut seeds) {
         return None;
     }
     relocations(
@@ -599,6 +607,27 @@ fn finish(
         log(b"Invalid R4M0 entry section\r\n");
         return None;
     }
+    if entry.offset >= sections[section].mem_size || sections[section].flags & 2 == 0 {
+        return None;
+    }
+    // The advertised generation must name the code actually entered, rather
+    // than a second unrelated export. Old packager artifacts obey this too.
+    let expected = if generation == 2 {
+        b"R4XStart2".as_slice()
+    } else {
+        b"R4XStart".as_slice()
+    };
+    let mut matched = false;
+    for index in 0..r.header.export_count as usize {
+        let export = record::<r4m::ExportRecord>(r, index, 3, b"r4x-entry-export")?;
+        let mut name = [0; 128];
+        if string(r, export.name_offset, &mut name, b"r4x-entry-export-name")? == expected {
+            matched = export.section == entry.section && export.offset == entry.offset;
+        }
+    }
+    if !matched {
+        return None;
+    }
     let offset = offsets[section] + entry.offset as usize;
     if offset >= image.len {
         log(b"Invalid R4M0 entry offset\r\n");
@@ -616,6 +645,7 @@ fn finish(
         section_count: r.header.section_count,
         relocation_count: r.header.reloc_count,
         appearance,
+        start_generation: generation,
     })
 }
 /// # Safety
@@ -638,7 +668,8 @@ pub unsafe extern "C" fn r4os_rust_program_image_load(
         log(b"Invalid R4M0 exports\r\n");
         return false;
     };
-    let Some((memory, parallel, workers, desktop, appearance)) = metadata(r, v1, v2) else {
+    let Some((memory, parallel, workers, desktop, appearance, generation)) = metadata(r, v1, v2)
+    else {
         return false;
     };
     let mut offsets = [0usize; 16];
@@ -656,7 +687,7 @@ pub unsafe extern "C" fn r4os_rust_program_image_load(
     let image = unsafe { image.assume_init() };
     unsafe { ptr::write_bytes(image.code, 0, image.len) };
     let Some(loaded) = finish(
-        r, sections, &offsets, image, memory, parallel, workers, desktop, appearance,
+        r, sections, &offsets, image, memory, parallel, workers, desktop, appearance, generation,
     ) else {
         super::stack::r4os_rust_program_image_release(image.range_id);
         return false;
@@ -674,7 +705,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ImportSeed, module_name_len) == 64);
     assert!(core::mem::offset_of!(ImportSeed, symbol_name) == 72);
     assert!(core::mem::offset_of!(ImportSeed, symbol_name_len) == 104);
-    assert!(core::mem::size_of::<Loaded>() == 1928);
+    assert!(core::mem::size_of::<Loaded>() == 1936);
     assert!(core::mem::offset_of!(Loaded, imports) == 112);
     assert!(core::mem::size_of::<Request>() == 96);
     assert!(core::mem::offset_of!(Request, file_size) == 80);

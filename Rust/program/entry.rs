@@ -48,7 +48,7 @@ pub extern "C" fn r4os_rust_program_entry_state() -> *mut State {
 }
 #[repr(C)]
 struct View {
-    context: *mut Context,
+    context: *mut core::ffi::c_void,
     args: Bytes,
     imports: *const Import,
     import_count: u32,
@@ -138,12 +138,22 @@ unsafe extern "C" fn should_close(_context: *const Context) -> u32 {
 unsafe extern "C" fn yield_current(_context: *const Context) {
     scheduler::yield_task();
 }
+unsafe extern "C" fn should_close2(_: *const contract::generation2::R4XStartContext2) -> u32 {
+    unsafe { should_close(ptr::null()) }
+}
+unsafe extern "C" fn yield_current2(_: *const contract::generation2::R4XStartContext2) {
+    scheduler::yield_task();
+}
 unsafe fn prepare(instance: *mut ProgramInstance) -> View {
     unsafe {
         let runtime = super::payload::runtime(instance);
         let process = super::payload::process(instance);
         let view = View {
-            context: ptr::addr_of_mut!((*runtime).r4xstart_context),
+            context: if (*runtime).start_generation == 2 {
+                ptr::addr_of_mut!((*runtime).r4xstart_context2).cast()
+            } else {
+                ptr::addr_of_mut!((*runtime).r4xstart_context).cast()
+            },
             args: Bytes {
                 data: ptr::addr_of!((*process).args).cast(),
                 len: 128,
@@ -157,7 +167,29 @@ unsafe fn prepare(instance: *mut ProgramInstance) -> View {
             flags |= contract::r4xstart_flag_imports_valid;
         }
         let len = cstring(bytes(view.args));
-        view.context.write(Context {
+        if (*runtime).start_generation == 2 {
+            let context = view
+                .context
+                .cast::<contract::generation2::R4XStartContext2>();
+            context.write(contract::generation2::R4XStartContext2 {
+                flags,
+                instance_id: u64::from((*instance).id),
+                app_class: u32::from((*instance).app_class) + 1,
+                args: view.args.data.addr() as u64,
+                args_len: len as u64,
+                imports: if view.import_count > 0 {
+                    view.imports.addr() as u64
+                } else {
+                    0
+                },
+                import_count: view.import_count,
+                should_close: should_close2 as *const () as usize as u64,
+                r#yield: yield_current2 as *const () as usize as u64,
+                ..contract::generation2::R4XStartContext2::default()
+            });
+            return view;
+        }
+        view.context.cast::<Context>().write(Context {
             magic: contract::r4xstart_magic,
             abi_major: contract::r4xstart_abi_major,
             abi_minor: contract::r4xstart_abi_minor,

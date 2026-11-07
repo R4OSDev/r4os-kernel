@@ -544,6 +544,24 @@ fn loaded_query(table: &[u8], version: u32) -> &'static [u8] {
     }
     b""
 }
+fn loaded_query2(table: &[u8], version: u32) -> &'static [u8] {
+    if table.len() < 24 {
+        return b"query2-range";
+    }
+    let size = le32(&table[8..]);
+    if version != 2
+        || le32(table) != 0x324c3452
+        || le32(&table[4..]) != 2
+        || size < 24
+        || size & 7 != 0
+        || size as usize > table.len()
+        || le32(&table[12..]) != 0
+        || le64(&table[16..]) != 0
+    {
+        return b"query2-header";
+    }
+    b""
+}
 fn loaded_interface(table: &[u8], version: u32, major: u16) -> &'static [u8] {
     if table.len() < 32 {
         return b"interface-range";
@@ -571,7 +589,8 @@ fn loaded_interface(table: &[u8], version: u32, major: u16) -> &'static [u8] {
 unsafe fn loaded_export(io: &LoadedExport) -> &'static [u8] {
     let name = unsafe { view(io.name) };
     let query = names_equal(name, b"Query");
-    if !query && !prefix(name) {
+    let query2 = names_equal(name, b"Query2");
+    if !query && !query2 && !prefix(name) {
         return b"";
     }
     if io.section_index as usize >= io.section_count || io.section_index as usize >= io.offset_count
@@ -595,6 +614,9 @@ unsafe fn loaded_export(io: &LoadedExport) -> &'static [u8] {
     }
     if query {
         return loaded_query(table, io.version);
+    }
+    if query2 {
+        return loaded_query2(table, io.version);
     }
     let Some(major) = major(name) else {
         return b"major-name";

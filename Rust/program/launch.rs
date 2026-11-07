@@ -498,14 +498,13 @@ unsafe fn exports(reader: *mut Reader, header: r4m::Header, verbose: bool) -> Op
             if !span.present {
                 return None;
             }
-            if &name[span.offset..span.offset + span.len] != b"R4XStart" {
-                continue;
-            }
-            if record.version >= 1 {
-                v1 = true;
-            }
-            if record.version >= 2 {
-                v2 = true;
+            if !policy::start_export(
+                &mut v1,
+                &mut v2,
+                &name[span.offset..span.offset + span.len],
+                record.version,
+            ) {
+                return None;
             }
         }
         Some((v1, v2))
@@ -531,12 +530,7 @@ unsafe fn metadata(
             return false;
         }
         let value = &data[span.offset..span.offset + span.len];
-        if !policy::r4os_rust_program_start_accepts(
-            value.as_ptr(),
-            value.len(),
-            export.0 && !export.1,
-            header.export_count,
-        ) {
+        if policy::start_generation(value, export.0, export.1, header.export_count).is_none() {
             return false;
         }
         let mut memory = MaybeUninit::<memory::Contract>::uninit();

@@ -200,6 +200,7 @@ unsafe fn create(
         ptr::copy_nonoverlapping(origin.as_ptr(), (*runtime).module_path.as_mut_ptr(), n);
         (*runtime).module_path_len = n as u32;
         (*runtime).appearance = value.appearance;
+        (*runtime).start_generation = value.start_generation;
         imports(instance, &value.imports[..value.import_count as usize]);
         entry::r4os_rust_program_entry_context(instance);
         instance
@@ -776,10 +777,10 @@ pub extern "C" fn r4os_rust_program_launch_last(display: bool) -> i32 {
     }
 }
 const _: () = {
-    assert!(mem::size_of::<Loaded>() == 2064);
+    assert!(mem::size_of::<Loaded>() == 2072);
     assert!(mem::offset_of!(Loaded, value) == 0);
-    assert!(mem::offset_of!(Loaded, origin) == 1928);
-    assert!(mem::offset_of!(Loaded, origin_len) == 2056);
+    assert!(mem::offset_of!(Loaded, origin) == 1936);
+    assert!(mem::offset_of!(Loaded, origin_len) == 2064);
     assert!(mem::size_of::<Options>() == 48);
     assert!(mem::offset_of!(Options, owner_handle) == 0);
     assert!(mem::offset_of!(Options, out_handle) == 16);

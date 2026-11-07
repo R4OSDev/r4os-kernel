@@ -35,6 +35,44 @@ fn start_state(metadata: &[u8]) -> u8 {
     }
 }
 
+/// Export names distinguish incompatible generations; minimum revisions do not.
+pub(super) fn start_export(v1: &mut bool, v2: &mut bool, name: &[u8], revision: u32) -> bool {
+    let (seen, expected) = match name {
+        b"R4XStart" => (v1, 1),
+        b"R4XStart2" => (v2, 2),
+        _ => return true,
+    };
+    if *seen || revision != expected {
+        return false;
+    }
+    *seen = true;
+    true
+}
+
+pub(super) fn start_generation(metadata: &[u8], v1: bool, v2: bool, exports: u32) -> Option<u8> {
+    if exports == 0 || v1 == v2 {
+        return None;
+    }
+    if v1 {
+        return (start_state(metadata) == 0).then_some(1);
+    }
+    // New artifacts carry one complete, unambiguous SDK-owned start identity.
+    for (key, expected) in [
+        (b"r4x.start=".as_slice(), b"r4xstart2".as_slice()),
+        (b"r4x.entry=", b"R4XStart2"),
+        (b"r4x.start_abi=", b"2"),
+        (b"r4x.context=", b"R4XStartContext2"),
+    ] {
+        let mut values = metadata
+            .split(|b| *b == 0)
+            .filter_map(|v| v.strip_prefix(key));
+        if values.next() != Some(expected) || values.next().is_some() {
+            return None;
+        }
+    }
+    Some(2)
+}
+
 /// # Safety
 /// The metadata pointer names the caller's resident bytes for this call.
 #[unsafe(no_mangle)]
