@@ -235,7 +235,7 @@ pub unsafe extern "C" fn r4os_rust_mod_init(peers: &state::Peers) {
         counter.store(0, Ordering::Relaxed);
     }
     LIBRARIES_ACTIVE.store(false, Ordering::Release);
-    for i in 0..6 {
+    for (i, query2) in PLATFORM_QUERIES2.iter().enumerate() {
         let mut meta = core::mem::MaybeUninit::<Platform>::uninit();
         if !unsafe { mod_platform(i, meta.as_mut_ptr()) } {
             return;
@@ -251,7 +251,7 @@ pub unsafe extern "C" fn r4os_rust_mod_init(peers: &state::Peers) {
             kind: 5,
             state: 1,
             resolver_status: 1,
-            export_count: 1,
+            export_count: 2,
             generation: load.generation,
             pinned: true,
             ..state::Entry::EMPTY
@@ -263,6 +263,10 @@ pub unsafe extern "C" fn r4os_rust_mod_init(peers: &state::Peers) {
         e.exports[0].version = 1;
         e.exports[0].address = meta.query;
         e.exports[0].name_len = copy(b"Query", &mut e.exports[0].name);
+        e.exports[1].used = true;
+        e.exports[1].version = 2;
+        e.exports[1].address = ptr::from_ref(query2) as u64;
+        e.exports[1].name_len = copy(b"Query2", &mut e.exports[1].name);
         unsafe { ptr::write(p, e) };
         let committed = unsafe { state::r4os_rust_mod_commit(&mut load, peers) };
         unsafe { state::r4os_rust_mod_abort(&mut load, peers) };
@@ -429,7 +433,11 @@ pub unsafe extern "C" fn r4os_rust_mod_export_info(
         return false;
     }
     let available_size = if view.kind == 5 {
-        crate::contract::r4l_query_struct_size
+        if unsafe { bytes(symbol) }.eq_ignore_ascii_case(b"Query2") {
+            core::mem::size_of::<crate::contract::generation2::R4LQuery2>() as u32
+        } else {
+            crate::contract::r4l_query_struct_size
+        }
     } else {
         if index >= view.section_count || index >= 16 {
             return false;
@@ -556,6 +564,27 @@ const fn platform_queries() -> [platform_contract::R4LQuery; kernel_config::PLAT
 }
 static PLATFORM_QUERIES: [platform_contract::R4LQuery; kernel_config::PLATFORM_API_COUNT] =
     platform_queries();
+
+const fn platform_queries2()
+-> [platform_contract::generation2::R4LQuery2; kernel_config::PLATFORM_API_COUNT] {
+    let mut out = [const {
+        platform_contract::generation2::R4LQuery2 {
+            magic: platform_contract::generation2::QUERY_MAGIC,
+            abi_version: 2,
+            size: 24,
+            group: 0,
+            reserved: 0,
+        }
+    }; kernel_config::PLATFORM_API_COUNT];
+    let mut i = 0;
+    while i < out.len() {
+        out[i].group = kernel_config::PLATFORM_APIS[i].1;
+        i += 1;
+    }
+    out
+}
+static PLATFORM_QUERIES2: [platform_contract::generation2::R4LQuery2;
+    kernel_config::PLATFORM_API_COUNT] = platform_queries2();
 
 unsafe fn mod_platform(index: usize, out: *mut Platform) -> bool {
     let Some(&(name, group)) = kernel_config::PLATFORM_APIS.get(index) else {

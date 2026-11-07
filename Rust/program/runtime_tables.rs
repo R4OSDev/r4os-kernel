@@ -1442,6 +1442,41 @@ const _: () = {
     assert!(mem::offset_of!(c::R4XStartR4Dev, performance_lock) == 376);
     assert!(mem::offset_of!(c::R4XStartR4Dev, performance_stack) == 384);
 };
+// Generation2 stores only immutable callback addresses. Every callback still
+// enters the same native owner used by Query:1; this is not resource state.
+static SYS2: Table<c::generation2::R4XStartR4Sys2> = Table::new();
+static DESK2: Table<c::generation2::R4XStartR4Desk2> = Table::new();
+static DRAW2: Table<c::generation2::R4XStartR4Draw2> = Table::new();
+static NET2: Table<c::generation2::R4XStartR4Net2> = Table::new();
+static AUDIO2: Table<c::generation2::R4XStartR4Audio2> = Table::new();
+static DEV2: Table<c::generation2::R4XStartR4Dev2> = Table::new();
+fn configure_generation2(group: u8) {
+    use c::generation2 as next;
+    // The boot owner has fully configured the original table before this
+    // projection. It is immutable after publication to program entries.
+    unsafe {
+        match group {
+            1 => SYS2.configure(next::R4XStartR4Sys2::project_provider(&*SYS.get())),
+            2 => DESK2.configure(next::R4XStartR4Desk2::project_provider(&*DESK.get())),
+            3 => DRAW2.configure(next::R4XStartR4Draw2::project_provider(&*DRAW.get())),
+            4 => NET2.configure(next::R4XStartR4Net2::project_provider(&*NET.get())),
+            5 => AUDIO2.configure(next::R4XStartR4Audio2::project_provider(&*AUDIO.get())),
+            6 => DEV2.configure(next::R4XStartR4Dev2::project_provider(&*DEV.get())),
+            _ => unreachable!(),
+        }
+    }
+}
+pub(super) fn interface2(group: u32) -> usize {
+    match group {
+        1 => SYS2.get().addr(),
+        2 => DESK2.get().addr(),
+        3 => DRAW2.get().addr(),
+        4 => NET2.get().addr(),
+        5 => AUDIO2.get().addr(),
+        6 => DEV2.get().addr(),
+        _ => 0,
+    }
+}
 pub(super) fn configure(group: u8) {
     match group {
         0 => {
@@ -1462,6 +1497,9 @@ pub(super) fn configure(group: u8) {
         5 => configure_audio(),
         6 => configure_dev(),
         _ => unreachable!(),
+    }
+    if group != 0 {
+        configure_generation2(group);
     }
 }
 pub(super) fn interface(group: u32) -> usize {

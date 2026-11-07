@@ -309,6 +309,7 @@ pub(super) unsafe fn run() -> bool {
         check!(replacement_xrgb(0xfffe_000e, &heap, &base));
         check!(shared_lifecycle(&heap, &base));
         check!(stack_headroom());
+        check!(generation2::providers());
         (*s).report = t::SelfTestReport {
             cases: case,
             failed_case: 0,
@@ -390,6 +391,7 @@ unsafe fn program_test_buffer_stats(out: *mut BufferStats) {
 // Private operation modules share the sole state and original typed owners.
 mod accounting;
 mod command_rasters;
+mod generation2;
 mod resource_cases;
 mod shared_cases;
 mod storage_cases;
