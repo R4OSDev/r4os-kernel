@@ -261,7 +261,7 @@ pub(super) unsafe extern "C" fn driver_unregister_display_blit_backend(name: *co
     }
 }
 
-pub(super) fn template() -> DriverApi {
+pub(super) const fn template() -> DriverApi {
     DriverApi {
         magic: driver_magic,
         version: driver_api_version,

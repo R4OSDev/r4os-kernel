@@ -450,6 +450,27 @@ pub(crate) fn table() -> *mut a::DriverApi {
     value
 }
 
+static TABLE2: a::DriverApi2 = a::DriverApi2::project_provider(
+    &super::api_callbacks::template(),
+    super::api_audio::register2,
+);
+pub(crate) fn table2() -> *const a::DriverApi2 {
+    ptr::addr_of!(TABLE2)
+}
+
+pub(crate) fn backend_registration_owner() -> Option<u32> {
+    if irq_router::r4os_rust_irq_router_local(false) != 0
+        || r4os_rust_driver_api_storage_owner() != 0
+        || threads::r4os_rust_driver_thread_current(0, 0) != 0
+        || owner() == 0
+        || !owned()
+        || unsafe { driver_owned_buffer_admit() } != 0
+    {
+        return None;
+    }
+    Some(owner())
+}
+
 unsafe fn driver_module_identity(slot: usize, generation: *mut u32) -> bool {
     let entry = crate::loader::registry_control::r4os_rust_mod_entry(slot);
     if entry.is_null() {

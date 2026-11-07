@@ -79,7 +79,7 @@ fn current_slot() -> usize {
 struct Table(UnsafeCell<contract::ProtocolApi>);
 // The table is installed before R4P init and retained through module calls.
 unsafe impl Sync for Table {}
-static TABLE: Table = Table(UnsafeCell::new(contract::ProtocolApi {
+const TEMPLATE: contract::ProtocolApi = contract::ProtocolApi {
     magic: contract::protocol_magic,
     version: contract::protocol_api_version,
     size: mem::size_of::<contract::ProtocolApi>() as u32,
@@ -97,7 +97,12 @@ static TABLE: Table = Table(UnsafeCell::new(contract::ProtocolApi {
     cpu_acceleration_work: Some(crate::program::r4dev::cpu_capabilities::acceleration_work),
     entropy_source_info: Some(crate::driver::entropy::info),
     entropy_fill: Some(crate::driver::entropy::fill),
-}));
+};
+static TABLE: Table = Table(UnsafeCell::new(TEMPLATE));
+static TABLE2: contract::ProtocolApi2 = contract::ProtocolApi2::project_provider(&TEMPLATE);
+pub(crate) fn table2() -> *const contract::ProtocolApi2 {
+    core::ptr::addr_of!(TABLE2)
+}
 
 unsafe fn length(text: *const u8) -> usize {
     let mut len = 0;

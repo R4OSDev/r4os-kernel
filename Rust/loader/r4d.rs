@@ -38,7 +38,19 @@ const FILE_MISSING: u8 = 3;
 const INVALID_FILE: u8 = 4;
 const INIT_FAILED: u8 = 5;
 const LOAD_FAILED: u8 = 6;
-type Init = unsafe extern "C" fn(*const api::DriverApi) -> i32;
+#[derive(Clone, Copy)]
+enum Init {
+    Legacy(unsafe extern "C" fn(*const api::DriverApi) -> i32),
+    Current(unsafe extern "C" fn(*const api::DriverApi2) -> i32),
+}
+impl Init {
+    unsafe fn call(self) -> i32 {
+        match self {
+            Self::Legacy(entry) => unsafe { entry(admission::table()) },
+            Self::Current(entry) => unsafe { entry(admission::table2()) },
+        }
+    }
+}
 type Shutdown = unsafe extern "C" fn() -> i32;
 #[derive(Clone, Copy)]
 struct Name {
@@ -544,6 +556,22 @@ impl Prepared {
             None
         }
     }
+    fn init(&self) -> Option<Init> {
+        let (generation, address) = loader::prepared_init(&self.value)?;
+        Some(match generation {
+            1 => Init::Legacy(unsafe {
+                mem::transmute::<usize, unsafe extern "C" fn(*const api::DriverApi) -> i32>(
+                    address as usize,
+                )
+            }),
+            2 => Init::Current(unsafe {
+                mem::transmute::<usize, unsafe extern "C" fn(*const api::DriverApi2) -> i32>(
+                    address as usize,
+                )
+            }),
+            _ => return None,
+        })
+    }
     fn commit(&mut self) -> Option<usize> {
         let slot = unsafe { modules::r4os_rust_mod_commit(&mut self.value, &self.peers) };
         if slot == usize::MAX { None } else { Some(slot) }
@@ -566,8 +594,8 @@ fn descriptor(
         return Ok(slot);
     }
     let mut prepared = Prepared::new(data, source, default, name).ok_or(LOAD_FAILED)?;
-    let Some(init) = prepared.export(b"DriverInit") else {
-        log(b"[R4D] missing DriverInit export\r\n");
+    let Some(init) = prepared.init() else {
+        log(b"[R4D] invalid DriverInit generation\r\n");
         return Err(if runtime { INVALID_FILE } else { LOAD_FAILED });
     };
     let Some(shutdown) = prepared.export(b"DriverShutdown") else {
@@ -588,7 +616,7 @@ fn descriptor(
                 kind: info.kind,
                 parallel_callbacks: info.parallel_callbacks,
                 module_slot,
-                init: Some(mem::transmute::<usize, Init>(init as usize)),
+                init: Some(init),
                 shutdown: Some(mem::transmute::<usize, Shutdown>(shutdown as usize)),
                 ..Module::EMPTY
             },
@@ -733,7 +761,7 @@ fn init_module(slot: usize, source: u8) -> u8 {
     assert!(admission::configure_callbacks(owner, unsafe {
         (*p).parallel_callbacks
     }));
-    let result = unsafe { init(crate::driver::api_admission::table()) };
+    let result = unsafe { init.call() };
     admission::r4os_rust_driver_api_leave();
     if result != 0 {
         log(b"[R4D] init failed code=");

@@ -21,7 +21,19 @@ use core::{
 };
 const N: usize = 32;
 const DEP: usize = 16;
-type Init = unsafe extern "C" fn(*const api::ProtocolApi) -> i32;
+#[derive(Clone, Copy)]
+enum Init {
+    Legacy(unsafe extern "C" fn(*const api::ProtocolApi) -> i32),
+    Current(unsafe extern "C" fn(*const api::ProtocolApi2) -> i32),
+}
+impl Init {
+    unsafe fn call(self) -> i32 {
+        match self {
+            Self::Legacy(entry) => unsafe { entry(ppi::r4os_rust_protocol_table()) },
+            Self::Current(entry) => unsafe { entry(ppi::table2()) },
+        }
+    }
+}
 type Shutdown = unsafe extern "C" fn() -> i32;
 type Query = unsafe extern "C" fn(*mut api::ProtocolStatus) -> i32;
 type Dispatch =
@@ -576,6 +588,22 @@ impl Prepared {
             None
         }
     }
+    fn init(&self) -> Option<Init> {
+        let (generation, address) = loader::prepared_init(&self.value)?;
+        Some(match generation {
+            1 => Init::Legacy(unsafe {
+                mem::transmute::<usize, unsafe extern "C" fn(*const api::ProtocolApi) -> i32>(
+                    address as usize,
+                )
+            }),
+            2 => Init::Current(unsafe {
+                mem::transmute::<usize, unsafe extern "C" fn(*const api::ProtocolApi2) -> i32>(
+                    address as usize,
+                )
+            }),
+            _ => return None,
+        })
+    }
     fn commit(&mut self) -> Option<usize> {
         let slot = unsafe { image::r4os_rust_mod_commit(&mut self.value, &self.peers) };
         if slot == usize::MAX { None } else { Some(slot) }
@@ -591,7 +619,8 @@ fn module(
     source: u8,
     module_slot: usize,
     registry_slot: usize,
-    exports: [u64; 4],
+    init: Init,
+    exports: [u64; 3],
 ) -> Module {
     Module {
         used: true,
@@ -599,10 +628,10 @@ fn module(
         _module_slot: module_slot,
         registry_slot,
         info,
-        init: Some(unsafe { mem::transmute::<usize, Init>(exports[0] as usize) }),
-        _shutdown: Some(unsafe { mem::transmute::<usize, Shutdown>(exports[1] as usize) }),
-        query: Some(unsafe { mem::transmute::<usize, Query>(exports[2] as usize) }),
-        dispatch: Some(unsafe { mem::transmute::<usize, Dispatch>(exports[3] as usize) }),
+        init: Some(init),
+        _shutdown: Some(unsafe { mem::transmute::<usize, Shutdown>(exports[0] as usize) }),
+        query: Some(unsafe { mem::transmute::<usize, Query>(exports[1] as usize) }),
+        dispatch: Some(unsafe { mem::transmute::<usize, Dispatch>(exports[2] as usize) }),
         ..Module::EMPTY
     }
 }
@@ -635,7 +664,7 @@ fn load_bytes_info(data: &[u8], info: Info, name: &[u8], path: &[u8], source: u8
     let Some(mut prepared) = Prepared::new(Some(data), ptr::null(), name, path) else {
         return false;
     };
-    let Some(init) = prepared.export(b"ProtocolInit") else {
+    let Some(init) = prepared.init() else {
         return false;
     };
     let Some(shutdown) = prepared.export(b"ProtocolShutdown") else {
@@ -665,7 +694,8 @@ fn load_bytes_info(data: &[u8], info: Info, name: &[u8], path: &[u8], source: u8
             source,
             module_slot,
             registry_slot,
-            [init, shutdown, query, dispatch],
+            init,
+            [shutdown, query, dispatch],
         ),
     );
     true
@@ -769,7 +799,7 @@ fn load_candidate(index: usize) -> Option<usize> {
     let prepared = Prepared::new(None, &source, name.bytes(), path.bytes());
     super::performance::add_r4p_read_ticks(start);
     let mut prepared = prepared?;
-    let init = prepared.export(b"ProtocolInit")?;
+    let init = prepared.init()?;
     let shutdown = prepared.export(b"ProtocolShutdown")?;
     let query = prepared.export(b"ProtocolQuery")?;
     let dispatch = prepared.export(b"ProtocolDispatch")?;
@@ -781,7 +811,8 @@ fn load_candidate(index: usize) -> Option<usize> {
             1,
             module_slot,
             registry_slot,
-            [init, shutdown, query, dispatch],
+            init,
+            [shutdown, query, dispatch],
         ),
     );
     unsafe {
@@ -825,7 +856,7 @@ fn init_module(index: usize) {
             mutate(slot, 1, 0, -5, b"execution scope unavailable");
             return;
         };
-        unsafe { init(ppi::r4os_rust_protocol_table()) }
+        unsafe { init.call() }
     };
     super::performance::add_r4p_init_ticks(start);
     if result != 0 {

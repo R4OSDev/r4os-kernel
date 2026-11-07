@@ -207,14 +207,16 @@ pub unsafe extern "C" fn r4os_rust_mod_executable(
 /// indices and names obey the existing private loader contract.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_mod_required(entry: &EntryView) -> Required {
+    if matches!(entry.kind, 3 | 4) && unsafe { init_export(entry) }.is_none() {
+        return required(
+            b"Init/Init2",
+            b"missing, mixed or invalid init generation",
+            false,
+        );
+    }
     let symbols: &[&'static [u8]] = match entry.kind {
-        3 => &[b"DriverInit", b"DriverShutdown"],
-        4 => &[
-            b"ProtocolInit",
-            b"ProtocolShutdown",
-            b"ProtocolQuery",
-            b"ProtocolDispatch",
-        ],
+        3 => &[b"DriverShutdown"],
+        4 => &[b"ProtocolShutdown", b"ProtocolQuery", b"ProtocolDispatch"],
         _ => return required(b"", b"", true),
     };
     for &symbol in symbols {
@@ -234,6 +236,52 @@ pub unsafe extern "C" fn r4os_rust_mod_required(entry: &EntryView) -> Required {
         }
     }
     required(b"", b"", true)
+}
+
+/// Exact one-generation init identity checked against its real executable
+/// section before the existing prepared module can be published.
+pub(crate) unsafe fn init_export(entry: &EntryView) -> Option<(u8, u64)> {
+    let (first, second): (&[u8], &[u8]) = match entry.kind {
+        3 => (b"DriverInit", b"DriverInit2"),
+        4 => (b"ProtocolInit", b"ProtocolInit2"),
+        _ => return None,
+    };
+    let mut selected = None;
+    for i in 0..(entry.export_count as usize).min(16) {
+        let export = unsafe { &*entry.exports.add(i) };
+        if !export.used {
+            continue;
+        }
+        let name = &export.name[..export.name_len];
+        let generation: u8 = if name.eq_ignore_ascii_case(first) {
+            1
+        } else if name.eq_ignore_ascii_case(second) {
+            2
+        } else {
+            continue;
+        };
+        if selected.is_some()
+            || export.version != u32::from(generation)
+            || export.address == 0
+            || export.section_index >= entry.section_count
+            || export.section_index >= 16
+        {
+            return None;
+        }
+        let section = unsafe { &*entry.sections.add(export.section_index as usize) };
+        if !section.used
+            || section.flags & 3 != 3
+            || export.section_offset >= section.mem_size
+            || section
+                .runtime_base
+                .checked_add(u64::from(export.section_offset))?
+                != export.address
+        {
+            return None;
+        }
+        selected = Some((generation, export.address));
+    }
+    selected
 }
 const _: () = {
     use core::mem::{offset_of, size_of};

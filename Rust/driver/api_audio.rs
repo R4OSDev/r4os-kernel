@@ -103,7 +103,11 @@ pub(crate) unsafe extern "C" fn register_output_epoch(
             context,
             crate::audio::types::OutputEpochBinding {
                 callback,
-                query: output_epoch,
+                query: if generation2((*STATE.0.get())[index]) {
+                    output_epoch2
+                } else {
+                    output_epoch
+                },
             },
         )
     }
@@ -322,9 +326,15 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_cleanup(owner: u32, out: *mut Cl
         if !r.used || r.owner != owner {
             continue;
         }
-        let d = unsafe { ptr::read(r.descriptor) };
-        if let Some(shutdown) = d.shutdown
-            && unsafe { shutdown(d.context) } != 0
+        let (shutdown, context) = if generation2(r) {
+            let d = unsafe { &*r.descriptor.cast::<a::AudioBackend2>() };
+            (d.shutdown, d.context)
+        } else {
+            let d = unsafe { ptr::read(r.descriptor) };
+            (d.shutdown, d.context)
+        };
+        if let Some(shutdown) = shutdown
+            && unsafe { shutdown(context) } != 0
         {
             result.failed = true;
             continue;
@@ -504,3 +514,296 @@ unsafe extern "C" fn output_active(raw: u64) -> i32 {
     };
     unsafe { (o.active)(d.context as u64) }
 }
+
+/// New typed registration shares the existing exact driver/audio owner and
+/// registry. Descriptor/callback storage is immutable and retained until real
+/// unregister or terminal cleanup succeeds, including partial failure.
+pub(crate) unsafe extern "C" fn register2(
+    name: *const u8,
+    descriptor: *const a::AudioBackend2,
+) -> i32 {
+    let Some(owner) = admission::backend_registration_owner() else {
+        return -1;
+    };
+    if name.is_null() || descriptor.is_null() {
+        return -1;
+    }
+    // Distinct header is checked before touching the full descriptor.
+    if unsafe { (*descriptor).magic } != a::audio_backend2_magic
+        || unsafe { (*descriptor).version } != a::audio_backend2_version
+        || unsafe { (*descriptor).size } < size_of::<a::AudioBackend2>() as u32
+    {
+        return -1;
+    }
+    let d = unsafe { ptr::read(descriptor) };
+    let outputs = [
+        d.output_query.is_some(),
+        d.output_select.is_some(),
+        d.output_active.is_some(),
+    ];
+    let progress = [
+        d.write_tracked.is_some(),
+        d.playback.is_some(),
+        d.flow.is_some(),
+    ];
+    if d.flags != 0
+        || d.reserved != 0
+        || d.write_pcm.is_none()
+        || d.stop.is_none()
+        || d.status.is_none()
+        || d.formats == 0
+        || d.formats & !(a::audio_backend_format_s16le | a::audio_backend_format_u8) != 0
+        || d.max_channels == 0
+        || d.max_channels > 8
+        || d.min_rate != 0 && d.max_rate != 0 && d.min_rate > d.max_rate
+        || outputs.iter().any(|&v| v) != outputs.iter().all(|&v| v)
+        || progress.iter().any(|&v| v) != progress.iter().all(|&v| v)
+        || d.idle.is_some() && !outputs[0]
+    {
+        return -1;
+    }
+    let Some(index) = (0..8).find(|&i| !unsafe { (*STATE.0.get())[i].used }) else {
+        return -2;
+    };
+    let mut record = Record {
+        used: true,
+        owner,
+        descriptor: descriptor.cast(),
+        ..Record::EMPTY
+    };
+    while record.name_len < 31 && unsafe { *name.add(record.name_len) } != 0 {
+        record.name[record.name_len] = unsafe { *name.add(record.name_len) };
+        record.name_len += 1;
+    }
+    if record.name_len == 0 || unsafe { *name.add(record.name_len) } != 0 {
+        return -1;
+    }
+    let context = unsafe { ptr::addr_of_mut!((*STATE.0.get())[index]).cast::<c_void>() };
+    unsafe { ptr::write(context.cast::<Record>(), record) };
+    if unsafe {
+        audio::register_external_audio_backend_z(
+            name,
+            BackendRegistration {
+                context,
+                write: Some(write2),
+                stop: Some(stop2),
+                status: Some(status2),
+                limits_present: true,
+                limits: Limits {
+                    formats: d.formats,
+                    min_rate: d.min_rate,
+                    max_rate: d.max_rate,
+                    max_channels: d.max_channels,
+                },
+            },
+        )
+    } != 0
+    {
+        unsafe { ptr::write(context.cast(), Record::EMPTY) };
+        return -3;
+    }
+    let extension_ok = !outputs[0]
+        || unsafe {
+            audio::register_external_audio_outputs(
+                &record.name[..record.name_len],
+                a::AudioOutputExtension {
+                    query: output_query2,
+                    select: output_select2,
+                    active: output_active2,
+                },
+                if d.idle.is_some() { Some(idle2) } else { None },
+            )
+        };
+    let progress_ok = extension_ok
+        && (!progress[0]
+            || unsafe {
+                audio::register_external_audio_playback(
+                    &record.name[..record.name_len],
+                    tracked_write2,
+                    playback2,
+                    flow2,
+                )
+            });
+    if !progress_ok {
+        if unsafe { audio::unregister_audio_backend_z(name) } == 0 {
+            unsafe { ptr::write(context.cast(), Record::EMPTY) };
+        }
+        return -3;
+    }
+    puts(b"[R4D] register audio backend2 ");
+    puts(&record.name[..record.name_len]);
+    puts(b"\r\n");
+    0
+}
+
+// The selected generation fixes the callback type at registration. These
+// adapters borrow the one original registry/owner; no legacy hot path decodes
+// a new descriptor or performs a second by-value descriptor conversion.
+unsafe fn record2(raw: *mut c_void) -> Option<(Record, *const a::AudioBackend2)> {
+    let r = unsafe { record(raw) }?;
+    generation2(r).then_some((r, r.descriptor.cast()))
+}
+fn generation2(r: Record) -> bool {
+    // Both admitted descriptors have an immutable readable u32 prefix. AUB2
+    // is disjoint from all legacy versions2/3/4/5. The typed registration
+    // already selected the callbacks; no callback pointer is reinterpreted.
+    !r.descriptor.is_null()
+        && unsafe { r.descriptor.cast::<u32>().read() } == a::audio_backend2_magic
+}
+unsafe extern "C" fn write2(
+    raw: *mut c_void,
+    data: *const u8,
+    len: u32,
+    rate: u32,
+    channels: u16,
+    format: u16,
+) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let d = unsafe { &*d };
+    unsafe { d.write_pcm.unwrap()(d.context, data, len, rate, channels, format) }
+}
+unsafe extern "C" fn stop2(raw: *mut c_void) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let d = unsafe { &*d };
+    unsafe { d.stop.unwrap()(d.context) }
+}
+unsafe extern "C" fn idle2(raw: *mut c_void) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let d = unsafe { &*d };
+    let call = d.idle.or(d.stop).unwrap();
+    unsafe { call(d.context) }
+}
+unsafe extern "C" fn status2(raw: *mut c_void, out: *mut a::AudioBackendStatus) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let d = unsafe { &*d };
+    let mut snapshot = a::AudioBackendStatus2::default();
+    let result = unsafe { d.status.unwrap()(d.context, &mut snapshot) };
+    if result != 0 {
+        return result;
+    }
+    if snapshot.reserved != 0 {
+        return -1;
+    }
+    unsafe {
+        out.write(snapshot.expand_legacy());
+    }
+    0
+}
+unsafe extern "C" fn tracked_write2(
+    raw: *mut c_void,
+    data: *const u8,
+    len: u32,
+    rate: u32,
+    channels: u16,
+    format: u16,
+    out: *mut a::AudioBackendWriteReceipt,
+) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let d = unsafe { &*d };
+    let Some(call) = d.write_tracked else {
+        return -1;
+    };
+    unsafe { call(d.context, data, len, rate, channels, format, out) }
+}
+unsafe extern "C" fn playback2(raw: *mut c_void, out: *mut a::AudioBackendPlayback) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let d = unsafe { &*d };
+    let Some(call) = d.playback else { return -1 };
+    unsafe { call(d.context, out) }
+}
+unsafe extern "C" fn flow2(raw: *mut c_void, input: *const a::AudioBackendFlow) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let d = unsafe { &*d };
+    let Some(call) = d.flow else { return -1 };
+    unsafe { call(d.context, input) }
+}
+unsafe extern "C" fn output_query2(raw: u64, index: u32, out: *mut a::AudioOutputInfo) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw as *mut c_void) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let d = unsafe { &*d };
+    let Some(call) = d.output_query else {
+        return -1;
+    };
+    unsafe { call(d.context as u64, index, out) }
+}
+unsafe extern "C" fn output_select2(raw: u64, index: u32) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw as *mut c_void) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let d = unsafe { &*d };
+    let Some(call) = d.output_select else {
+        return -1;
+    };
+    unsafe { call(d.context as u64, index) }
+}
+unsafe extern "C" fn output_active2(raw: u64) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw as *mut c_void) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return -1;
+    };
+    let d = unsafe { &*d };
+    let Some(call) = d.output_active else {
+        return -1;
+    };
+    unsafe { call(d.context as u64) }
+}
+unsafe extern "C" fn output_epoch2(
+    raw: *mut c_void,
+    callback: a::AudioOutputEpochFn,
+    out: *mut a::AudioOutputEpoch,
+) -> i32 {
+    let Some((r, d)) = (unsafe { record2(raw) }) else {
+        return -1;
+    };
+    let Some(_callback) = Callback::enter(r.owner) else {
+        return a::service_api_result_busy;
+    };
+    unsafe { callback((*d).context as u64, out) }
+}
+const _: () = {
+    assert!(size_of::<Record>() == 56);
+};

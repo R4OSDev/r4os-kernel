@@ -1553,3 +1553,11 @@ pub unsafe extern "C" fn r4os_rust_mod_prepared_export(
     unsafe { out.write((*export).address) };
     true
 }
+
+pub(crate) fn prepared_init(load: &state::Prepared) -> Option<(u8, u64)> {
+    if !unsafe { state::r4os_rust_mod_owns(load) } {
+        return None;
+    }
+    let view = unsafe { ctl::view(state::entry(load.slot)) };
+    unsafe { query::init_export(&view) }
+}
