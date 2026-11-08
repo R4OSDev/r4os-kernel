@@ -54,6 +54,7 @@ unsafe fn terminate(handle: Handle, code: i32, skip: Option<u32>) {
             if !matches!((*thread).state, 3 | 4) {
                 (*thread).exit_code = code;
                 (*thread).state = 4;
+                super::wait_sources::Channel::publish(ptr::addr_of_mut!((*thread).waitset), true);
                 (*thread).finished_tick = now;
                 changed = true;
                 threads::queue(thread, 1);
@@ -149,6 +150,7 @@ unsafe fn claim(handle: Handle, gated: bool) -> Claim {
             if !matches!((*thread).state, 3 | 4) {
                 (*thread).exit_code = -9;
                 (*thread).state = 4;
+                super::wait_sources::Channel::publish(ptr::addr_of_mut!((*thread).waitset), true);
                 (*thread).finished_tick = timer::tick_count();
                 changed = true;
             }

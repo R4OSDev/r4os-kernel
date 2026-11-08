@@ -5,6 +5,43 @@ use super::{registry, registry_state::state, registry_types::*};
 use crate::contract::{ProgramProcessCompletion as Completion, ProgramProcessHandle as Handle};
 use core::ptr;
 
+pub(super) unsafe fn waitset_source<T>(
+    input: super::wait_sources::Identity,
+    action: impl FnOnce(*mut super::wait_sources::Channel) -> Result<T, i32>,
+) -> Result<T, i32> {
+    let id = u32::try_from(input.object()).map_err(|_| crate::contract::waitset_error_invalid)?;
+    if id == 0 || input.original().is_some_and(|r| r.generation == 0) {
+        return Err(crate::contract::waitset_error_invalid);
+    }
+    let _guard = registry::Guard::acquire().ok_or(crate::contract::waitset_error_busy)?;
+    unsafe {
+        let mut node = (*state()).completion_head;
+        while !node.is_null() {
+            if (*node).handle.instance_id == id
+                && matches!((*node).state, 1 | 2)
+                && input
+                    .original()
+                    .is_none_or(|r| r.generation == (*node).handle.generation)
+                && input.matches(ptr::addr_of!((*node).waitset))
+            {
+                return input.locked(
+                    ptr::addr_of_mut!((*node).waitset),
+                    (*node).state == 2,
+                    action,
+                );
+            }
+            node = (*node).next;
+        }
+    }
+    Err(crate::contract::waitset_error_stale)
+}
+pub(super) unsafe fn mark_consumed(node: *mut ProgramCompletionNode) {
+    unsafe {
+        super::wait_sources::Channel::close(ptr::addr_of_mut!((*node).waitset));
+        (*node).state = 3;
+    }
+}
+
 pub(super) unsafe fn record(node: *const ProgramCompletionNode) -> Completion {
     unsafe {
         Completion {
@@ -80,7 +117,7 @@ unsafe fn consume(handle: Handle, out: *mut Completion) -> i32 {
         if !retained {
             registry::unlink_completion(node);
         }
-        (*node).state = 3;
+        mark_consumed(node);
         if (*(*state()).stats).completion_ready != 0 {
             (*(*state()).stats).completion_ready -= 1;
         }
@@ -118,7 +155,7 @@ pub(super) unsafe fn orphan(handle: Handle) {
                     if !retained {
                         registry::unlink_completion(node);
                     }
-                    (*node).state = 3;
+                    mark_consumed(node);
                     if (*(*state()).stats).completion_ready != 0 {
                         (*(*state()).stats).completion_ready -= 1;
                     }
@@ -154,7 +191,7 @@ unsafe fn abandon(handle: Handle) {
                 if !retained {
                     registry::unlink_completion(node);
                 }
-                (*node).state = 3;
+                mark_consumed(node);
                 if (*(*state()).stats).completion_ready != 0 {
                     (*(*state()).stats).completion_ready -= 1;
                 }

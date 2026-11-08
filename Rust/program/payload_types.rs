@@ -271,6 +271,8 @@ pub struct Gui {
     pub activity: super::gui_activity::Channel,
     pub pointer: super::gui_pointer::Window,
     pub input: super::gui_input::Control,
+    pub(super) waitset_activity: super::wait_sources::Channel,
+    pub(super) waitset_legacy_mask: u32,
 }
 
 #[repr(C)]
@@ -498,6 +500,8 @@ pub unsafe fn initialize(kind: u8, memory: *mut u8) {
             6 => {
                 let payload = memory.cast::<Gui>();
                 ptr::addr_of_mut!((*payload).activity).write(super::gui_activity::Channel::EMPTY);
+                ptr::addr_of_mut!((*payload).waitset_activity)
+                    .write(super::wait_sources::Channel::GUI);
                 ptr::addr_of_mut!((*payload).pointer).write(super::gui_pointer::Window::EMPTY);
                 ptr::addr_of_mut!((*payload).input).write(super::gui_input::Control::EMPTY);
                 ptr::addr_of_mut!((*payload).operation_gate).write(UnwindGuard {
@@ -799,7 +803,8 @@ const _: () = {
     assert!(mem::offset_of!(Frame, base_commands) == 272);
     assert!(mem::offset_of!(Frame, base_resources) == 280);
     assert!(mem::offset_of!(Frame, base_raster_words) == 288);
-    assert!(mem::size_of::<Gui>() == 4456);
+    assert!(mem::size_of::<Gui>() == 4496);
+    assert!(mem::offset_of!(Gui, waitset_activity) == 4456);
     assert!(mem::offset_of!(Gui, input) == 4400);
     assert!(mem::offset_of!(Gui, pointer) == 4152);
     assert!(mem::size_of::<super::gui_pointer::Window>() == 248);

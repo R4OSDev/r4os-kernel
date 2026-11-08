@@ -3,7 +3,7 @@
 //! No foreign pointer, callback or unwind pin survives a scheduler park.
 #[path = "waitsets/policy.rs"]
 mod policy;
-use super::{context, notifications, payload_types};
+use super::{context, notifications, payload_types, wait_sources};
 use crate::{
     arch::runtime,
     contract as c,
@@ -35,13 +35,15 @@ unsafe impl Sync for Serial {}
 static SERIAL: Serial = Serial(UnsafeCell::new(0));
 
 /// Intrusive kernel-owned link, never a caller's descriptor or task wait node.
-/// Only Notifications mutates the source links, under the same Runtime owner.
+/// Original source owners mutate the links under the same Runtime owner.
 #[repr(C)]
 pub(super) struct Subscription {
     pub(super) previous: *mut Subscription,
     pub(super) next: *mut Subscription,
     pub(super) source_handle: u64,
     pub(super) linked: bool,
+    pub(super) channel: *mut wait_sources::Channel,
+    resource_ready: bool,
     parent: *mut Record,
     sequence: u64,
     closed: bool,
@@ -71,7 +73,7 @@ struct Record {
     queue: WaitQueue,
     registrations: [Registration; MAX],
 }
-fn valid<T>(pointer: *const T, count: usize) -> bool {
+pub(super) fn valid<T>(pointer: *const T, count: usize) -> bool {
     let address = pointer.addr();
     let Some(bytes) = size_of::<T>().checked_mul(count) else {
         return false;
@@ -81,7 +83,7 @@ fn valid<T>(pointer: *const T, count: usize) -> bool {
         && address.is_multiple_of(align_of::<T>())
         && address.checked_add(bytes).is_some()
 }
-fn overlaps(a: usize, n: usize, b: usize, m: usize) -> bool {
+pub(super) fn overlaps(a: usize, n: usize, b: usize, m: usize) -> bool {
     a < b + m && b < a + n
 }
 fn identity() -> Option<(u32, u64)> {
@@ -146,13 +148,13 @@ fn syntax(source: &c::WaitSource) -> Result<(), i32> {
     if source.version != 1
         || source.size as usize != size_of::<c::WaitSource>()
         || source.reserved0 != 0
-        || source.generation != 0
     {
         return Err(c::waitset_error_invalid);
     }
     match source.kind {
         c::waitset_source_notification => {
-            if source.object == 0
+            if source.generation != 0
+                || source.object == 0
                 || source.flags & !c::waitset_source_flag_stop != 0
                 || source.deadline_ns != 0
                 || key(source) != ClockKey::default()
@@ -161,11 +163,30 @@ fn syntax(source: &c::WaitSource) -> Result<(), i32> {
             }
         }
         c::waitset_source_timer => {
-            if source.object != 0 || source.flags != 0 || source.observed_revision != 0 {
+            if source.generation != 0
+                || source.object != 0
+                || source.flags != 0
+                || source.observed_revision != 0
+            {
                 return Err(c::waitset_error_invalid);
             }
             if !key(source).valid() {
                 return Err(c::waitset_error_clock_unavailable);
+            }
+        }
+        c::waitset_source_io
+        | c::waitset_source_process
+        | c::waitset_source_thread
+        | c::waitset_source_service_endpoint
+        | c::waitset_source_gui_activity => {
+            if source.generation == 0
+                || source.flags != 0
+                || source.deadline_ns != 0
+                || key(source) != ClockKey::default()
+                || (source.kind == c::waitset_source_gui_activity && source.object != 0)
+                || (source.kind != c::waitset_source_gui_activity && source.object == 0)
+            {
+                return Err(c::waitset_error_invalid);
             }
         }
         _ => return Err(c::waitset_error_unsupported),
@@ -190,7 +211,7 @@ unsafe fn registration(record: *mut Record, id: u64) -> *mut Registration {
         ptr::null_mut()
     }
 }
-/// Called only by the original notification owner while it holds Runtime.
+/// Called only by the original source owner while it holds Runtime.
 /// Sequence publication precedes this bounded wake; no external callback runs.
 pub(super) unsafe fn source_changed(link: *mut Subscription, sequence: u64, closed: bool) {
     unsafe {
@@ -205,6 +226,26 @@ pub(super) unsafe fn source_changed(link: *mut Subscription, sequence: u64, clos
                 0,
                 ptr::null_mut(),
             );
+        }
+    }
+}
+pub(super) unsafe fn resource_changed(
+    link: *mut Subscription,
+    sequence: u64,
+    ready: bool,
+    closed: bool,
+) {
+    unsafe {
+        (*link).resource_ready = ready;
+        source_changed(link, sequence, closed);
+    }
+}
+unsafe fn unsubscribe(record: *mut Record, link: *mut Subscription) {
+    unsafe {
+        if !(*link).channel.is_null() {
+            wait_sources::unsubscribe(link);
+        } else {
+            notifications::unsubscribe((*record).notifications, link);
         }
     }
 }
@@ -283,26 +324,51 @@ pub(super) unsafe fn enroll(handle: u64, source: *const c::WaitSource, output: *
     let Some((owner, _)) = owners() else {
         return c::waitset_error_context;
     };
-    let id = unsafe {
-        let _guard = runtime::RuntimeGuard::acquire();
+    let result = unsafe {
+        if source.kind >= c::waitset_source_io {
+            wait_sources::access(wait_sources::Identity::Prepared(source), |channel| {
+                enroll_locked(owner, handle, source, channel)
+            })
+        } else {
+            let _guard = runtime::RuntimeGuard::acquire();
+            enroll_locked(owner, handle, source, ptr::null_mut())
+        }
+    };
+    match result {
+        Ok(id) => {
+            unsafe {
+                output.write(id);
+            }
+            c::waitset_ok
+        }
+        Err(error) => error,
+    }
+}
+unsafe fn enroll_locked(
+    owner: *mut Owner,
+    handle: u64,
+    source: c::WaitSource,
+    channel: *mut wait_sources::Channel,
+) -> Result<u64, i32> {
+    unsafe {
         let record = find(owner, handle);
         if record.is_null() {
-            return c::waitset_error_stale;
+            return Err(c::waitset_error_stale);
         }
         if (*owner).closing || (*record).closed {
-            return c::waitset_error_closed;
+            return Err(c::waitset_error_closed);
         }
         if !creator(record) {
-            return c::waitset_error_owner;
+            return Err(c::waitset_error_owner);
         }
         if (*record).waiting {
-            return c::waitset_error_busy;
+            return Err(c::waitset_error_busy);
         }
         if (*record).count == (*record).capacity {
-            return c::waitset_error_capacity;
+            return Err(c::waitset_error_capacity);
         }
         if (*record).next_registration == u64::MAX || (*record).revision == u64::MAX {
-            return c::waitset_error_exhausted;
+            return Err(c::waitset_error_exhausted);
         }
         let mut selected = ptr::null_mut();
         for index in 0..(*record).capacity {
@@ -315,12 +381,19 @@ pub(super) unsafe fn enroll(handle: u64, source: *const c::WaitSource, output: *
         assert!(!selected.is_null());
         let now = if source.kind == c::waitset_source_timer {
             let Some(sample) = clock() else {
-                return c::waitset_error_clock_unavailable;
+                return Err(c::waitset_error_clock_unavailable);
             };
             if sample.key != key(&source) {
-                return c::waitset_error_clock_changed;
+                return Err(c::waitset_error_clock_changed);
             }
             sample.instant_ns
+        } else if source.kind != c::waitset_source_notification {
+            wait_sources::subscribe(
+                channel,
+                ptr::addr_of_mut!((*selected).link),
+                source.observed_revision,
+            )?;
+            0
         } else {
             match notifications::subscribe(
                 (*record).notifications,
@@ -329,7 +402,7 @@ pub(super) unsafe fn enroll(handle: u64, source: *const c::WaitSource, output: *
                 source.observed_revision,
             ) {
                 Ok(()) => 0,
-                Err(error) => return error,
+                Err(error) => return Err(error),
             }
         };
         (*record).next_registration += 1;
@@ -339,10 +412,8 @@ pub(super) unsafe fn enroll(handle: u64, source: *const c::WaitSource, output: *
         (*selected).spec = source;
         (*selected).last_ns = now;
         (*selected).clock_invalid = false;
-        (*selected).id
-    };
-    unsafe { output.write(id) };
-    c::waitset_ok
+        Ok((*selected).id)
+    }
 }
 pub(super) unsafe fn rearm(handle: u64, id: u64, source: *const c::WaitSource) -> i32 {
     if !valid(source, 1) {
@@ -439,7 +510,7 @@ pub(super) unsafe fn remove(handle: u64, id: u64) -> i32 {
         if slot.is_null() {
             return c::waitset_error_stale;
         }
-        notifications::unsubscribe((*record).notifications, ptr::addr_of_mut!((*slot).link));
+        unsubscribe(record, ptr::addr_of_mut!((*slot).link));
         (*slot).id = 0;
         (*record).count -= 1;
         // Removal and Close remain possible at exhaustion; never wrap identity.
@@ -464,7 +535,7 @@ unsafe fn collect(
             if slot.id == 0 {
                 continue;
             }
-            let ready = if slot.spec.kind == c::waitset_source_notification {
+            let ready = if slot.spec.kind != c::waitset_source_timer {
                 if slot.link.closed {
                     status[index] = c::waitset_event_source_closed as i32;
                     flags[index] |= c::waitset_flag_rescan;
@@ -477,7 +548,14 @@ unsafe fn collect(
                 {
                     flags[index] |= c::waitset_flag_rescan | c::waitset_flag_coalesced;
                 }
-                slot.link.closed || slot.link.sequence != slot.spec.observed_revision
+                slot.link.closed
+                    || if slot.spec.kind == c::waitset_source_notification
+                        || slot.spec.kind == c::waitset_source_gui_activity
+                    {
+                        slot.link.sequence != slot.spec.observed_revision
+                    } else {
+                        slot.link.resource_ready
+                    }
             } else {
                 if let Some(sample) = sample {
                     if sample.key != key(&slot.spec) || sample.instant_ns < slot.last_ns {
@@ -529,7 +607,7 @@ unsafe fn collect(
                 flags: flags[index as usize],
                 registration: slot.id,
                 user_tag: slot.spec.user_tag,
-                revision: if slot.spec.kind == c::waitset_source_notification {
+                revision: if slot.spec.kind != c::waitset_source_timer {
                     slot.link.sequence
                 } else {
                     0
@@ -750,10 +828,7 @@ unsafe fn close_record(owner: *mut Owner, handle: u64) -> i32 {
             (*record).waiting = false;
             for index in 0..(*record).capacity {
                 let slot = ptr::addr_of_mut!((*record).registrations[index]);
-                notifications::unsubscribe(
-                    (*record).notifications,
-                    ptr::addr_of_mut!((*slot).link),
-                );
+                unsubscribe(record, ptr::addr_of_mut!((*slot).link));
                 (*slot).id = 0;
             }
             (*record).count = 0;

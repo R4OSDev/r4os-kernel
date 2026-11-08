@@ -77,6 +77,7 @@ pub struct Thread {
     pub(super) fault_frame: *mut crate::arch::callback_abort::Frame,
     pub(super) execution_aborted: bool,
     pub(super) retire_retry: super::retire_wait::Retry,
+    pub(super) waitset: super::wait_sources::Channel,
 }
 impl Default for Thread {
     fn default() -> Self {
@@ -120,11 +121,12 @@ impl Default for Thread {
             fault_frame: ptr::null_mut(),
             execution_aborted: false,
             retire_retry: super::retire_wait::Retry::EMPTY,
+            waitset: super::wait_sources::Channel::EMPTY,
         }
     }
 }
 const _: () = {
-    assert!(mem::size_of::<Thread>() == 400);
+    assert!(mem::size_of::<Thread>() == 432);
     assert!(mem::align_of::<Thread>() == 8);
     assert!(mem::size_of::<OptionalLease>() == 40);
     assert!(mem::offset_of!(OptionalLease, present) == 32);
@@ -267,6 +269,50 @@ pub(super) unsafe fn by_id(id: u32) -> *mut Thread {
     }
     ptr::null_mut()
 }
+pub(super) unsafe fn waitset_source<T>(
+    input: super::wait_sources::Identity,
+    action: impl FnOnce(*mut super::wait_sources::Channel) -> Result<T, i32>,
+) -> Result<T, i32> {
+    use crate::contract as c;
+    let id = u32::try_from(input.object()).map_err(|_| c::waitset_error_invalid)?;
+    if id == 0
+        || input
+            .original()
+            .is_some_and(|r| r.generation == 0 || r.scope_id == 0 || r.scope_generation == 0)
+    {
+        return Err(c::waitset_error_invalid);
+    }
+    let current = unsafe { super::context::handle() }.ok_or(c::waitset_error_context)?;
+    let _guard = Guard::acquire(0);
+    unsafe {
+        let thread = by_id(id);
+        if thread.is_null()
+            || !(*thread).used
+            || (*thread).retire_pending
+            || (*thread).retire_in_progress
+            || (*thread).instance_id != current.instance_id
+            || (*thread).instance_generation != current.generation
+            || input.original().is_some_and(|r| {
+                r.generation != (*thread).generation
+                    || r.scope_id != u64::from(current.instance_id)
+                    || r.scope_generation != current.generation
+            })
+        {
+            return Err(c::waitset_error_stale);
+        }
+        if (*thread).flags & MAIN != 0 || (*thread).flags & JOINABLE == 0 {
+            return Err(c::waitset_error_unsupported);
+        }
+        if thread == self::current() {
+            return Err(c::waitset_error_owner);
+        }
+        input.locked(
+            ptr::addr_of_mut!((*thread).waitset),
+            matches!((*thread).state, 3 | 4),
+            action,
+        )
+    }
+}
 pub(super) unsafe fn by_handle(handle: JoinHandle) -> *mut Thread {
     unsafe {
         let thread = by_id(handle.thread_id);
@@ -345,6 +391,7 @@ pub(super) unsafe fn link(thread: *mut Thread) {
 }
 pub(super) unsafe fn unlink(thread: *mut Thread) {
     unsafe {
+        super::wait_sources::Channel::close(ptr::addr_of_mut!((*thread).waitset));
         if !(*thread).registry_prev.is_null() {
             (*(*thread).registry_prev).registry_next = (*thread).registry_next;
         } else {
@@ -478,6 +525,7 @@ pub(super) unsafe fn mark(thread: *mut Thread, running: bool, code: i32) {
         }
         (*thread).exit_code = code;
         (*thread).state = 3;
+        super::wait_sources::Channel::publish(ptr::addr_of_mut!((*thread).waitset), true);
         (*thread).finished_tick = timer::tick_count();
         bump();
         drop(guard);

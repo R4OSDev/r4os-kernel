@@ -241,6 +241,7 @@ pub struct Endpoint {
     pub queued_slots: [usize; 8],
     pub queued_count: usize,
     pub queue: [RequestSlot; 8],
+    pub(super) waitset: crate::program::wait_sources::Channel,
 }
 impl Endpoint {
     pub const EMPTY: Self = Self {
@@ -283,6 +284,7 @@ impl Endpoint {
         queued_slots: [0; 8],
         queued_count: 0,
         queue: [const { RequestSlot::EMPTY }; 8],
+        waitset: crate::program::wait_sources::Channel::EMPTY,
     };
 }
 impl Default for Endpoint {
@@ -574,7 +576,7 @@ const _: () = {
     assert!(core::mem::offset_of!(Endpoint, queued_slots) == 1016);
     assert!(core::mem::offset_of!(Endpoint, queued_count) == 1080);
     assert!(core::mem::offset_of!(Endpoint, queue) == 1088);
-    assert!(core::mem::size_of::<Endpoint>() == 67520);
+    assert!(core::mem::size_of::<Endpoint>() == 67552);
     assert!(core::mem::align_of::<Endpoint>() == 8);
     assert!(core::mem::offset_of!(PerformanceSummary, max_services) == 0);
     assert!(core::mem::offset_of!(PerformanceSummary, used_services) == 4);

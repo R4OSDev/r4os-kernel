@@ -21,7 +21,7 @@ pub(super) fn providers() -> bool {
     // Independent original mapping with DEV21, SYS22, DRAW23 and SYS28 appends;
     // never regenerate expected positions with the production projector.
     let sizes = [
-        (1480, 1472),
+        (1488, 1480),
         (632, 632),
         (920, 920),
         (296, 296),
@@ -44,7 +44,7 @@ pub(super) fn providers() -> bool {
             || (before.magic & 0xffffff) != (after.magic & 0xffffff)
             || after.version
                 != if group == 1 {
-                    3
+                    4
                 } else if group == 3 || group == 6 {
                     2
                 } else {
@@ -146,6 +146,7 @@ pub(super) fn providers() -> bool {
         || sys.waitset_remove == 0
         || sys.waitset_wait == 0
         || sys.waitset_close == 0
+        || sys.waitset_source_prepare == 0
     {
         return false;
     }
@@ -155,7 +156,7 @@ pub(super) fn providers() -> bool {
         return false;
     }
     super::log(
-        b"[API2] queries=6 slots=522 shared_callbacks=ok legacy_tombstones=zero waitset_tail=present call=ok\r\n",
+        b"[API2] queries=6 slots=523 shared_callbacks=ok legacy_tombstones=zero waitset_tail=present source_adapters=present call=ok\r\n",
     );
     true
 }

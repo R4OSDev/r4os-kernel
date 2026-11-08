@@ -15,6 +15,44 @@ use core::{
     ptr,
     sync::atomic::{AtomicU32, Ordering},
 };
+pub(crate) unsafe fn waitset_source<T>(
+    input: crate::program::wait_sources::Identity,
+    process: c::ProgramProcessHandle,
+    action: impl FnOnce(*mut crate::program::wait_sources::Channel) -> Result<T, i32>,
+) -> Result<T, i32> {
+    let handle = u32::try_from(input.object()).map_err(|_| c::waitset_error_invalid)?;
+    if handle == 0 {
+        return Err(c::waitset_error_invalid);
+    }
+    let identity = {
+        let _registry = reg::lock_registry(1).ok_or(c::waitset_error_busy)?;
+        unsafe {
+            let slot = reg::endpoint_for_handle(handle).ok_or(c::waitset_error_stale)?;
+            let ep = reg::endpoint(slot);
+            let entry = reg::entry((*ep).service_slot);
+            if !reg::same_binding(
+                (*entry).binding,
+                c::ProgramObservationHandle {
+                    process,
+                    id: (*entry).binding.id,
+                },
+            ) || (*entry).binding.id == 0
+                || (*entry).state != STATE_RUNNING
+            {
+                return Err(c::waitset_error_owner);
+            }
+            reg::identity(ep)
+        }
+    };
+    let lease = reg::lock_identity(identity, 4).ok_or(c::waitset_error_stale)?;
+    unsafe {
+        input.locked(
+            ptr::addr_of_mut!((*lease.endpoint).waitset),
+            (*lease.endpoint).queued_count != 0,
+            action,
+        )
+    }
+}
 pub(super) unsafe fn slot(ep: *mut Endpoint, index: usize) -> *mut RequestSlot {
     assert!(index < DEPTH);
     unsafe {
@@ -72,6 +110,8 @@ pub(super) unsafe fn reset_slot(p: *mut RequestSlot) {
 }
 pub(super) unsafe fn reset_metadata(ep: *mut Endpoint, count_reset: bool) {
     unsafe {
+        crate::program::wait_sources::Channel::close(ptr::addr_of_mut!((*ep).waitset));
+        ptr::addr_of_mut!((*ep).waitset).write(crate::program::wait_sources::Channel::EMPTY);
         // Stable mutex/generation/request-ID block/lifetime/timing and every
         // payload byte remain untouched, including during immediate reuse.
         (*ep).used = false;
@@ -209,6 +249,10 @@ unsafe fn remove_queued(ep: *mut Endpoint, s: *const RequestSlot) {
                 (*ep).queued_slots[n] = (*ep).queued_slots[n + 1];
             }
             (*ep).queued_count -= 1;
+            crate::program::wait_sources::Channel::publish(
+                ptr::addr_of_mut!((*ep).waitset),
+                (*ep).queued_count != 0,
+            );
             return;
         }
         panic!("Queued service slot missing from admitted FIFO");
@@ -331,6 +375,7 @@ unsafe fn publish(
         (*ep).queued_slots[(*ep).queued_count] = i;
         (*ep).queued_count += 1;
         (*s).state = REQUEST_QUEUED;
+        crate::program::wait_sources::Channel::publish(ptr::addr_of_mut!((*ep).waitset), true);
         (*ep).requests = (*ep).requests.wrapping_add(1);
         (*ep).queue_high_water = (*ep).queue_high_water.max(counts(ep).used);
         queue_op(ptr::addr_of_mut!((*ep).requests_available), 0, 0);

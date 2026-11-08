@@ -1,4 +1,10 @@
 //! Direct system platform callbacks; original typed owners and call boundaries.
+pub(super) unsafe extern "C" fn sys_waitset_source_prepare(
+    request: *const crate::contract::WaitSourceRequest,
+    output: *mut crate::contract::WaitSource,
+) -> i32 {
+    unsafe { super::wait_sources::prepare(request, output) }
+}
 pub(super) unsafe extern "C" fn sys_waitset_create(capacity: u32, output: *mut u64) -> i32 {
     unsafe { super::waitsets::create(capacity, output) }
 }

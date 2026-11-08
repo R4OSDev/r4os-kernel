@@ -342,12 +342,15 @@ fn configure_sys() {
         waitset_remove: super::platform_callbacks::sys_waitset_remove as *const () as usize,
         waitset_wait: super::platform_callbacks::sys_waitset_wait as *const () as usize,
         waitset_close: super::platform_callbacks::sys_waitset_close as *const () as usize,
+        waitset_source_prepare: super::platform_callbacks::sys_waitset_source_prepare as *const ()
+            as usize,
         ..Default::default()
     };
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1480);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1488);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_source_prepare) == 1480);
     assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_create) == 1432);
     assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_enroll) == 1440);
     assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_rearm) == 1448);

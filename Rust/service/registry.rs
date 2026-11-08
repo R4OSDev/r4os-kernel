@@ -590,7 +590,10 @@ pub(super) fn prepare_endpoint() -> Option<Prepared<EndpointNode>> {
 }
 
 pub(super) unsafe fn retire_endpoint(ep: *mut Endpoint) {
-    unsafe { (*raw()).endpoints.remove(ep) };
+    unsafe {
+        crate::program::wait_sources::Channel::close(ptr::addr_of_mut!((*ep).waitset));
+        (*raw()).endpoints.remove(ep)
+    };
 }
 
 fn can_collect() -> bool {

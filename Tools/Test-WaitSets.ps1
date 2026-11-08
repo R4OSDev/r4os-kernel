@@ -21,6 +21,7 @@ try{
  $paths=@{
   TREAP_SOURCE=(Join-Path $kernel 'Rust/driver/treap.rs')
   NOTIFICATIONS_SOURCE=(Join-Path $kernel 'Rust/program/notifications.rs')
+  WAIT_SOURCES_SOURCE=(Join-Path $kernel 'Rust/program/wait_sources.rs')
   WAITSETS_SOURCE=(Join-Path $kernel 'Rust/program/waitsets.rs')
   CASES_SOURCE=(Join-Path $base 'host_tests.rs')
  }
@@ -34,7 +35,7 @@ try{
  if($LASTEXITCODE -ne 0){throw 'Actual WaitSet/notification owners did not compile.'}
  & $executable --test-threads=1
  if($LASTEXITCODE -ne 0){throw 'Actual WaitSet/notification owner checks failed.'}
- Write-Output 'Actual WaitSet/notification owners: 7 integration cases and 5 deadline/selection cases passed; simulated scheduler/heap boundaries, no SMP claim.'
+ Write-Output 'Actual WaitSet/notification owners and embedded source channels passed. Scheduler/heap/resource-admission seams: no native IO/service, SMP or hardware claim.'
 }finally{
  if(Test-Path -LiteralPath $work){Remove-Item -LiteralPath $work -Recurse -Force}
 }

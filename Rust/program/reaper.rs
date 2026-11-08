@@ -307,6 +307,7 @@ unsafe fn reap_slot(slot: *mut ProgramRegistrySlot, notify: bool) -> u8 {
             (*node).flags |= crate::contract::program_completion_flag_output_available;
         }
         (*node).state = 2;
+        super::wait_sources::Channel::publish(ptr::addr_of_mut!((*node).waitset), true);
         let stats = (*state()).stats;
         if (*stats).completion_pending != 0 {
             (*stats).completion_pending -= 1;
@@ -317,7 +318,7 @@ unsafe fn reap_slot(slot: *mut ProgramRegistrySlot, notify: bool) -> u8 {
             false
         } else {
             registry::unlink_completion(node);
-            (*node).state = 3;
+            completions::mark_consumed(node);
             true
         };
         registry::clear_slot(current);

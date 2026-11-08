@@ -135,6 +135,7 @@ struct Request {
     service_epoch: u64,
     service_interested: bool,
     service_request_id: u32,
+    waitset: super::wait_sources::Channel,
 }
 impl Request {
     const EMPTY: Self = Self {
@@ -185,6 +186,7 @@ impl Request {
         service_epoch: 0,
         service_interested: false,
         service_request_id: 0,
+        waitset: super::wait_sources::Channel::EMPTY,
     };
 }
 struct Worker {
@@ -316,6 +318,7 @@ unsafe fn unqueue(req: *mut Request) {
 }
 unsafe fn clear_request(req: *mut Request) {
     unsafe {
+        super::wait_sources::Channel::close(ptr::addr_of_mut!((*req).waitset));
         unqueue(req);
         service::finished(req);
         req.write(Request::EMPTY);
@@ -742,6 +745,7 @@ unsafe extern "C" fn worker_main() {
             // The actual terminal native result, before its existing waiter
             // publication; this observer owns no request or cancellation duty.
             crate::sched::worker_observation::finish(observation, result, true);
+            super::wait_sources::Channel::publish(ptr::addr_of_mut!((*req).waitset), true);
             sync_objects::r4os_rust_sync_completion(ptr::addr_of_mut!((*req).completion), 1, 0);
             drop(guard);
             scheduler::safe_reschedule();
@@ -1078,6 +1082,44 @@ unsafe fn for_caller(id: u32) -> *mut Request {
         ptr::null_mut()
     }
 }
+pub(super) unsafe fn waitset_source<T>(
+    input: super::wait_sources::Identity,
+    action: impl FnOnce(*mut super::wait_sources::Channel) -> Result<T, i32>,
+) -> Result<T, i32> {
+    let id = u32::try_from(input.object()).map_err(|_| c::waitset_error_invalid)?;
+    if id == 0 {
+        return Err(c::waitset_error_invalid);
+    }
+    let _guard = lock().ok_or(c::waitset_error_busy)?;
+    unsafe {
+        let wanted = for_caller(id);
+        if wanted.is_null() {
+            return Err(c::waitset_error_stale);
+        }
+        // A legacy ID names only its current incarnation, never history.
+        // Reject ambiguous live IDs instead of choosing an arbitrary slot.
+        let mut matches = 0;
+        for index in 0..CAPACITY {
+            let req = ptr::addr_of_mut!((*state()).requests[index]);
+            if (*req).used
+                && !(*req).close_pending
+                && (*req).id == id
+                && (*req).owner_id == (*wanted).owner_id
+                && (*req).owner_generation == (*wanted).owner_generation
+            {
+                matches += 1;
+            }
+        }
+        if matches != 1 {
+            return Err(c::waitset_error_stale);
+        }
+        input.locked(
+            ptr::addr_of_mut!((*wanted).waitset),
+            matches!((*wanted).state, 3 | 4),
+            action,
+        )
+    }
+}
 unsafe fn info(req: *const Request) -> Info {
     unsafe {
         Info {
@@ -1351,6 +1393,7 @@ unsafe fn defer_close(value: Claim) -> u8 {
         if !(*req).close_pending {
             (*req).retire_retry = super::retire_wait::Retry::EMPTY;
             (*req).close_pending = true;
+            super::wait_sources::Channel::close(ptr::addr_of_mut!((*req).waitset));
         }
         drop(guard);
         signal_reaper();
@@ -1369,6 +1412,7 @@ unsafe fn mark_pending(id: u32) -> bool {
         if !(*req).close_pending {
             (*req).retire_retry = super::retire_wait::Retry::EMPTY;
             (*req).close_pending = true;
+            super::wait_sources::Channel::close(ptr::addr_of_mut!((*req).waitset));
         }
         drop(guard);
         signal_reaper();
@@ -1497,6 +1541,7 @@ unsafe fn cancel_queued(req: *mut Request) {
         (*req).state = 4;
         service::finished(req);
         (*req).completed_tick = timer::tick_count();
+        super::wait_sources::Channel::publish(ptr::addr_of_mut!((*req).waitset), true);
         sync_objects::r4os_rust_sync_completion(ptr::addr_of_mut!((*req).completion), 1, 0);
     }
 }
@@ -1576,6 +1621,7 @@ pub(super) unsafe fn cancel(handle: Handle, caller: Option<(u32, u64)>) -> bool 
                     (*req).state = 4;
                     service::finished(req);
                     (*req).completed_tick = timer::tick_count();
+                    super::wait_sources::Channel::publish(ptr::addr_of_mut!((*req).waitset), true);
                     sync_objects::r4os_rust_sync_completion(
                         ptr::addr_of_mut!((*req).completion),
                         1,

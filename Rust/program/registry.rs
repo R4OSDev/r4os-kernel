@@ -760,7 +760,10 @@ unsafe fn allocate_completion(r: &CompletionRequest) -> bool {
     }
 }
 pub(super) unsafe fn free_completion(node: *mut ProgramCompletionNode) {
-    unsafe { heap::r4os_rust_heap_free(node.cast(), mem::size_of::<ProgramCompletionNode>()) };
+    unsafe {
+        super::wait_sources::Channel::close(ptr::addr_of_mut!((*node).waitset));
+        heap::r4os_rust_heap_free(node.cast(), mem::size_of::<ProgramCompletionNode>())
+    };
 }
 unsafe fn link_completion(node: *mut ProgramCompletionNode) {
     unsafe {
@@ -792,6 +795,7 @@ pub(super) unsafe fn unlink_completion(wanted: *mut ProgramCompletionNode) -> bo
                 node = (*node).next;
                 continue;
             }
+            super::wait_sources::Channel::close(ptr::addr_of_mut!((*node).waitset));
             if !previous.is_null() {
                 (*previous).next = (*node).next;
             } else {

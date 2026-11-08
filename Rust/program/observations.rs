@@ -262,7 +262,7 @@ unsafe fn close(key: c::ProgramObservationHandle) -> i32 {
                         (*(*state()).stats).completion_ready -= 1;
                     }
                     registry::unlink_completion(node);
-                    (*node).state = 3;
+                    super::completions::mark_consumed(node);
                     finished = node;
                 }
                 break;

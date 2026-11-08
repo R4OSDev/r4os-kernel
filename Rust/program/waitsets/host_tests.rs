@@ -104,6 +104,175 @@ impl Drop for Fixture {
         }
     }
 }
+// The actual embedded channel and Set algorithms run here. Only admission to
+// a canonical IO/Process/Service owner is a seam; native owner proof is separate.
+struct Resource(Option<Box<super::wait_sources::Channel>>);
+impl Resource {
+    fn new() -> Self {
+        let mut result = Self(Some(Box::new(super::wait_sources::Channel::EMPTY)));
+        crate::SOURCE.with(|p| p.set(result.0.as_mut().unwrap().as_mut()));
+        crate::SOURCE_READY.with(|v| v.set(false));
+        result
+    }
+    fn prepare(&self) -> c::WaitSource {
+        let mut source = c::WaitSource::default();
+        let request = c::WaitSourceRequest {
+            kind: c::waitset_source_io,
+            object: 17,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { super::wait_sources::prepare(&request, &mut source) },
+            0
+        );
+        assert_ne!(source.generation, 0);
+        source
+    }
+    fn publish(&mut self, ready: bool) {
+        crate::SOURCE_READY.with(|v| v.set(ready));
+        unsafe {
+            super::wait_sources::Channel::publish(self.0.as_mut().unwrap().as_mut(), ready);
+        }
+    }
+    fn release(&mut self) {
+        if let Some(mut channel) = self.0.take() {
+            unsafe {
+                super::wait_sources::Channel::close(channel.as_mut());
+            }
+            crate::SOURCE.with(|p| p.set(ptr::null_mut()));
+            drop(channel);
+        }
+    }
+}
+impl Drop for Resource {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+#[test]
+fn embedded_epoch_rejects_prepare_close_replacement_before_enroll() {
+    let f = Fixture::new();
+    let mut old = Resource::new();
+    let prepared = old.prepare();
+    old.release();
+    let current = Resource::new();
+    let replacement = current.prepare();
+    assert_ne!(prepared.generation, replacement.generation);
+    let set = f.set(1);
+    let mut output = 0xfeed;
+    assert_eq!(
+        unsafe { waitsets::enroll(set, &prepared, &mut output) },
+        c::waitset_error_stale
+    );
+    assert_eq!(output, 0xfeed);
+    f.enroll(set, replacement);
+}
+#[test]
+fn embedded_level_readiness_survives_rearm_but_owner_consumption_clears_it() {
+    let mut f = Fixture::new();
+    let mut resource = Resource::new();
+    let source = resource.prepare();
+    let set = f.set(2);
+    let id = f.enroll(set, source);
+    let notification = f.notification();
+    f.enroll(set, Fixture::source(notification, 23));
+    assert_eq!(f.poll(set, 2).0.count, 0);
+    resource.publish(true);
+    assert_eq!(f.notify(2, notification, 1, ptr::null_mut()), 0);
+    let (batch, rows) = f.poll(set, 1);
+    assert_eq!(batch.count, 1);
+    assert_ne!(batch.flags & c::waitset_flag_more, 0);
+    assert_eq!(rows[0].registration, id);
+    assert_eq!(
+        unsafe {
+            waitsets::rearm(
+                set,
+                id,
+                &c::WaitSource {
+                    observed_revision: rows[0].revision,
+                    ..source
+                },
+            )
+        },
+        0
+    );
+    assert_eq!(
+        f.poll(set, 2).0.count,
+        2,
+        "Rearm does not consume terminal work"
+    );
+    resource.publish(false);
+    assert_eq!(
+        f.poll(set, 2).0.count,
+        1,
+        "only actual owner consumption clears level"
+    );
+    assert_eq!(unsafe { waitsets::remove(set, id) }, 0);
+    resource.publish(true);
+    assert_eq!(f.poll(set, 2).0.count, 1);
+}
+#[test]
+fn embedded_source_close_during_park_frees_backing_before_wait_resumes() {
+    let f = Fixture::new();
+    let mut resource = Resource::new();
+    let source = resource.prepare();
+    let set = f.set(1);
+    let id = f.enroll(set, source);
+    crate::PARK.with(|p| {
+        *p.borrow_mut() = Some(Box::new(move |ticks| {
+            assert_eq!(ticks, u64::MAX);
+            resource.release();
+        }))
+    });
+    let mut batch = c::WaitSetBatch::default();
+    let mut row = c::WaitSetEvent::default();
+    assert_eq!(
+        unsafe {
+            waitsets::wait(
+                set,
+                &c::WaitSetDeadline {
+                    kind: 2,
+                    ..Default::default()
+                },
+                &mut row,
+                1,
+                &mut batch,
+            )
+        },
+        0
+    );
+    assert_eq!(row.status, c::waitset_event_source_closed as i32);
+    assert_eq!(
+        unsafe { waitsets::rearm(set, id, &source) },
+        c::waitset_error_closed
+    );
+    assert_eq!(unsafe { waitsets::remove(set, id) }, 0);
+}
+#[test]
+fn embedded_source_subscriber_cap_unlink_and_failed_set_free() {
+    let f = Fixture::new();
+    let resource = Resource::new();
+    let source = resource.prepare();
+    let mut sets = [0; 32];
+    for set in &mut sets {
+        *set = f.set(1);
+        f.enroll(*set, source);
+    }
+    let extra = f.set(1);
+    let mut output = 0x1234;
+    assert_eq!(
+        unsafe { waitsets::enroll(extra, &source, &mut output) },
+        c::waitset_error_capacity
+    );
+    assert_eq!(output, 0x1234);
+    crate::FAIL_FREE.with(|v| v.set(true));
+    assert_eq!(
+        unsafe { waitsets::close(sets[0]) },
+        c::waitset_error_release
+    );
+    f.enroll(extra, source);
+    assert_eq!(unsafe { waitsets::close(sets[0]) }, 0);
+}
 #[test]
 fn actual_owner_coalesces_rotates_and_prioritizes_stop() {
     let mut f = Fixture::new();

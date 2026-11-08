@@ -1,11 +1,14 @@
 //! Host seams for the actual WaitSet/notification owners. This replaces only
-//! scheduler, heap and current-instance hardware boundaries; no owner algorithm.
+//! scheduler, heap and current-instance hardware boundaries. Resource admission
+//! seams test the actual new channel/Set protocol, not native IO/service owners.
 #![allow(dead_code)]
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
 };
 thread_local! {
+    static SOURCE: Cell<*mut program::wait_sources::Channel> = const { Cell::new(core::ptr::null_mut()) };
+    static SOURCE_READY: Cell<bool> = const { Cell::new(false) };
     static DEPTH: Cell<u64> = const { Cell::new(0) };
     static INSTANCE: Cell<*mut program::context::Instance> = const { Cell::new(core::ptr::null_mut()) };
     static CORE: Cell<*mut sched::task::task_registry::Core> = const { Cell::new(core::ptr::null_mut()) };
@@ -250,13 +253,77 @@ mod driver {
 mod contract {
     pub use r4os_contract::*;
 }
+fn resource<T>(
+    input: program::wait_sources::Identity,
+    action: impl FnOnce(*mut program::wait_sources::Channel) -> Result<T, i32>,
+) -> Result<T, i32> {
+    DEPTH.with(|d| assert_eq!(d.get(), 0, "source owner must precede Runtime"));
+    let channel = SOURCE.with(|v| v.get());
+    if channel.is_null() {
+        return Err(contract::waitset_error_stale);
+    }
+    unsafe { input.locked(channel, SOURCE_READY.with(|v| v.get()), action) }
+}
+mod service {
+    pub mod endpoint {
+        pub(crate) unsafe fn waitset_source<T>(
+            input: crate::program::wait_sources::Identity,
+            _: crate::contract::ProgramProcessHandle,
+            action: impl FnOnce(*mut crate::program::wait_sources::Channel) -> Result<T, i32>,
+        ) -> Result<T, i32> {
+            crate::resource(input, action)
+        }
+    }
+}
 mod program {
+    pub mod gui_activity {
+        pub(super) unsafe fn waitset_membership(_: *mut super::wait_sources::Channel) {}
+        pub(super) unsafe fn waitset_source<T>(
+            input: super::wait_sources::Identity,
+            action: impl FnOnce(*mut super::wait_sources::Channel) -> Result<T, i32>,
+        ) -> Result<T, i32> {
+            crate::resource(input, action)
+        }
+    }
+    pub mod async_io {
+        pub(super) unsafe fn waitset_source<T>(
+            input: super::wait_sources::Identity,
+            action: impl FnOnce(*mut super::wait_sources::Channel) -> Result<T, i32>,
+        ) -> Result<T, i32> {
+            crate::resource(input, action)
+        }
+    }
+    pub mod completions {
+        pub(super) unsafe fn waitset_source<T>(
+            input: super::wait_sources::Identity,
+            action: impl FnOnce(*mut super::wait_sources::Channel) -> Result<T, i32>,
+        ) -> Result<T, i32> {
+            crate::resource(input, action)
+        }
+    }
+    pub mod threads {
+        pub(super) unsafe fn waitset_source<T>(
+            input: super::wait_sources::Identity,
+            action: impl FnOnce(*mut super::wait_sources::Channel) -> Result<T, i32>,
+        ) -> Result<T, i32> {
+            crate::resource(input, action)
+        }
+    }
+    #[path = "WAIT_SOURCES_SOURCE"]
+    pub(crate) mod wait_sources;
     pub mod context {
         pub struct Instance {
             pub runtime_payload: *mut core::ffi::c_void,
             pub notifications: super::notifications::Owner,
         }
-        pub fn current() -> *mut Instance {
+        pub unsafe fn handle() -> Option<crate::contract::ProgramProcessHandle> {
+            Some(crate::contract::ProgramProcessHandle {
+                instance_id: 1,
+                generation: 1,
+                ..Default::default()
+            })
+        }
+        pub unsafe fn current() -> *mut Instance {
             super::super::INSTANCE.with(|i| i.get())
         }
     }

@@ -36,6 +36,69 @@ struct Subscribers(UnsafeCell<*mut Channel>);
 // Exact live GUI payloads only; insert/remove/publication all hold Runtime.
 unsafe impl Sync for Subscribers {}
 static SUBSCRIBERS: Subscribers = Subscribers(UnsafeCell::new(ptr::null_mut()));
+unsafe fn gui_for(channel: *mut Channel) -> *mut t::Gui {
+    unsafe {
+        channel
+            .cast::<u8>()
+            .sub(core::mem::offset_of!(t::Gui, activity))
+            .cast()
+    }
+}
+pub(super) unsafe fn waitset_membership(observers: *mut super::wait_sources::Channel) {
+    unsafe {
+        let gui = observers
+            .cast::<u8>()
+            .sub(core::mem::offset_of!(t::Gui, waitset_activity))
+            .cast::<t::Gui>();
+        let mask = (*gui).waitset_legacy_mask
+            | if (*observers).subscribed() {
+                c::gui_activity_shared_all
+            } else {
+                0
+            };
+        subscribe(ptr::addr_of_mut!((*gui).activity), mask);
+    }
+}
+pub(super) unsafe fn waitset_source<T>(
+    input: super::wait_sources::Identity,
+    action: impl FnOnce(*mut super::wait_sources::Channel) -> Result<T, i32>,
+) -> Result<T, i32> {
+    if input.object() != 0 {
+        return Err(c::waitset_error_invalid);
+    }
+    let instance = unsafe { context::current() };
+    if instance.is_null()
+        || unsafe { (*instance).app_class != 1 }
+        || !unsafe { gui_events::allowed(instance) }
+    {
+        return Err(c::waitset_error_unsupported);
+    }
+    let thread = unsafe { threads::current() };
+    if !thread.is_null()
+        && unsafe { (*thread).owner_instance == instance && (*thread).flags & threads::MAIN == 0 }
+    {
+        return Err(c::waitset_error_owner);
+    }
+    let gui = {
+        let _owner = crate::memory::owner::Guard::acquire(0);
+        unsafe { (*instance).gui_payload.cast::<t::Gui>() }
+    };
+    if gui.is_null() {
+        return Err(c::waitset_error_unsupported);
+    }
+    unsafe {
+        input.locked(
+            ptr::addr_of_mut!((*gui).waitset_activity),
+            false,
+            |channel| {
+                if (*gui).activity.queue.core.closing {
+                    return Err(c::waitset_error_closed);
+                }
+                action(channel)
+            },
+        )
+    }
+}
 unsafe fn unlink(channel: *mut Channel) {
     unsafe {
         if (*channel).subscriptions == 0 {
@@ -57,6 +120,11 @@ unsafe fn unlink(channel: *mut Channel) {
 unsafe fn publish(channel: *mut Channel) {
     unsafe {
         if !(*channel).queue.core.closing {
+            let gui = gui_for(channel);
+            super::wait_sources::Channel::publish_locked(
+                ptr::addr_of_mut!((*gui).waitset_activity),
+                false,
+            );
             sync_wait::r4os_rust_sync_queue(
                 ptr::addr_of_mut!((*channel).queue),
                 8,
@@ -107,6 +175,8 @@ pub(super) unsafe fn close(gui: *mut t::Gui) {
     let _runtime = RuntimeGuard::acquire();
     unsafe {
         let channel = ptr::addr_of_mut!((*gui).activity);
+        super::wait_sources::Channel::close_locked(ptr::addr_of_mut!((*gui).waitset_activity));
+        (*gui).waitset_legacy_mask = 0;
         unlink(channel);
         sync_objects::queue_close_cancelled(ptr::addr_of_mut!((*channel).queue));
     }
@@ -195,7 +265,14 @@ pub(crate) unsafe fn wait(last: u64, timeout: u64, mask: u32, out: *mut u64) -> 
             runtime::restore_runtime(flags);
             return -2;
         }
-        subscribe(channel, mask);
+        (*gui).waitset_legacy_mask = mask;
+        let combined = mask
+            | if (*gui).waitset_activity.subscribed() {
+                c::gui_activity_shared_all
+            } else {
+                0
+            };
+        subscribe(channel, combined);
     }
     // Transfer this exact outer admission to native atomic enrollment/park;
     // no RuntimeGuard or GUI/Channel reference crosses the physical switch.
