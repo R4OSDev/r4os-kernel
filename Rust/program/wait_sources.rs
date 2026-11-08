@@ -78,6 +78,14 @@ impl Channel {
         }
     }
     pub(crate) unsafe fn close(channel: *mut Self) {
+        // The authoritative owner (or exclusive unlinked backing) serializes
+        // this zero-epoch path with Prepare. No observer could have a link.
+        if unsafe { (*channel).epoch == 0 } {
+            unsafe {
+                (*channel).closed = true;
+            }
+            return;
+        }
         let _runtime = RuntimeGuard::acquire();
         unsafe {
             Self::close_locked(channel);
