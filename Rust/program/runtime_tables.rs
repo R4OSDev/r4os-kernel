@@ -223,6 +223,11 @@ fn configure_sys() {
         system_update_target_supported:
             crate::program::system::atomic::r4os_rust_sys_update_target_supported as *const ()
                 as usize,
+        file_metadata2: crate::program::system::metadata::r4os_rust_sys_file_metadata2
+            as c::R4SysFns::file_metadata2 as *const () as usize,
+        directory_metadata_batch2:
+            crate::program::system::metadata::r4os_rust_sys_directory_metadata_batch2
+                as c::R4SysFns::directory_metadata_batch2 as *const () as usize,
         directory_batch: crate::program::system::directory::r4os_rust_sys_directory_batch
             as *const () as usize,
         drive_info_geometry: crate::program::system::directory::r4os_rust_sys_drive_info_geometry
@@ -336,8 +341,18 @@ fn configure_sys() {
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1416);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1432);
     assert!(mem::offset_of!(c::R4XStartR4Sys, system_update_target_supported) == 1408);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, file_metadata2) == 1416);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, directory_metadata_batch2) == 1424);
+    assert!(mem::size_of::<c::FileIdentity2>() == 48);
+    assert!(mem::size_of::<c::FileMetadata2>() == 112);
+    assert!(mem::offset_of!(c::FileMetadata2, identity) == 8);
+    assert!(mem::offset_of!(c::FileMetadata2, backend_node) == 72);
+    assert!(mem::size_of::<c::DirectoryMetadataEntry2>() == 1136);
+    assert!(mem::offset_of!(c::DirectoryMetadataEntry2, path) == 112);
+    assert!(mem::size_of::<c::DirectoryMetadataCursor2>() == 2184);
+    assert!(mem::offset_of!(c::DirectoryMetadataCursor2, scan) == 24);
     assert!(mem::offset_of!(c::R4XStartR4Sys, service_inventory_page) == 1392);
     assert!(mem::offset_of!(c::R4XStartR4Sys, service_control_bound) == 1400);
     assert!(mem::offset_of!(c::R4XStartR4Sys, program_observation_retain) == 1336);

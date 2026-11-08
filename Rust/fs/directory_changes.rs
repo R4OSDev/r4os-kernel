@@ -4,7 +4,11 @@ use crate::contract::DirectoryChangeCursor as Cursor;
 use crate::memory::owner::Guard;
 use crate::storage::access_runtime::r4os_rust_storage_access_runtime;
 use crate::storage::access_state::{Input, Mount, Reference};
-use core::{cell::UnsafeCell, mem::MaybeUninit};
+use core::{
+    cell::UnsafeCell,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicBool, Ordering::Relaxed},
+};
 
 const CAPACITY: usize = 256;
 #[repr(C)]
@@ -72,6 +76,19 @@ static HISTORY: Canonical = Canonical(UnsafeCell::new(History {
         node: 0,
     }); CAPACITY],
 }));
+// Existing history/cursors retain their wrapping behavior and exact layout.
+// New identities refuse forever after canonical wrap; no second sequence or
+// namespace registry is introduced. The same metadata owner serializes both.
+static NAMESPACE_EXHAUSTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn namespace_generation() -> Option<u64> {
+    let _guard = Guard::acquire(1);
+    if NAMESPACE_EXHAUSTED.load(Relaxed) {
+        None
+    } else {
+        Some(unsafe { (*HISTORY.0.get()).sequence })
+    }
+}
 
 /// # Safety
 /// State is aligned resident storage serialized by its caller. Publish input
@@ -111,7 +128,13 @@ pub unsafe extern "C" fn r4os_rust_fs_directory_changes(
         0 => {
             {
                 let _guard = Guard::acquire(1);
-                unsafe { (&mut *HISTORY.0.get()).publish(mount.read(), node) };
+                unsafe {
+                    let history = &mut *HISTORY.0.get();
+                    if history.sequence == u64::MAX {
+                        NAMESPACE_EXHAUSTED.store(true, Relaxed);
+                    }
+                    history.publish(mount.read(), node);
+                }
             }
             unsafe { fs_directory_activity() };
             0

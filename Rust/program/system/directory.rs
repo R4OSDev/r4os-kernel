@@ -1,7 +1,7 @@
 //! Original directory/drive/read metadata and caller-owned cursor APIs.
 use super::{
     context::{self as ctx, PathBuffers},
-    fs, io, path,
+    fs, io, metadata, path,
 };
 use crate::{
     contract as c,
@@ -15,28 +15,6 @@ macro_rules! some {
             None => return $error,
         }
     };
-}
-pub(super) fn metadata(entry: &fs::Entry, letter: u8, truncate: bool) -> c::FileInfo {
-    let mut info = c::FileInfo {
-        exists: 1,
-        is_dir: u8::from(entry.is_dir()),
-        drive: letter,
-        attr: entry.attr,
-        size: entry.size,
-        first_cluster: if truncate {
-            entry.node as u32
-        } else {
-            u32::try_from(entry.node).expect("File node projection")
-        },
-        created_time: entry.times[0],
-        created_date: entry.times[1],
-        access_date: entry.times[2],
-        modified_time: entry.times[3],
-        modified_date: entry.times[4],
-        ..Default::default()
-    };
-    path::fixed_z(&mut info.name, &entry.name[..entry.name_len]);
-    info
 }
 /// # Safety
 /// Original bounded drive index and exclusive public output for its mounted
@@ -367,7 +345,10 @@ pub unsafe extern "C" fn r4os_rust_sys_directory_next(
         if count + 1 > len as usize {
             return -7;
         }
-        let metadata = metadata(&entry, letter, true);
+        let metadata = match metadata::legacy(&entry, letter) {
+            Ok(value) => value,
+            Err(code) => return code,
+        };
         ptr::copy_nonoverlapping(full.as_ptr(), out, count + 1);
         info.write(metadata);
         cursor.write(next);
@@ -390,11 +371,14 @@ pub unsafe extern "C" fn r4os_rust_sys_file_info(input: *const u8, out: *mut c::
         let volume = some!(ctx::volume(target), -2);
         let mut request = some!(fs::Request::volume(12, letter, volume), -3);
         if path::root(path) {
+            let first_cluster = match metadata::checked_node(fs::scalar(volume, 2)) {
+                Ok(value) => value,
+                Err(code) => return code,
+            };
             (*out).exists = 1;
             (*out).is_dir = 1;
             (*out).attr = 0x10;
-            (*out).first_cluster =
-                u32::try_from(fs::scalar(volume, 2)).expect("Root node projection");
+            (*out).first_cluster = first_cluster;
             path::fixed_z(&mut (*out).name, b"\\");
             request.ok = true;
             return 1;
@@ -412,7 +396,11 @@ pub unsafe extern "C" fn r4os_rust_sys_file_info(input: *const u8, out: *mut c::
             }
             _ => unreachable!(),
         }
-        out.write(metadata(&entry, letter, false));
+        let metadata = match metadata::legacy(&entry, letter) {
+            Ok(value) => value,
+            Err(code) => return code,
+        };
+        out.write(metadata);
         request.ok = true;
         1
     }
@@ -461,6 +449,18 @@ pub unsafe extern "C" fn r4os_rust_sys_directory_batch(
     cursor: *mut c::DirectoryBatchCursor,
     out: *mut c::DirectoryBatchEntry,
     capacity: u32,
+) -> i32 {
+    unsafe { directory_batch_core(input, cursor, out.cast(), capacity, None) }
+}
+
+/// Same bounded request/backend engine; only the owned result projection
+/// differs. A wide caller stages its cursor and verifies its namespace loan.
+pub(super) unsafe fn directory_batch_core(
+    input: *const u8,
+    cursor: *mut c::DirectoryBatchCursor,
+    out: *mut u8,
+    capacity: u32,
+    namespace: Option<u64>,
 ) -> i32 {
     unsafe {
         if cursor.is_null()
@@ -614,6 +614,16 @@ pub unsafe extern "C" fn r4os_rust_sys_directory_batch(
         if scan_poll(&mut next.change, &mut next.parent_change).is_err() {
             return -10;
         }
+        // Reject every unrepresentable legacy node before publishing a row.
+        // Current backend admission remains unchanged; a future wider node
+        // never truncates or panics through the preserved old ABI.
+        if namespace.is_none() {
+            for entry in &entries[..count] {
+                if let Err(code) = metadata::checked_node(entry.node) {
+                    return code;
+                }
+            }
+        }
         // Validate every full path before committing the opaque continuation.
         // A failed output has no authority and cannot silently consume data.
         for (index, entry) in entries[..count].iter().enumerate() {
@@ -622,14 +632,37 @@ pub unsafe extern "C" fn r4os_rust_sys_directory_batch(
                 path::join(relative, &entry.name[..entry.name_len], &mut joined),
                 -7
             );
-            let mut record = c::DirectoryBatchEntry {
-                info: metadata(entry, letter, true),
-                ..Default::default()
-            };
-            if !path::drive_z(letter, path, &mut record.path) {
-                return -7;
+            if let Some(namespace) = namespace {
+                let info = match metadata::project(volume, entry, letter, namespace, false) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                let mut record = c::DirectoryMetadataEntry2 {
+                    info,
+                    ..Default::default()
+                };
+                if !path::drive_z(letter, path, &mut record.path) {
+                    return -7;
+                }
+                out.add(index * size_of::<c::DirectoryMetadataEntry2>())
+                    .cast::<c::DirectoryMetadataEntry2>()
+                    .write(record);
+            } else {
+                let info = match metadata::legacy(entry, letter) {
+                    Ok(value) => value,
+                    Err(code) => return code,
+                };
+                let mut record = c::DirectoryBatchEntry {
+                    info,
+                    ..Default::default()
+                };
+                if !path::drive_z(letter, path, &mut record.path) {
+                    return -7;
+                }
+                out.add(index * size_of::<c::DirectoryBatchEntry>())
+                    .cast::<c::DirectoryBatchEntry>()
+                    .write(record);
             }
-            out.add(index).write(record);
         }
         cursor.write(next);
         request.ok = true;
