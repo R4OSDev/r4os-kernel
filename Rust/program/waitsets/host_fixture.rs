@@ -277,7 +277,7 @@ mod service {
 }
 mod program {
     pub mod gui_activity {
-        pub(super) unsafe fn waitset_membership(_: *mut super::wait_sources::Channel) {}
+        pub(super) unsafe fn waitset_membership(_: *mut super::wait_sources::Channel, _: bool) {}
         pub(super) unsafe fn waitset_source<T>(
             input: super::wait_sources::Identity,
             action: impl FnOnce(*mut super::wait_sources::Channel) -> Result<T, i32>,

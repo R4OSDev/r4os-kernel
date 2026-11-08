@@ -111,7 +111,7 @@ impl Channel {
             (*channel).head = ptr::null_mut();
             (*channel).count = 0;
             if (*channel).gui {
-                super::gui_activity::waitset_membership(channel);
+                super::gui_activity::waitset_membership(channel, false);
             }
         }
     }
@@ -235,7 +235,7 @@ pub(super) unsafe fn subscribe(
         (*link).linked = true;
         waitsets::resource_changed(link, (*channel).revision, (*channel).ready, false);
         if (*channel).gui {
-            super::gui_activity::waitset_membership(channel);
+            super::gui_activity::waitset_membership(channel, true);
         }
         Ok(())
     }
@@ -263,7 +263,7 @@ pub(super) unsafe fn unsubscribe(link: *mut Subscription) {
         (*link).previous = ptr::null_mut();
         (*link).next = ptr::null_mut();
         if (*channel).gui {
-            super::gui_activity::waitset_membership(channel);
+            super::gui_activity::waitset_membership(channel, false);
         }
     }
 }

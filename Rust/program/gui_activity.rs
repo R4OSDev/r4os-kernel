@@ -44,7 +44,10 @@ unsafe fn gui_for(channel: *mut Channel) -> *mut t::Gui {
             .cast()
     }
 }
-pub(super) unsafe fn waitset_membership(observers: *mut super::wait_sources::Channel) {
+pub(super) unsafe fn waitset_membership(
+    observers: *mut super::wait_sources::Channel,
+    force_rescan: bool,
+) {
     unsafe {
         let gui = observers
             .cast::<u8>()
@@ -56,7 +59,14 @@ pub(super) unsafe fn waitset_membership(observers: *mut super::wait_sources::Cha
             } else {
                 0
             };
-        subscribe(ptr::addr_of_mut!((*gui).activity), mask);
+        let channel = ptr::addr_of_mut!((*gui).activity);
+        let unchanged = (*channel).subscriptions == mask;
+        subscribe(channel, mask);
+        // A legacy ALL subscription can already match the combined mask.
+        // New observers still need their first scan of preexisting input.
+        if force_rescan && unchanged {
+            publish(channel);
+        }
     }
 }
 pub(super) unsafe fn waitset_source<T>(
