@@ -82,6 +82,7 @@ pub mod thread_runtime;
 pub mod threads;
 pub mod util;
 pub mod vm;
+pub mod waitsets;
 
 pub mod r4dev;
 

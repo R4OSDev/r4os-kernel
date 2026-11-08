@@ -300,6 +300,21 @@ pub(super) unsafe fn complete(
             bump();
             report(report_boot, b"SERVMAN: Task frei");
         }
+        let instance = (*thread).owner_instance;
+        if !instance.is_null() && task_id != 0 {
+            let runtime = (*instance)
+                .runtime_payload
+                .cast::<super::payload_types::Runtime>();
+            if !runtime.is_null()
+                && !super::waitsets::cleanup(
+                    ptr::addr_of_mut!((*runtime).wait_sets),
+                    Some((task_id, task_generation)),
+                )
+            {
+                clear_claim(thread, keep_join);
+                return false;
+            }
+        }
         if !threads::release_input(thread) {
             clear_claim(thread, keep_join);
             return false;

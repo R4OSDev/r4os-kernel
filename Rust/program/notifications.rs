@@ -31,6 +31,8 @@ struct Record {
     sequence: u64,
     closed: bool,
     queue: WaitQueue,
+    subscribers: *mut super::waitsets::Subscription,
+    subscriber_count: u32,
 }
 struct Serial(UnsafeCell<u64>);
 // SAFETY: serial reservation shares the existing scheduler runtime owner with
@@ -40,7 +42,7 @@ static SERIAL: Serial = Serial(UnsafeCell::new(0));
 unsafe fn find(owner: *mut Owner, handle: u64) -> *mut Record {
     unsafe { (*owner).tree.find(handle).cast() }
 }
-fn can_sleep() -> bool {
+pub(super) fn can_sleep() -> bool {
     let flags: u64;
     unsafe { core::arch::asm!("pushfq; pop {}",out(reg) flags,options(nomem,preserves_flags)) };
     if flags & 0x200 == 0 || runtime::r4os_rust_runtime_control(8, 0) != 0 {
@@ -53,9 +55,9 @@ fn can_sleep() -> bool {
     let core = unsafe { task_registry::core(task.cast()) };
     unsafe { (*core).preempt_disable_depth == 0 && (*core).held_lock_count == 0 }
 }
-struct Operation(task_context::Unwind);
+pub(super) struct Operation(task_context::Unwind);
 impl Operation {
-    fn enter() -> Option<Self> {
+    pub(super) fn enter() -> Option<Self> {
         if !can_sleep() {
             return None;
         }
@@ -112,6 +114,8 @@ unsafe fn create(owner: *mut Owner, output: *mut u64) -> i32 {
             sequence: 0,
             closed: false,
             queue: WaitQueue::EMPTY,
+            subscribers: ptr::null_mut(),
+            subscriber_count: 0,
         });
         {
             let _guard = runtime::RuntimeGuard::acquire();
@@ -146,6 +150,88 @@ unsafe fn query(owner: *mut Owner, handle: u64, output: *mut u64) -> i32 {
         c::notification_ok
     }
 }
+/// Caller holds Runtime. Links belong to stable resident WaitSet registrations;
+/// the bounded source list is detached before its original Record is freed.
+pub(super) unsafe fn subscribe(
+    owner: *mut Owner,
+    handle: u64,
+    link: *mut super::waitsets::Subscription,
+    observed: u64,
+) -> Result<(), i32> {
+    unsafe {
+        let record = find(owner, handle);
+        if record.is_null() {
+            return Err(c::waitset_error_stale);
+        }
+        if (*owner).closing || (*record).closed {
+            return Err(c::waitset_error_closed);
+        }
+        if observed > (*record).sequence {
+            return Err(c::waitset_error_invalid);
+        }
+        if (*record).subscriber_count == c::waitset_max_source_subscribers {
+            return Err(c::waitset_error_capacity);
+        }
+        assert!(!(*link).linked);
+        (*link).source_handle = handle;
+        (*link).previous = ptr::null_mut();
+        (*link).next = (*record).subscribers;
+        if !(*link).next.is_null() {
+            (*(*link).next).previous = link;
+        }
+        (*record).subscribers = link;
+        (*record).subscriber_count += 1;
+        (*link).linked = true;
+        super::waitsets::source_changed(link, (*record).sequence, false);
+        Ok(())
+    }
+}
+/// Caller holds Runtime; no source or registration pointer escapes the owner.
+pub(super) unsafe fn unsubscribe(owner: *mut Owner, link: *mut super::waitsets::Subscription) {
+    unsafe {
+        if !(*link).linked {
+            return;
+        }
+        let record = find(owner, (*link).source_handle);
+        assert!(!record.is_null() && (*record).subscriber_count != 0);
+        if (*link).previous.is_null() {
+            assert!((*record).subscribers == link);
+            (*record).subscribers = (*link).next;
+        } else {
+            (*(*link).previous).next = (*link).next;
+        }
+        if !(*link).next.is_null() {
+            (*(*link).next).previous = (*link).previous;
+        }
+        (*record).subscriber_count -= 1;
+        (*link).previous = ptr::null_mut();
+        (*link).next = ptr::null_mut();
+        (*link).linked = false;
+    }
+}
+unsafe fn publish_subscribers(record: *mut Record, closed: bool) {
+    unsafe {
+        let mut link = (*record).subscribers;
+        let mut count = 0;
+        while !link.is_null() {
+            let next = (*link).next;
+            if closed {
+                (*link).linked = false;
+                (*link).previous = ptr::null_mut();
+                (*link).next = ptr::null_mut();
+            }
+            super::waitsets::source_changed(link, (*record).sequence, closed);
+            count += 1;
+            assert!(count <= c::waitset_max_source_subscribers);
+            link = next;
+        }
+        assert!(count == (*record).subscriber_count);
+        if closed {
+            (*record).subscribers = ptr::null_mut();
+            (*record).subscriber_count = 0;
+        }
+    }
+}
 unsafe fn notify(owner: *mut Owner, handle: u64, count: u32) -> i32 {
     unsafe {
         if handle == 0 || count == 0 {
@@ -162,10 +248,12 @@ unsafe fn notify(owner: *mut Owner, handle: u64, count: u32) -> i32 {
         let queue = ptr::addr_of_mut!((*record).queue);
         if (*record).sequence == u64::MAX {
             (*record).closed = true;
+            publish_subscribers(record, true);
             sync_wait::r4os_rust_sync_queue(queue, 4, ptr::null_mut(), 3, ptr::null_mut());
             return c::notification_error_exhausted;
         }
         (*record).sequence += 1;
+        publish_subscribers(record, false);
         let mut remaining = count;
         while remaining != 0
             && sync_wait::r4os_rust_sync_queue(queue, 0, ptr::null_mut(), 0, ptr::null_mut()) != 0
@@ -234,6 +322,7 @@ unsafe fn remove(owner: *mut Owner, handle: u64) -> i32 {
                 return c::notification_error_stale;
             }
             (*record).closed = true;
+            publish_subscribers(record, true);
             sync_wait::r4os_rust_sync_queue(
                 ptr::addr_of_mut!((*record).queue),
                 4,

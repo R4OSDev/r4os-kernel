@@ -1,4 +1,36 @@
 //! Direct system platform callbacks; original typed owners and call boundaries.
+pub(super) unsafe extern "C" fn sys_waitset_create(capacity: u32, output: *mut u64) -> i32 {
+    unsafe { super::waitsets::create(capacity, output) }
+}
+pub(super) unsafe extern "C" fn sys_waitset_enroll(
+    handle: u64,
+    source: *const crate::contract::WaitSource,
+    output: *mut u64,
+) -> i32 {
+    unsafe { super::waitsets::enroll(handle, source, output) }
+}
+pub(super) unsafe extern "C" fn sys_waitset_rearm(
+    handle: u64,
+    registration: u64,
+    source: *const crate::contract::WaitSource,
+) -> i32 {
+    unsafe { super::waitsets::rearm(handle, registration, source) }
+}
+pub(super) unsafe extern "C" fn sys_waitset_remove(handle: u64, registration: u64) -> i32 {
+    unsafe { super::waitsets::remove(handle, registration) }
+}
+pub(super) unsafe extern "C" fn sys_waitset_wait(
+    handle: u64,
+    deadline: *const crate::contract::WaitSetDeadline,
+    events: *mut crate::contract::WaitSetEvent,
+    capacity: u32,
+    batch: *mut crate::contract::WaitSetBatch,
+) -> i32 {
+    unsafe { super::waitsets::wait(handle, deadline, events, capacity, batch) }
+}
+pub(super) unsafe extern "C" fn sys_waitset_close(handle: u64) -> i32 {
+    unsafe { super::waitsets::close(handle) }
+}
 pub(super) unsafe extern "C" fn sys_write(data: *const u8, len: u32) -> i32 {
     unsafe { crate::program::program_io::r4os_rust_program_io_write(1, data.cast(), len, false) }
 }

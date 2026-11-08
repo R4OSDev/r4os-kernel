@@ -44,6 +44,12 @@ pub(super) unsafe fn resource_step(instance: *mut ProgramInstance) -> bool {
 }
 pub(super) unsafe fn cleanup(instance: *mut ProgramInstance) -> bool {
     unsafe {
+        let runtime = (*instance).runtime_payload.cast::<t::Runtime>();
+        if !runtime.is_null()
+            && !super::waitsets::cleanup(ptr::addr_of_mut!((*runtime).wait_sets), None)
+        {
+            return false;
+        }
         if !process_data::r4os_rust_program_data_local_cleanup(instance)
             || !notifications_cleanup(instance)
         {

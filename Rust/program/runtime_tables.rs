@@ -336,12 +336,24 @@ fn configure_sys() {
             as usize,
         entropy_source_info: crate::driver::entropy::info as *const () as usize,
         entropy_fill: crate::driver::entropy::fill as *const () as usize,
+        waitset_create: super::platform_callbacks::sys_waitset_create as *const () as usize,
+        waitset_enroll: super::platform_callbacks::sys_waitset_enroll as *const () as usize,
+        waitset_rearm: super::platform_callbacks::sys_waitset_rearm as *const () as usize,
+        waitset_remove: super::platform_callbacks::sys_waitset_remove as *const () as usize,
+        waitset_wait: super::platform_callbacks::sys_waitset_wait as *const () as usize,
+        waitset_close: super::platform_callbacks::sys_waitset_close as *const () as usize,
         ..Default::default()
     };
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1432);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1480);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_create) == 1432);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_enroll) == 1440);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_rearm) == 1448);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_remove) == 1456);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_wait) == 1464);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_close) == 1472);
     assert!(mem::offset_of!(c::R4XStartR4Sys, system_update_target_supported) == 1408);
     assert!(mem::offset_of!(c::R4XStartR4Sys, file_metadata2) == 1416);
     assert!(mem::offset_of!(c::R4XStartR4Sys, directory_metadata_batch2) == 1424);

@@ -34,6 +34,7 @@ pub struct Runtime {
     pub appearance: super::policy::Appearance,
     pub r4xstart_context2: contract::generation2::R4XStartContext2,
     pub start_generation: u8,
+    pub wait_sets: super::waitsets::Owner,
 }
 
 #[repr(C)]
@@ -652,7 +653,8 @@ const _: () = {
     assert!(mem::offset_of!(Header, requested_bytes) == 8);
     assert!(mem::offset_of!(Header, kind) == 12);
     assert!(mem::offset_of!(Header, reserved) == 14);
-    assert!(mem::size_of::<Runtime>() == 2248);
+    assert!(mem::size_of::<Runtime>() == 2272);
+    assert!(mem::offset_of!(Runtime, wait_sets) == 2248);
     assert!(mem::align_of::<Runtime>() == 8);
     assert!(mem::offset_of!(Runtime, header) == 800);
     assert!(mem::offset_of!(Runtime, local_context) == 0);
