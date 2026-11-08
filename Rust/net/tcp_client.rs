@@ -645,6 +645,7 @@ fn maintenance(now: u64) {
         tcp::r4os_rust_net_tcp_reap_time_wait(now);
     }
     dhcp_client::r4os_rust_dhcp_client_retry_task();
+    super::protocol_link::maintenance(now);
 }
 #[repr(C)]
 pub struct SendResult {

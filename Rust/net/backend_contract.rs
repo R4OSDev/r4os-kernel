@@ -2,7 +2,7 @@
 //! Canonical packet/query ABI comes from the unchanged platform contract.
 pub use crate::contract::{NetBackendNegotiation as Negotiation, NetPacket as Packet};
 pub const MAX_PACKET_SEGMENTS: usize = 8;
-pub const SUPPORTED_CAPABILITIES: u64 = 1;
+pub const SUPPORTED_CAPABILITIES: u64 = 1 | crate::contract::net_backend_cap_rx_multicast;
 pub const KNOWN_PACKET_FLAGS: u64 = 31;
 #[repr(C)]
 #[derive(Clone, Copy)]

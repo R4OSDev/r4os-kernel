@@ -2,6 +2,7 @@
 //! encoding/checksums stay with the unchanged R4P implementation.
 use crate::sched::sync_types::Text;
 pub const TYPE_IPV4: u16 = 0x0800;
+pub const TYPE_IPV6: u16 = 0x86DD;
 pub const TYPE_ARP: u16 = 0x0806;
 pub const TYPE_R4OS_DIAG: u16 = 0x88B5;
 pub const MIN_FRAME_SIZE: usize = 60;
@@ -63,7 +64,7 @@ fn err(s: &mut Stats, value: &'static [u8]) {
 
 fn classify(s: &mut Stats, kind: u16) {
     match kind {
-        TYPE_IPV4 | TYPE_ARP => {}
+        TYPE_IPV4 | TYPE_IPV6 | TYPE_ARP => {}
         TYPE_R4OS_DIAG => s.test_frames += 1,
         _ => s.unknown_ethertype += 1,
     }

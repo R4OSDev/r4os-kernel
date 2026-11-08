@@ -299,6 +299,14 @@ unsafe fn received(
         adapters::r4os_rust_net_adapter_rx(index, len);
         return true;
     }
+    if kind == ethernet::TYPE_IPV6 {
+        if unsafe { super::protocol_link::received(index, data, len) } {
+            adapters::r4os_rust_net_adapter_rx(index, len);
+            return true;
+        }
+        unsafe { adapters::r4os_rust_net_adapter_drop(index, Text::literal(b"ipv6-provider")) };
+        return false;
+    }
     if kind == ethernet::TYPE_IPV4 {
         let Some(packet) = (unsafe { io::ipv4_rx(data, len) }) else {
             unsafe {

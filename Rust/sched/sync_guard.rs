@@ -110,6 +110,12 @@ unsafe fn try_task_owned(g: *mut UnwindGuard, t: *mut Task) -> bool {
             return false;
         }
         let c = registry::core(t);
+        // An IRQ can interrupt exit_current after Dead publication but before
+        // the physical context switch. That interrupted task cannot accept a
+        // fresh guard/PI owner; the caller must use its existing retry path.
+        if matches!((*c).state, State::Unused | State::Dead) {
+            return false;
+        }
         if free(g) {
             // A ready/current task may still have its original FIFO offer
             // before claim. A nested nonblocking attempt cannot acquire a

@@ -31,6 +31,7 @@ pub mod operations;
 pub mod packet_io;
 pub mod packet_pool;
 pub mod packet_views;
+pub(crate) mod protocol_link;
 pub mod protocol_runtime;
 pub mod protocol_stats;
 pub mod r4p_contract;

@@ -226,6 +226,41 @@ fn module_snapshot(index: usize) -> Module {
     let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
     unsafe { md(index).read() }
 }
+/// Real module identity for a currently admitted PPI scope. Module code is
+/// already pinned by the caller's original serial/execution admission.
+pub(crate) fn provider_identity(registry_slot: usize) -> Option<u64> {
+    for index in 0..N {
+        let m = module_snapshot(index);
+        if !m.used || !m.initialized || m.registry_slot != registry_slot {
+            continue;
+        }
+        let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+        if !image::r4os_rust_mod_published(m._module_slot) {
+            return None;
+        }
+        let entry = image::entry(m._module_slot);
+        if entry.is_null() {
+            return None;
+        }
+        let generation = unsafe { (*entry).generation };
+        let slot = u32::try_from(m._module_slot).ok()?.checked_add(1)?;
+        return (generation != 0).then_some((u64::from(generation) << 32) | u64::from(slot));
+    }
+    None
+}
+/// The existing header dependency graph owns nested provider order. Do not
+/// open a new recursive PPI dispatch path outside that acyclic graph.
+pub(crate) fn declares_dependency(registry_slot: usize, role: &[u8]) -> bool {
+    for index in 0..N {
+        let m = module_snapshot(index);
+        if m.used && m.initialized && m.registry_slot == registry_slot {
+            return m.info.dependencies[..m.info.dependency_count]
+                .iter()
+                .any(|entry| entry.bytes().eq_ignore_ascii_case(role));
+        }
+    }
+    false
+}
 fn publish_module(index: usize, value: Module) {
     let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
     unsafe { md(index).write(value) };

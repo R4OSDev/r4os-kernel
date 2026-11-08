@@ -73,6 +73,9 @@ pub struct NativeAdapter {
     pub stats: NativeAdapterStats,
     pub backend: backend_contract::Negotiation,
     pub ops: NativeAdapterOps,
+    // Generic NIC lifecycle identity, owned by this same registry. A genuine
+    // carrier transition invalidates copied protocol work from its old link.
+    pub link_generation: u64,
 }
 impl NativeAdapter {
     pub(crate) const EMPTY: Self = Self {
@@ -110,12 +113,14 @@ impl NativeAdapter {
             reserved: 0,
         },
         ops: NativeAdapterOps::EMPTY,
+        link_generation: 0,
     };
 }
 struct State {
     entries: [NativeAdapter; CAPACITY],
     count: usize,
     next_registration: u32,
+    next_link_generation: u64,
 }
 struct Storage(UnsafeCell<State>);
 // SAFETY: all table access holds short common network metadata admission.
@@ -126,6 +131,7 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
     entries: [NativeAdapter::EMPTY; CAPACITY],
     count: 0,
     next_registration: 1,
+    next_link_generation: 1,
 }));
 fn state() -> *mut State {
     STATE.0.get()
@@ -143,6 +149,20 @@ fn set_lifecycle(value: &mut NativeAdapter, phase: u8) {
     if value.lifecycle != phase {
         value.lifecycle = phase;
         value.state_changed_tick = timing::now_ticks();
+    }
+}
+// SAFETY: caller holds network admission and uses the reference only until it ends.
+fn change_link(s: &mut State, index: usize, link: u8) {
+    assert!(link <= 2, "Exact adapter link");
+    if s.entries[index].link != link {
+        assert_ne!(
+            s.next_link_generation,
+            u64::MAX,
+            "nonwrapping NIC link generation"
+        );
+        s.entries[index].link_generation = s.next_link_generation;
+        s.next_link_generation += 1;
+        s.entries[index].link = link;
     }
 }
 // SAFETY: caller holds network admission and uses the reference only until it ends.
@@ -195,11 +215,16 @@ pub unsafe extern "C" fn r4os_rust_net_adapter_register(input: *const NativeAdap
     let _guard = Guard::acquire(2);
     unsafe {
         let s = &mut *state();
-        if s.count >= CAPACITY || s.next_registration > 0x7fff_ffff {
+        if s.count >= CAPACITY
+            || s.next_registration > 0x7fff_ffff
+            || s.next_link_generation == u64::MAX
+        {
             return usize::MAX;
         }
         value.registration_id = s.next_registration;
         s.next_registration += 1;
+        value.link_generation = s.next_link_generation;
+        s.next_link_generation += 1;
         let now = timing::now_ticks();
         value.registered_tick = now;
         value.state_changed_tick = now;
@@ -278,9 +303,10 @@ pub extern "C" fn r4os_rust_net_adapter_lifecycle(index: usize, phase: u8) {
 pub extern "C" fn r4os_rust_net_adapter_link(index: usize, link: u8) {
     let _guard = Guard::acquire(2);
     unsafe {
-        if let Some(e) = entry(index) {
-            e.link = link;
-            set_lifecycle(e, lifecycle(link));
+        let s = &mut *state();
+        if index < s.count {
+            change_link(s, index, link);
+            set_lifecycle(&mut s.entries[index], lifecycle(link));
         }
     }
 }
@@ -333,10 +359,12 @@ pub extern "C" fn r4os_rust_net_adapter_rx(index: usize, len: usize) {
 pub extern "C" fn r4os_rust_net_adapter_tx_ok(index: usize, len: usize) {
     let _guard = Guard::acquire(2);
     unsafe {
-        if let Some(e) = entry(index) {
-            if e.link == 0 {
-                e.link = 2;
+        let s = &mut *state();
+        if index < s.count {
+            if s.entries[index].link == 0 {
+                change_link(s, index, 2);
             }
+            let e = &mut s.entries[index];
             set_lifecycle(e, 2);
             e.stats.tx_packets += 1;
             e.stats.tx_bytes += len as u64;
@@ -424,7 +452,7 @@ const _: () = {
     assert!(core::mem::offset_of!(NativeAdapterStats, last_error) == 56);
 };
 const _: () = {
-    assert!(core::mem::size_of::<NativeAdapter>() == 256);
+    assert!(core::mem::size_of::<NativeAdapter>() == 264);
     assert!(core::mem::align_of::<NativeAdapter>() == 8);
     assert!(core::mem::offset_of!(NativeAdapter, registration_id) == 0);
     assert!(core::mem::offset_of!(NativeAdapter, name) == 8);
@@ -445,6 +473,7 @@ const _: () = {
     assert!(core::mem::offset_of!(NativeAdapter, stats) == 80);
     assert!(core::mem::offset_of!(NativeAdapter, backend) == 152);
     assert!(core::mem::offset_of!(NativeAdapter, ops) == 208);
+    assert!(core::mem::offset_of!(NativeAdapter, link_generation) == 256);
 };
 const _: () = {
     assert!(core::mem::size_of::<BackendStatus>() == 160);

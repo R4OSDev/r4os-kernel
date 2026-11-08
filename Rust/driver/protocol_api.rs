@@ -99,9 +99,61 @@ const TEMPLATE: contract::ProtocolApi = contract::ProtocolApi {
     entropy_fill: Some(crate::driver::entropy::fill),
 };
 static TABLE: Table = Table(UnsafeCell::new(TEMPLATE));
-static TABLE2: contract::ProtocolApi2 = contract::ProtocolApi2::project_provider(&TEMPLATE);
+static TABLE2: contract::ProtocolApi2 = contract::ProtocolApi2 {
+    protocol_dispatch: Some(protocol_dispatch),
+    link_io: Some(link_io),
+    ..contract::ProtocolApi2::project_provider(&TEMPLATE)
+};
 pub(crate) fn table2() -> *const contract::ProtocolApi2 {
     core::ptr::addr_of!(TABLE2)
+}
+
+unsafe extern "C" fn protocol_dispatch(
+    role: *const u8,
+    len: u32,
+    op: u32,
+    input: *const contract::ProtocolBuffer,
+    output: *mut contract::ProtocolBuffer,
+) -> i32 {
+    let slot = current_slot();
+    if slot == NO_SLOT
+        || role.is_null()
+        || len == 0
+        || len > 64
+        || input.is_null()
+        || output.is_null()
+    {
+        return contract::network_error_invalid;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(role, len as usize) };
+    if !crate::loader::r4p::declares_dependency(slot, bytes) {
+        return contract::network_error_unsupported_policy;
+    }
+    unsafe {
+        crate::loader::r4p::r4os_rust_r4p_dispatch(
+            crate::fs::vfs_types::Bytes {
+                data: role,
+                len: len as usize,
+            },
+            op,
+            input,
+            output,
+        )
+    }
+}
+
+unsafe extern "C" fn link_io(
+    input: *const contract::NetworkLinkRequest,
+    output: *mut contract::NetworkLinkInfo,
+) -> i32 {
+    let slot = current_slot();
+    if slot == NO_SLOT {
+        return contract::network_error_backend;
+    }
+    let Some(provider) = crate::loader::r4p::provider_identity(slot) else {
+        return contract::network_error_provider_changed;
+    };
+    unsafe { crate::net::protocol_link::call(provider, input, output) }
 }
 
 unsafe fn length(text: *const u8) -> usize {

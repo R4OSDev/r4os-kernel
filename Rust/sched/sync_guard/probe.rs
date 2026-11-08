@@ -251,6 +251,17 @@ fn handoff(mode: u32) -> bool {
                 ok = !life::kill(id, Some(generation.wrapping_add(1))) && ok;
                 ok = life::kill(id, Some(generation)) && ok;
                 ok = (*c).state == State::Dead && (*c).guard_offer.is_empty() && ok;
+                // The exact killed task is still retained by this Runtime
+                // admission. IRQ-style acquisition against an unrelated free
+                // guard must not attach a new owner or change its counters.
+                let sibling = ptr::addr_of_mut!((*FIX.0.get()).sibling);
+                ok = !try_task_owned(sibling, task(0))
+                    && free(sibling)
+                    && (*sibling).owner_task.is_null()
+                    && (*sibling).donation_rank == pi::NO_RANK
+                    && (*c).unwind_guard_count == 0
+                    && (*c).inherited_rank_counts == [0; 4]
+                    && ok;
             } else if mode == 1 {
                 ok = scheduler::r4os_rust_scheduler_task(
                     2,
@@ -437,7 +448,7 @@ fn cycle() -> bool {
 pub(crate) fn run() -> bool {
     let ok = handoff(0) && handoff(1) && handoff(2) && chain(3) && chain(4) && cycle();
     if ok {
-        puts(b"GUARD08731 PASS fifo=1 kill=1 cancel=1 irq-timeout=1 mixed=2 cycle=1 tasks=17 own=reaped\r\n");
+        puts(b"GUARD08731 PASS fifo=1 kill=1 dead-try=1 cancel=1 irq-timeout=1 mixed=2 cycle=1 tasks=17 own=reaped\r\n");
     }
     ok
 }
