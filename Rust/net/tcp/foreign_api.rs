@@ -1167,3 +1167,27 @@ pub(crate) unsafe fn wait_observations(
         }
     }
 }
+
+/// Exact retained slot query; no resident borrow escapes the TCP owner.
+/// None is invalid identity, Some(0) live, nonzero is the actual packet cause.
+pub(crate) fn retained_terminal_cause(id: u32) -> Option<u32> {
+    let _guard = super::super::tcp_owner::Guard::acquire()?;
+    unsafe {
+        let c = &*by_id(id)?;
+        c.retained_terminal.then_some(c.terminal_cause)
+    }
+}
+
+pub(crate) fn begin_retained_connect(ip: [u8; 4], port: u16, seq: u32) -> i32 {
+    let Some(_guard) = super::super::tcp_owner::Guard::acquire() else {
+        return -1;
+    };
+    unsafe { connections::begin_live_connect_mode(ip, port, seq, true) }
+}
+
+pub(crate) fn retained_connected(id: u32) -> bool {
+    let Some(_guard) = super::super::tcp_owner::Guard::acquire() else {
+        return false;
+    };
+    unsafe { by_id(id).is_some_and(|c| (*c).retained_terminal && (*c).negotiation_counted) }
+}

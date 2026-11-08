@@ -10,6 +10,7 @@ struct Handle {
     handle: u32,
     conn_id: u32,
     owner_id: u16,
+    retained: bool,
 }
 impl Handle {
     const EMPTY: Self = Self {
@@ -17,6 +18,7 @@ impl Handle {
         handle: 0,
         conn_id: 0,
         owner_id: 0,
+        retained: false,
     };
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -163,7 +165,9 @@ pub(super) fn clear_handles() {
         s.handles.fill(Handle::EMPTY);
         s.tombs.fill(Tombstone::EMPTY);
         s.next_tomb = 0;
-        s.next_handle = 1;
+        // A live backend restart must not let an old service front entry
+        // alias a newly allocated connection. Static bootstrap starts at1;
+        // subsequent clear/restart never rewinds this exhausting counter.
     });
 }
 pub(super) fn count_raw() -> u32 {
@@ -302,7 +306,7 @@ fn reap_at(index: usize, entry: Handle, cause: u32) {
 pub(super) fn reap() {
     for index in 0..TCP_SERVICE_HANDLES {
         let entry = state(|s| s.handles[index]);
-        if !entry.used || usable(entry.conn_id) {
+        if !entry.used || entry.retained || usable(entry.conn_id) {
             continue;
         }
         reap_at(index, entry, cause(entry.conn_id));
@@ -312,6 +316,9 @@ fn owner_matches(handle: u16, request: u16) -> bool {
     handle == 0 || request == 0 || handle == request
 }
 pub(super) fn allocate(id: u32, owner: u16) -> Option<u32> {
+    allocate_mode(id, owner, false)
+}
+fn allocate_mode(id: u32, owner: u16, retained: bool) -> Option<u32> {
     reap();
     if let Some(existing) = for_connection(id, owner) {
         return Some(existing);
@@ -327,15 +334,16 @@ pub(super) fn allocate(id: u32, owner: u16) -> Option<u32> {
         }
         let index = s.handles.iter().position(|h| !h.used)?;
         let handle = s.next_handle;
-        s.next_handle = s.next_handle.wrapping_add(1);
-        if s.next_handle == 0 {
-            s.next_handle = 1;
+        if handle == 0 {
+            return None;
         }
+        s.next_handle = s.next_handle.checked_add(1).unwrap_or(0);
         s.handles[index] = Handle {
             used: true,
             handle,
             conn_id: id,
             owner_id: owner,
+            retained,
         };
         Some(handle)
     })
@@ -374,7 +382,7 @@ pub(super) fn resolve(handle: u32, owner: u16) -> Lookup {
         if !entry.used || entry.handle != handle {
             continue;
         }
-        if !usable(entry.conn_id) {
+        if !entry.retained && !usable(entry.conn_id) {
             let cause = cause(entry.conn_id);
             reap_at(index, entry, cause);
             return Lookup {
@@ -390,7 +398,11 @@ pub(super) fn resolve(handle: u32, owner: u16) -> Lookup {
             }
             continue;
         }
-        let cause = cause(entry.conn_id);
+        let cause = if entry.retained {
+            retained_cause(entry.conn_id)
+        } else {
+            cause(entry.conn_id)
+        };
         if state(|s| s.handles[index] == entry) {
             return Lookup {
                 conn_id: entry.conn_id,
@@ -415,7 +427,11 @@ pub(super) fn resolve_close(handle: u32, owner: u16) -> Lookup {
             }
             continue;
         }
-        let cause = cause(entry.conn_id);
+        let cause = if entry.retained {
+            retained_cause(entry.conn_id)
+        } else {
+            cause(entry.conn_id)
+        };
         if state(|s| s.handles[index] == entry) {
             return Lookup {
                 conn_id: entry.conn_id,
@@ -511,4 +527,17 @@ pub(super) fn owner_for_connection(id: u32) -> u16 {
             .find(|h| h.used && h.conn_id == id)
             .map_or(0, |h| h.owner_id)
     })
+}
+
+pub(super) fn allocate_retained(id: u32, owner: u16) -> Option<u32> {
+    // Publish retention together with this original handle entry. A reaper
+    // must never observe a newly retained connection as a legacy stale slot.
+    allocate_mode(id, owner, true)
+}
+fn retained_cause(id: u32) -> u32 {
+    match tcp::retained_terminal_cause(id) {
+        Some(0) => SOCKET_LIFECYCLE_ACTIVE_PUBLIC,
+        Some(value) => value,
+        None => SOCKET_LIFECYCLE_BAD_HANDLE_PUBLIC,
+    }
 }

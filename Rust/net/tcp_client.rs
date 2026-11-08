@@ -276,6 +276,9 @@ fn window_update(id: u32) {
     }
 }
 fn connect(ip: [u8; 4], port: u16, deadline: Option<u64>) -> i32 {
+    connect_mode(ip, port, deadline, false)
+}
+fn connect_mode(ip: [u8; 4], port: u16, deadline: Option<u64>, retained: bool) -> i32 {
     if adapters::r4os_rust_net_adapter_count() == 0 {
         error(b"no-adapter");
         return wire::TCP_RESULT_NO_CONNECTION;
@@ -284,8 +287,11 @@ fn connect(ip: [u8; 4], port: u16, deadline: Option<u64>) -> i32 {
         timeout(b"connect-timeout");
         return BAD_STATE;
     }
-    let connection =
-        unsafe { tcp::r4os_rust_net_tcp_begin_live_connect(&ip, port, next_seq(ip, port)) };
+    let connection = if retained {
+        tcp::begin_retained_connect(ip, port, next_seq(ip, port))
+    } else {
+        unsafe { tcp::r4os_rust_net_tcp_begin_live_connect(&ip, port, next_seq(ip, port)) }
+    };
     if connection <= 0 {
         return connection;
     }
@@ -316,7 +322,7 @@ fn connect(ip: [u8; 4], port: u16, deadline: Option<u64>) -> i32 {
         }
         retransmits += 1;
     }
-    if !established(id) {
+    if !established(id) && !(retained && tcp::retained_connected(id)) {
         timeout(b"connect-timeout");
         abort_connection(id, b"connect-timeout");
         return BAD_STATE;
@@ -806,3 +812,7 @@ const _: () = {
     assert!(core::mem::offset_of!(SendResult, available) == 0);
     assert!(core::mem::offset_of!(SendResult, result) == 1);
 };
+
+pub(crate) fn connect_retained(ip: [u8; 4], port: u16, deadline: Option<u64>) -> i32 {
+    connect_mode(ip, port, deadline, true)
+}

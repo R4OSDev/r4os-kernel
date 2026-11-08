@@ -6,7 +6,20 @@ pub(crate) unsafe fn begin_live_connect(
     remote_port: u16,
     initial_seq: u32,
 ) -> i32 {
+    unsafe { begin_live_connect_mode(remote_ip, remote_port, initial_seq, false) }
+}
+
+pub(crate) unsafe fn begin_live_connect_mode(
+    remote_ip: [u8; 4],
+    remote_port: u16,
+    initial_seq: u32,
+    retained: bool,
+) -> i32 {
     unsafe {
+        if *NEXT_ID.0.get() > i32::MAX as u32 {
+            (*stats()).last_error = text(b"connection-id-exhausted");
+            return -1;
+        }
         let Some(slot) = alloc_connection() else {
             (*stats()).last_error = text(b"no-conn");
             return -1;
@@ -14,6 +27,7 @@ pub(crate) unsafe fn begin_live_connect(
         let c = &mut *connection(slot);
         reset_connection_slot(c);
         c.used = true;
+        c.retained_terminal = retained;
         c.id = *NEXT_ID.0.get();
         c.generation = next_slot_generation(slot);
         c.state = State::SynSent;
@@ -151,6 +165,10 @@ pub(crate) unsafe fn accept_inbound(view: SegmentView, initial_seq: u32) -> Opti
             reset_connection_slot(&mut *c);
             (*stats()).last_error = text(b"syn-reuse");
         }
+        if *NEXT_ID.0.get() > i32::MAX as u32 {
+            (*stats()).last_error = text(b"connection-id-exhausted");
+            return None;
+        }
         let Some(slot) = alloc_connection() else {
             (*stats()).last_error = text(b"accept-full");
             return None;
@@ -192,6 +210,7 @@ pub(crate) unsafe fn abort(conn_id: u32, reason: Text) {
         if let Some(c) = by_id(conn_id) {
             discard_catalog(&mut *c);
             (*c).state = State::Closed;
+            (*c).retained_terminal = false;
             (*c).used = false;
             (*stats()).last_error = reason;
         }
@@ -234,6 +253,7 @@ pub(crate) unsafe fn request_close(id: u32) -> bool {
         let Some(c) = by_id(id) else {
             return false;
         };
+        (*c).retained_terminal = false;
         match (*c).state {
             State::Established => {
                 (*c).close_requested = true;

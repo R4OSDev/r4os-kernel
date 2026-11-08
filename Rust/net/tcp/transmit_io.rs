@@ -353,6 +353,9 @@ pub(crate) unsafe fn read(id: u32, out: &mut [u8]) -> i32 {
             }
             flush_out_of_order_payload(c);
         } else if c.state == State::Closed {
+            if c.retained_terminal {
+                return 0;
+            }
             discard_catalog(c);
             c.used = false;
             return -1;
@@ -367,6 +370,7 @@ pub(crate) unsafe fn close(id: u32) -> i32 {
             return -1;
         };
         let c = &mut *c;
+        c.retained_terminal = false;
         if c.state == State::Closed {
             discard_catalog(c);
             c.used = false;

@@ -153,10 +153,10 @@ unsafe fn bind(port: u16) -> (i32, Text) {
                 continue;
             }
             let handle = (*s).next_handle;
-            (*s).next_handle = (*s).next_handle.wrapping_add(1);
-            if (*s).next_handle == 0 {
-                (*s).next_handle = 1;
+            if handle == 0 || handle > i32::MAX as u32 {
+                return (-3, text(b"handle-exhausted"));
             }
+            (*s).next_handle = handle.checked_add(1).unwrap_or(0);
             (*s).sockets[index] = Socket {
                 active: true,
                 handle,
@@ -410,6 +410,28 @@ pub unsafe extern "C" fn r4os_rust_udp_socket_recv(
         error.write(text(b"recv-ok"));
         len as i32
     }
+}
+
+/// New explicitly truncating backend receive, sharing the original FIFO.
+/// Some metadata distinguishes a zero-length datagram from an empty queue.
+/// The original length is kept even when capacity is zero; one whole queued
+/// datagram is consumed. No foreign table pointer or registry is introduced.
+pub(crate) fn receive_datagram(handle: u32, out: &mut [u8]) -> Result<Option<Info>, ()> {
+    let _guard = Guard::acquire().ok_or(())?;
+    let queued = unsafe {
+        let index = by_handle(handle).ok_or(())?;
+        let socket = &mut (*state()).sockets[index];
+        if socket.count == 0 {
+            return Ok(None);
+        }
+        let queued = socket.queue[socket.head];
+        socket.head = (socket.head + 1) % QUEUE_CAPACITY;
+        socket.count -= 1;
+        queued
+    };
+    let copied = out.len().min(usize::from(queued.info.length));
+    out[..copied].copy_from_slice(&queued.payload[..copied]);
+    Ok(Some(queued.info))
 }
 
 const _: () = {

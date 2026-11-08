@@ -27,6 +27,9 @@ pub(super) fn handle_udp_result_operation(
     id: u32,
     payload: &[u8],
 ) -> i32 {
+    if op == crate::contract::network_op_recv {
+        return truncated_datagram_reply(response, channel, op, id, payload);
+    }
     let mut data_buf = [0; UDP_RESULT_DATA_MAX];
     let result = make_udp_result(op, payload, &mut data_buf);
     let mut payload_buf = [0; TCP_MESSAGE_PAYLOAD_MAX];
@@ -39,6 +42,71 @@ pub(super) fn handle_udp_result_operation(
         id,
         RESULT_OK,
         &payload_buf[..base + result.data.len()],
+    )
+}
+
+/// Private new NIPC recv: exact6byte handle/capacity request; original fixed
+/// UdpServiceResult followed by LE u32 original datagram length, then copied
+/// payload. The service facade supplies canonical public provider identities.
+fn truncated_datagram_reply(
+    response: &mut [u8],
+    channel: u32,
+    op: u16,
+    id: u32,
+    payload: &[u8],
+) -> i32 {
+    let mut out = UdpServiceResult {
+        action: UDP_ACTION_RECV,
+        ..UdpServiceResult::EMPTY
+    };
+    let mut data = [0; UDP_RESULT_DATA_MAX];
+    let mut original = 0u32;
+    let mut copied = 0usize;
+    if payload.len() != 6 {
+        udp_bad_request_result(&mut out);
+    } else {
+        out.handle = read_u32(payload, 0);
+        let capacity = usize::from(read_u16(payload, 4)).min(UDP_RESULT_DATA_MAX - 4);
+        out.requested_bytes = int(capacity);
+        match super::super::udp_sockets::receive_datagram(out.handle, &mut data[..capacity]) {
+            Err(()) => {
+                out.result = -1;
+                set_udp_lifecycle(&mut out, SOCKET_LIFECYCLE_BAD_HANDLE_PUBLIC);
+            }
+            Ok(None) => {
+                out.result = 0;
+                out.flags |= UDP_FLAG_OK | UDP_FLAG_HANDLE_VALID;
+                set_udp_service_status(&mut out, Status::WouldBlock);
+                set_udp_lifecycle(&mut out, SOCKET_LIFECYCLE_WOULD_BLOCK_PUBLIC);
+            }
+            Ok(Some(info)) => {
+                original = u32::from(info.length);
+                copied = capacity.min(usize::from(info.length));
+                out.result = 0;
+                out.bytes = int(copied);
+                out.source_ip = info.source_ip;
+                out.dest_ip = info.dest_ip;
+                out.source_port = info.source_port;
+                out.dest_port = info.dest_port;
+                out.flags |=
+                    UDP_FLAG_OK | UDP_FLAG_DATA | UDP_FLAG_HANDLE_VALID | UDP_FLAG_REMOTE_VALID;
+                set_udp_lifecycle(&mut out, SOCKET_LIFECYCLE_ACTIVE_PUBLIC);
+            }
+        }
+    }
+    fill_udp_result_status(&mut out);
+    set_udp_operation_status(&mut out);
+    let mut body = [0; TCP_MESSAGE_PAYLOAD_MAX];
+    let base = out.encode(&mut body);
+    write_u32(&mut body, base, original);
+    body[base + 4..base + 4 + copied].copy_from_slice(&data[..copied]);
+    write_response(
+        response,
+        channel,
+        op,
+        id,
+        RESULT_OK,
+        &body[..base + 4 + copied],
     )
 }
 
@@ -118,7 +186,8 @@ pub(super) fn is_udp_operation(op: u16) -> bool {
 }
 
 pub(super) fn is_udp_result_operation(op: u16) -> bool {
-    op == OP_UDP_BIND_RESULT
+    op == crate::contract::network_op_recv
+        || op == OP_UDP_BIND_RESULT
         || op == OP_UDP_SENDTO_RESULT
         || op == OP_UDP_RECV_RESULT
         || op == OP_UDP_CLOSE_RESULT

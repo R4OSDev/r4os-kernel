@@ -45,6 +45,8 @@ pub const OP_TCP_ACCEPT_RESULT: u16 = 0x0319;
 pub const OP_TCP_ABORT_RESULT: u16 = 0x031A;
 pub const OP_TCP_ACCEPT_POLL_RESULT: u16 = 0x031B;
 pub const OP_TCP_RETRANSMIT_RESULT: u16 = 0x031C;
+pub const OP_TCP_CONNECT_RETAINED_RESULT: u16 =
+    crate::contract::net_service_op_tcp_connect_retained_result;
 pub const OP_UDP_BIND: u16 = 0x0401;
 pub const OP_UDP_SENDTO: u16 = 0x0402;
 pub const OP_UDP_RECV: u16 = 0x0403;

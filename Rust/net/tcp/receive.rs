@@ -30,7 +30,8 @@ pub(crate) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
                 }
                 discard_catalog(c);
                 c.state = State::Closed;
-                c.used = false;
+                c.terminal_cause = crate::contract::net_service_socket_lifecycle_reset;
+                c.used = c.retained_terminal;
             }
             (*stats()).last_error = text(b"rst");
             return Some(view);
@@ -79,6 +80,7 @@ pub(crate) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
                 {
                     c.ack = c.ack.wrapping_add(1);
                     c.state = State::Closed;
+                    c.terminal_cause = crate::contract::net_service_socket_lifecycle_peer_gone;
                     (*stats()).last_error = text(b"fin-rx");
                 }
             } else if c.state == State::FinWait && view.flags & FLAG_ACK != 0 {
@@ -375,6 +377,9 @@ pub(crate) unsafe fn reap_time_wait(now: u64) -> u32 {
                 continue;
             }
             if c.state == State::Closed && c.rx_len == 0 {
+                if c.retained_terminal {
+                    continue;
+                }
                 if c.time_wait_until == 0 {
                     c.time_wait_until = now.wrapping_add(TIME_WAIT_TICKS);
                 } else if tcp_runtime::deadline_reached(now, c.time_wait_until) {

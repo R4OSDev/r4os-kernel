@@ -434,6 +434,9 @@ fn handle(channel: u32, request: &[u8], response: &mut [u8]) -> i32 {
         write_restart_diagnostics(&mut w);
         return write_response(response, channel, op, id, RESULT_OK, w.slice());
     }
+    if (channel == 4 || channel == 5) && op == crate::contract::network_op_info {
+        return network_backend_info(response, channel, op, id, payload);
+    }
     if channel == 2 && op == OP_DHCP_STATUS_RESULT {
         return wire_reply(
             response,
@@ -854,3 +857,43 @@ use udp::{
     handle_udp_result_operation, is_udp_operation, is_udp_result_operation, make_udp_status_result,
     write_udp_operation, write_udp_status,
 };
+
+// Optional capability handshake on the existing private NIPC adapters. A zero
+// provider belongs only to this internal copied reply, never public service Info.
+fn network_backend_info(
+    response: &mut [u8],
+    channel: u32,
+    op: u16,
+    id: u32,
+    request: &[u8],
+) -> i32 {
+    if !request.is_empty() {
+        return write_response(response, channel, op, id, RESULT_BAD_REQUEST, &[]);
+    }
+    let (capabilities, send, recv) = if channel == 4 {
+        (
+            crate::contract::network_cap_ipv4
+                | crate::contract::network_cap_tcp
+                | crate::contract::network_cap_retained_terminal,
+            TCP_WRITE_PAYLOAD_MAX.min(3968),
+            TCP_RESULT_DATA_MAX.min(4008),
+        )
+    } else {
+        (
+            crate::contract::network_cap_ipv4
+                | crate::contract::network_cap_udp
+                | crate::contract::network_cap_datagram_truncate,
+            UDP_SEND_PAYLOAD_MAX
+                .min(super::udp_sockets::PAYLOAD_MAX)
+                .min(3968),
+            (UDP_RESULT_DATA_MAX - 4).min(4008),
+        )
+    };
+    let mut body = [0; 48];
+    write_u32(&mut body, 0, 1);
+    write_u32(&mut body, 4, 48);
+    body[16..24].copy_from_slice(&capabilities.to_le_bytes());
+    write_u32(&mut body, 24, int(send));
+    write_u32(&mut body, 28, int(recv));
+    write_response(response, channel, op, id, RESULT_OK, &body)
+}

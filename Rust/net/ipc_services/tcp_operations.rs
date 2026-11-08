@@ -131,7 +131,8 @@ pub(super) fn is_tcp_operation(op: u16) -> bool {
 }
 
 pub(super) fn is_tcp_result_operation(op: u16) -> bool {
-    op == OP_TCP_CONNECT_RESULT
+    op == OP_TCP_CONNECT_RETAINED_RESULT
+        || op == OP_TCP_CONNECT_RESULT
         || op == OP_TCP_WRITE_RESULT
         || op == OP_TCP_READ_RESULT
         || op == OP_TCP_CLOSE_RESULT
@@ -151,7 +152,7 @@ pub(super) fn make_tcp_result<'a>(
     data_out: &'a mut [u8],
     client_id: u16,
 ) -> TcpResultPayload<'a> {
-    let request = if op == OP_TCP_CONNECT_RESULT {
+    let request = if op == OP_TCP_CONNECT_RESULT || op == OP_TCP_CONNECT_RETAINED_RESULT {
         split_service_deadline(payload)
     } else {
         DeadlineRequest {
@@ -166,9 +167,13 @@ pub(super) fn make_tcp_result<'a>(
         ..TcpServiceResult::EMPTY
     };
     let data = match op {
-        OP_TCP_CONNECT_RESULT => {
-            tcp_connect_result(&mut out, request.payload, request.deadline_tick, client_id)
-        }
+        OP_TCP_CONNECT_RESULT | OP_TCP_CONNECT_RETAINED_RESULT => tcp_connect_result_mode(
+            &mut out,
+            request.payload,
+            request.deadline_tick,
+            client_id,
+            op == OP_TCP_CONNECT_RETAINED_RESULT,
+        ),
         OP_TCP_WRITE_RESULT => tcp_write_result(&mut out, request.payload, client_id),
         OP_TCP_READ_RESULT => tcp_read_result(&mut out, request.payload, data_out, client_id),
         OP_TCP_CLOSE_RESULT => tcp_close_result(&mut out, request.payload, client_id),
@@ -191,7 +196,7 @@ pub(super) fn make_tcp_result<'a>(
 
 pub(super) fn tcp_result_action(op: u16) -> u16 {
     match op {
-        OP_TCP_CONNECT_RESULT => TCP_ACTION_CONNECT,
+        OP_TCP_CONNECT_RESULT | OP_TCP_CONNECT_RETAINED_RESULT => TCP_ACTION_CONNECT,
         OP_TCP_WRITE_RESULT => TCP_ACTION_WRITE,
         OP_TCP_READ_RESULT => TCP_ACTION_READ,
         OP_TCP_CLOSE_RESULT => TCP_ACTION_CLOSE,
@@ -207,11 +212,12 @@ pub(super) fn tcp_result_action(op: u16) -> u16 {
     }
 }
 
-pub(super) fn tcp_connect_result(
+fn tcp_connect_result_mode(
     out: &mut TcpServiceResult,
     payload: &[u8],
     deadline_tick: Option<u64>,
     client_id: u16,
+    retained: bool,
 ) -> &'static [u8] {
     if payload.len() < 6 {
         return tcp_bad_request_result(out);
@@ -220,7 +226,11 @@ pub(super) fn tcp_connect_result(
     out.port = read_u16(payload, 4);
     out.remote_port = out.port;
     out.flags |= TCP_FLAG_REMOTE_VALID;
-    let conn = net::tcp_connect_until(out.remote_ip, out.port, deadline_tick);
+    let conn = if retained {
+        super::super::tcp_client::connect_retained(out.remote_ip, out.port, deadline_tick)
+    } else {
+        net::tcp_connect_until(out.remote_ip, out.port, deadline_tick)
+    };
     if conn <= 0 {
         out.result = conn;
         set_tcp_lifecycle(
@@ -231,7 +241,12 @@ pub(super) fn tcp_connect_result(
     }
     out.conn_id = int(conn);
     out.flags |= TCP_FLAG_CONN_VALID;
-    let svc_handle = match state::allocate(out.conn_id, client_id) {
+    let allocated = if retained {
+        state::allocate_retained(out.conn_id, client_id)
+    } else {
+        state::allocate(out.conn_id, client_id)
+    };
+    let svc_handle = match allocated {
         Some(value) => value,
         None => {
             let _ = net::tcp_close(out.conn_id);
@@ -268,6 +283,13 @@ pub(super) fn tcp_write_result(
     out.flags |= TCP_FLAG_HANDLE_VALID | TCP_FLAG_CONN_VALID;
     let data = &payload[4..];
     out.requested_bytes = int(data.len());
+    if lookup.lifecycle_cause == SOCKET_LIFECYCLE_RESET_PUBLIC
+        || lookup.lifecycle_cause == SOCKET_LIFECYCLE_PEER_GONE_PUBLIC
+    {
+        out.result = super::super::r4p_contract::TCP_RESULT_BAD_STATE;
+        set_tcp_lifecycle(out, lookup.lifecycle_cause);
+        return b"".as_slice();
+    }
     let written = net::tcp_write(conn_id, data);
     let total: usize = if written > 0 { int(written) } else { 0 };
     let write_error: i32 = if written < 0 { written } else { 0 };
@@ -339,7 +361,10 @@ pub(super) fn tcp_read_result<'a>(
                 operation_status_name(Status::WouldBlock),
             );
             set_tcp_service_status(out, Status::WouldBlock);
-            set_tcp_lifecycle(out, SOCKET_LIFECYCLE_WOULD_BLOCK_PUBLIC);
+            let cause = super::super::tcp::retained_terminal_cause(conn_id)
+                .filter(|c| *c != 0)
+                .unwrap_or(SOCKET_LIFECYCLE_WOULD_BLOCK_PUBLIC);
+            set_tcp_lifecycle(out, cause);
         }
         return &data_out[0..usize::try_from(got).expect("Original bounded positive IPC length")];
     }

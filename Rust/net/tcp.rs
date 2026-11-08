@@ -307,6 +307,9 @@ pub struct Connection {
     pub last_len: usize,
     pub sent: tcp_runtime::SendCatalog,
     pub out_of_order: [OutOfOrderSegment; OUT_OF_ORDER_SLOT_COUNT],
+    // New RPC sockets retain exact terminal metadata in this original slot.
+    pub retained_terminal: bool,
+    pub terminal_cause: u32,
 }
 impl Connection {
     pub const EMPTY: Self = Self {
@@ -350,6 +353,8 @@ impl Connection {
         last_len: 0,
         sent: tcp_runtime::SendCatalog::EMPTY,
         out_of_order: [OutOfOrderSegment::EMPTY; OUT_OF_ORDER_SLOT_COUNT],
+        retained_terminal: false,
+        terminal_cause: 0,
     };
 }
 #[repr(C)]
@@ -516,6 +521,8 @@ unsafe fn discard_catalog(c: &mut Connection) {
 unsafe fn reset_connection_slot(c: &mut Connection) {
     unsafe { discard_catalog(c) };
     c.used = false;
+    c.retained_terminal = false;
+    c.terminal_cause = 0;
     c.id = 0;
     c.generation = 0;
     c.listener_generation = 0;
@@ -573,7 +580,7 @@ unsafe fn reap_closed_connection_slots() -> u32 {
         let mut count = 0;
         for slot in 0..MAX_CONNECTIONS {
             let c = &mut *connection(slot);
-            if c.used && c.state == State::Closed {
+            if c.used && c.state == State::Closed && !c.retained_terminal {
                 reset_connection_slot(c);
                 count += 1;
             }
@@ -868,6 +875,7 @@ pub(super) use contract_checks::{
 };
 use foreign_api::loopback_write_foreign;
 pub(super) use foreign_api::wait_observations;
+pub(crate) use foreign_api::{begin_retained_connect, retained_connected, retained_terminal_cause};
 pub use foreign_api::{
     r4os_rust_net_tcp_abort, r4os_rust_net_tcp_abort_all,
     r4os_rust_net_tcp_abort_connections_on_port, r4os_rust_net_tcp_accept_inbound,

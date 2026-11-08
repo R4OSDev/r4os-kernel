@@ -3,6 +3,9 @@ use super::*;
 
 pub(crate) unsafe fn self_test_connect(remote_ip: [u8; 4], remote_port: u16) -> i32 {
     unsafe {
+        if *NEXT_ID.0.get() > i32::MAX as u32 {
+            return -1;
+        }
         let Some(slot) = alloc_connection() else {
             return -1;
         };
@@ -303,7 +306,62 @@ pub(crate) unsafe fn graceful_close_probe() -> bool {
         if apply_rx_view(ack).is_none() {
             return false;
         }
-        connection_identity(id).is_none()
+        connection_identity(id).is_none() && retained_peer_cause_probe()
+    }
+}
+
+// Regression for the actual last-read/peer-FIN loss: exercise the original
+// resident packet owner and read functions, retaining both FIN and RST causes.
+// This extends the existing graceful-close case, not a new gate or registry.
+unsafe fn retained_peer_cause_probe() -> bool {
+    unsafe {
+        for flag in [FLAG_FIN, FLAG_RST] {
+            let remote = [198, 51, 100, 96];
+            let Some((end, c)) = probe_connection(remote, 65096) else {
+                return false;
+            };
+            (*c).retained_terminal = true;
+            let data = probe_view(
+                remote,
+                c,
+                (*c).ack,
+                (*c).seq,
+                FLAG_ACK | FLAG_PSH,
+                b"abcdefgh",
+            );
+            if apply_rx_view(data).is_none() {
+                return false;
+            }
+            let terminal = probe_view(remote, c, (*c).ack, (*c).seq, FLAG_ACK | flag, b"");
+            if apply_rx_view(terminal).is_none() {
+                return false;
+            }
+            let expected = if flag == FLAG_FIN {
+                crate::contract::net_service_socket_lifecycle_peer_gone
+            } else {
+                crate::contract::net_service_socket_lifecycle_reset
+            };
+            let mut bytes = [0; 4];
+            if read(end.id, &mut bytes) != 4
+                || &bytes != b"abcd"
+                || read(end.id, &mut bytes) != 4
+                || &bytes != b"efgh"
+            {
+                return false;
+            }
+            set_error(text(b"unrelated-activity"));
+            if read(end.id, &mut bytes) != 0
+                || read(end.id, &mut bytes) != 0
+                || !(*c).used
+                || (*c).terminal_cause != expected
+            {
+                return false;
+            }
+            if close(end.id) != 0 || by_id(end.id).is_some() {
+                return false;
+            }
+        }
+        true
     }
 }
 
