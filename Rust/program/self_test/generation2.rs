@@ -18,15 +18,15 @@ pub(super) fn providers() -> bool {
     let names: [&[u8]; 6] = [
         b"R4SYS", b"R4DESK", b"R4DRAW", b"R4NET", b"R4AUDIO", b"R4DEV",
     ];
-    // Immutable 0.90.11 mapping, rather than regenerating expected slots
-    // with the production projector being checked.
+    // Independent original mapping with the explicit 0.90.21 R4DEV append;
+    // never regenerate expected positions with the production projector.
     let sizes = [
         (1416, 1408),
         (632, 632),
         (912, 912),
         (296, 296),
         (232, 232),
-        (736, 712),
+        (744, 720),
     ];
     for (index, name) in names.iter().enumerate() {
         let group = (index + 1) as u32;
@@ -42,7 +42,7 @@ pub(super) fn providers() -> bool {
             || before.magic >> 24 != u32::from(b'1')
             || after.magic >> 24 != u32::from(b'2')
             || (before.magic & 0xffffff) != (after.magic & 0xffffff)
-            || after.version != 1
+            || after.version != if group == 6 { 2 } else { 1 }
             || before.flags != after.flags
         {
             return false;
@@ -141,7 +141,7 @@ pub(super) fn providers() -> bool {
         return false;
     }
     super::log(
-        b"[API2] queries=6 slots=512 shared_callbacks=ok legacy_tombstones=zero call=ok\r\n",
+        b"[API2] queries=6 slots=513 shared_callbacks=ok legacy_tombstones=zero call=ok\r\n",
     );
     true
 }

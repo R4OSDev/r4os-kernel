@@ -203,7 +203,11 @@ use crate::{
     contract,
     platform::{acpi, cpu, irq, pci_inventory},
 };
-use core::{mem::MaybeUninit, ptr};
+use core::{
+    mem::{self, MaybeUninit},
+    ptr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 const MAX_ADAPTERS: usize = 8;
 const WITH_DRIVER: u8 = 0;
 const WITHOUT_DRIVER: u8 = 1;
@@ -459,6 +463,11 @@ struct Snapshot {
     requested_text_index: usize,
     protocol_role: [u8; 64],
     protocol_note: [u8; 96],
+    // Synchronous caller loans; each row is copied while its text is live.
+    capture_rows: *mut contract::DeviceInventoryRecord,
+    capture_capacity: u32,
+    capture_mode: bool,
+    source_mask: u32,
 }
 impl Snapshot {
     // Initialization uses exclusive caller storage and does not produce another
@@ -476,6 +485,10 @@ impl Snapshot {
                 displays: 0,
             });
             ptr::addr_of_mut!((*out).requested_text_index).write(requested_text_index);
+            ptr::addr_of_mut!((*out).capture_rows).write(ptr::null_mut());
+            ptr::addr_of_mut!((*out).capture_capacity).write(0);
+            ptr::addr_of_mut!((*out).capture_mode).write(false);
+            ptr::addr_of_mut!((*out).source_mask).write(0);
             ptr::addr_of_mut!((*out).network_notes)
                 .cast::<u8>()
                 .write_bytes(0, MAX_ADAPTERS * 96);
@@ -485,7 +498,15 @@ impl Snapshot {
         }
     }
 }
-// Stream all counts and retain only the requested record. No inventory-sized
+fn wants_text(snapshot: *const Snapshot) -> bool {
+    unsafe {
+        (*snapshot).count == (*snapshot).requested_text_index
+            || ((*snapshot).capture_mode
+                && (*snapshot).count < (*snapshot).capture_capacity as usize)
+    }
+}
+// Stream all counts and retain only the requested record. Capture copies each
+// offered row before another producer reuses its text. No inventory-sized
 // stack allocation or Snapshot reference spans a device callback.
 fn add(snapshot: *mut Snapshot, record: Record) {
     unsafe {
@@ -496,6 +517,14 @@ fn add(snapshot: *mut Snapshot, record: Record) {
         }
         if count == (*snapshot).requested_text_index {
             ptr::addr_of_mut!((*snapshot).selected).write(record);
+        }
+        if (*snapshot).capture_mode {
+            if count < (*snapshot).capture_capacity as usize {
+                write_record((*snapshot).capture_rows.add(count), record);
+            }
+            if record.bus < 32 {
+                (*snapshot).source_mask |= 1u32 << record.bus;
+            }
         }
         ptr::addr_of_mut!((*snapshot).count).write(count + 1);
         match record.bus {
@@ -533,7 +562,7 @@ fn collect(snapshot: *mut Snapshot) {
             continue;
         }
         assert!(entry.name_len <= 32);
-        let name = if unsafe { (*snapshot).count != (*snapshot).requested_text_index } {
+        let name = if !wants_text(snapshot) {
             Text::EMPTY
         } else {
             unsafe {
@@ -570,7 +599,7 @@ fn collect(snapshot: *mut Snapshot) {
                 && entry.role_len <= 64
                 && entry.note_len <= 96
         );
-        let (role, note) = if unsafe { (*snapshot).count == (*snapshot).requested_text_index } {
+        let (role, note) = if wants_text(snapshot) {
             unsafe {
                 let role = ptr::addr_of_mut!((*snapshot).protocol_role).cast::<u8>();
                 let note = ptr::addr_of_mut!((*snapshot).protocol_note).cast::<u8>();
@@ -822,10 +851,10 @@ fn add_usb(snapshot: *mut Snapshot) {
     }
 }
 
-// Like PCI notes, only the requested record owns text in this existing
-// stationary buffer. This adds no ABI or 16-KB snapshot-stack allocation.
+// Legacy retains only the requested text. Whole capture copies each offered
+// note before reusing this stationary buffer; no inventory-sized stack.
 fn usb_work_note(snapshot: *mut Snapshot, mode: u8) -> Text {
-    if unsafe { (*snapshot).count != (*snapshot).requested_text_index } {
+    if !wants_text(snapshot) {
         return Text::EMPTY;
     }
     let out = unsafe { &mut *ptr::addr_of_mut!((*snapshot).xhci_note) };
@@ -1145,10 +1174,9 @@ fn network_note(snapshot: *mut Snapshot, index: usize, adapter: &NetInput) -> Te
     writer.result()
 }
 fn xhci_note(snapshot: *mut Snapshot, pci_function: crate::platform::pci_scan::Device) -> Text {
-    // record() emits only the requested row's text. Preserve that exact
-    // function's note while collecting subsequent controllers, without a
-    // larger fixed-stack snapshot or borrowed shared note bytes.
-    if unsafe { (*snapshot).count != (*snapshot).requested_text_index } {
+    // Legacy keeps its selected note intact. Whole capture copies the note
+    // immediately in add before subsequent controllers reuse this buffer.
+    if !wants_text(snapshot) {
         return Text::EMPTY;
     }
     let host = xhci(pci_function, true);
@@ -1255,6 +1283,94 @@ unsafe fn copy_fixed(out: *mut u8, size: usize, text: Text) {
         }
     }
 }
+static NEXT_CAPTURE: AtomicU64 = AtomicU64::new(0);
+
+/// # Safety
+/// Outputs are mapped, exclusively borrowed canonical storage throughout this
+/// synchronous call and disjoint from owner metadata/code. Capacity counts
+/// whole records. No caller reference, owner lock or allocation is retained.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn r4os_rust_device_inventory_capture(
+    rows: *mut contract::DeviceInventoryRecord,
+    capacity: u32,
+    out_info: *mut contract::DeviceInventorySnapshotInfo,
+) -> i32 {
+    let invalid = contract::device_snapshot_result_invalid;
+    if out_info.is_null() || !out_info.is_aligned() {
+        return invalid;
+    }
+    let Some(info_end) = out_info
+        .addr()
+        .checked_add(mem::size_of::<contract::DeviceInventorySnapshotInfo>())
+    else {
+        return invalid;
+    };
+    if capacity != 0 {
+        let Some(bytes) =
+            (capacity as usize).checked_mul(mem::size_of::<contract::DeviceInventoryRecord>())
+        else {
+            return invalid;
+        };
+        let Some(rows_end) = rows.addr().checked_add(bytes) else {
+            return invalid;
+        };
+        if rows.is_null()
+            || !rows.is_aligned()
+            || (rows.addr() < info_end && out_info.addr() < rows_end)
+        {
+            return invalid;
+        }
+    }
+    let generation =
+        match NEXT_CAPTURE.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+            Ok(previous) => previous + 1,
+            Err(_) => return contract::device_snapshot_result_exhausted,
+        };
+    let mut storage = MaybeUninit::<Snapshot>::uninit();
+    let snapshot = storage.as_mut_ptr();
+    unsafe {
+        Snapshot::initialize(snapshot, usize::MAX);
+        (*snapshot).capture_rows = rows;
+        (*snapshot).capture_capacity = capacity;
+        (*snapshot).capture_mode = true;
+    }
+    collect(snapshot); // Exactly one existing passive metadata traversal.
+    let (info, result) = unsafe {
+        let total = (*snapshot).count as u32;
+        let result = if (*snapshot).truncated {
+            contract::device_snapshot_result_overflow
+        } else if total > capacity {
+            contract::device_snapshot_result_capacity
+        } else {
+            contract::device_snapshot_result_ok
+        };
+        let complete = result == contract::device_snapshot_result_ok;
+        (
+            contract::DeviceInventorySnapshotInfo {
+                snapshot_generation: if complete { generation } else { 0 },
+                count: total.min(capacity),
+                required_count: total,
+                capacity,
+                flags: contract::device_snapshot_flag_independent_copies
+                    | if complete {
+                        contract::device_snapshot_flag_complete
+                    } else {
+                        0
+                    },
+                with_driver: (*snapshot).with_driver,
+                without_driver: (*snapshot).without_driver,
+                unknown: (*snapshot).unknown,
+                source_mask: (*snapshot).source_mask,
+                ..contract::DeviceInventorySnapshotInfo::default()
+            },
+            result,
+        )
+    };
+    unsafe { out_info.write(info) };
+    result
+}
+
 /// # Safety
 /// Output is exclusive aligned Contract storage for this synchronous call.
 /// Each existing device owner supplies stable metadata, with no held inventory
@@ -1297,6 +1413,10 @@ pub unsafe extern "C" fn r4os_rust_device_inventory_record(
         return 0;
     }
     let record = unsafe { ptr::addr_of!((*snapshot).selected).read() };
+    unsafe { write_record(out, record) };
+    1
+}
+unsafe fn write_record(out: *mut contract::DeviceInventoryRecord, record: Record) {
     unsafe {
         out.write(contract::DeviceInventoryRecord {
             binding: record.binding,
@@ -1317,7 +1437,6 @@ pub unsafe extern "C" fn r4os_rust_device_inventory_record(
         copy_fixed(ptr::addr_of_mut!((*out).status).cast(), 32, record.status);
         copy_fixed(ptr::addr_of_mut!((*out).note).cast(), 96, record.note);
     }
-    1
 }
 /// # Safety
 /// Exclusive aligned private count output; follows the identical full collection

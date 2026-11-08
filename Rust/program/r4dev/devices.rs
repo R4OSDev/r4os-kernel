@@ -28,6 +28,17 @@ fn has_bus(bus: u8) -> bool {
         .any(|i| block_diagnostics::device_snapshot(i).is_some_and(|d| d.bus == bus))
 }
 /// # Safety
+/// Exclusive mapped record/receipt storage, borrowed until actual return.
+/// The passive owner validates capacity, alignment and output disjointness.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_r4dev_device_inventory_capture(
+    rows: *mut c::DeviceInventoryRecord,
+    capacity: u32,
+    out_info: *mut c::DeviceInventorySnapshotInfo,
+) -> i32 {
+    unsafe { inventory::r4os_rust_device_inventory_capture(rows, capacity, out_info) }
+}
+/// # Safety
 /// Caller owns one aligned output. Refusal leaves the entire record untouched.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4dev_firmware_system_uuid(

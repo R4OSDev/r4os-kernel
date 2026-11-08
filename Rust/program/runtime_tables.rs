@@ -1229,6 +1229,9 @@ fn configure_dev() {
             as *const () as usize,
         device_inventory_record: r4dev::devices::r4os_rust_r4dev_device_inventory_record
             as *const () as usize,
+        device_inventory_capture: r4dev::devices::r4os_rust_r4dev_device_inventory_capture
+            as c::R4DevFns::device_inventory_capture as *const ()
+            as usize,
         memory_summary: r4dev::memory::r4os_rust_r4dev_memory_summary as *const () as usize,
         memory_block_count: r4dev::memory::r4os_rust_r4dev_memory_block_count as *const () as usize,
         memory_block: r4dev::memory::r4os_rust_r4dev_memory_block as *const () as usize,
@@ -1340,7 +1343,8 @@ fn configure_dev() {
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 736);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 744);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, device_inventory_capture) == 736);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_microcode_info) == 672);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_pmu_info) == 680);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_pmu_measure) == 688);
