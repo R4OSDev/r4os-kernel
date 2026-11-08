@@ -15,6 +15,7 @@ pub mod exit;
 pub mod exit_state;
 pub mod failure;
 pub mod fault;
+mod font_metrics;
 pub mod gfx_output_api;
 pub mod gfx_queue_api;
 pub mod gui_activity;

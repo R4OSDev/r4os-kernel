@@ -863,12 +863,16 @@ fn configure_draw() {
         gfx_queue_submit_render_color_grid_list: crate::program::domain_api::r4os_rust_program_domain_gfx_queue_submit_render_color_grid_list as *const () as usize,
         gfx_output_brightness: super::platform_callbacks::draw_gfx_output_brightness as *const () as usize,
         gfx_brightness_request: crate::program::domain_api::r4os_rust_program_domain_gfx_brightness_request as *const () as usize,
+        font_prefix_metrics2: super::font_metrics::r4os_rust_draw_font_prefix_metrics2 as *const () as usize,
         ..Default::default()
     };
     DRAW.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Draw>() == 912);
+    assert!(mem::size_of::<c::R4XStartR4Draw>() == 920);
+    assert!(mem::size_of::<c::FontAdvance2>() == 8);
+    assert!(mem::size_of::<c::FontAdvanceInfo2>() == 40);
+    assert!(mem::offset_of!(c::R4XStartR4Draw, font_prefix_metrics2) == 912);
     assert!(mem::offset_of!(c::R4XStartR4Draw, magic) == 0);
     assert!(mem::offset_of!(c::R4XStartR4Draw, abi_version) == 4);
     assert!(mem::offset_of!(c::R4XStartR4Draw, size) == 8);

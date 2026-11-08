@@ -8,7 +8,7 @@ use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ptr,
-    sync::atomic::{AtomicU8, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
 };
 struct Banks(UnsafeCell<[CatalogState; 2]>);
 // SAFETY: current bank is immutable. A sole writer owns the other bank only
@@ -24,6 +24,9 @@ static EMPTY: CatalogState = CatalogState::EMPTY;
 static CURRENT: AtomicU8 = AtomicU8::new(0);
 static READERS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 static WRITER: AtomicU8 = AtomicU8::new(0);
+// The original publication revision keeps its old wrapping behavior. New
+// metric keys stop permanently at that canonical wrap; no second counter.
+static METRICS_EXHAUSTED: AtomicBool = AtomicBool::new(false);
 fn bank(index: u8) -> *mut CatalogState {
     assert!(index < 2);
     unsafe { BANKS.0.get().cast::<CatalogState>().add(index as usize) }
@@ -117,6 +120,7 @@ impl Replacement {
         let old = CURRENT.load(Ordering::Acquire);
         let mut revision = unsafe { ptr::addr_of!((*bank(old)).revision).read() }.wrapping_add(1);
         if revision == 0 {
+            METRICS_EXHAUSTED.store(true, Ordering::Release);
             revision = 1
         }
         unsafe { ptr::addr_of_mut!((*self.state()).revision).write(revision) }
@@ -191,6 +195,13 @@ pub fn with_catalog<T>(f: impl FnOnce(&CatalogState) -> T) -> T {
 }
 pub fn revision() -> u32 {
     with_catalog(|s| s.revision)
+}
+/// Revision belongs to this exact immutable read lease, not a later bank.
+pub fn metrics_revision(view: &View) -> Option<u64> {
+    if view.bank == 255 || METRICS_EXHAUSTED.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(u64::from(unsafe { (*view.state()).revision }))
 }
 pub fn reset() {
     if let Some(mut preparation) = begin(true) {

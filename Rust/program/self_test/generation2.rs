@@ -18,12 +18,12 @@ pub(super) fn providers() -> bool {
     let names: [&[u8]; 6] = [
         b"R4SYS", b"R4DESK", b"R4DRAW", b"R4NET", b"R4AUDIO", b"R4DEV",
     ];
-    // Independent original mapping with 0.90.21 DEV and 0.90.22 SYS appends;
+    // Independent original mapping with DEV21, SYS22 and DRAW23 appends;
     // never regenerate expected positions with the production projector.
     let sizes = [
         (1432, 1424),
         (632, 632),
-        (912, 912),
+        (920, 920),
         (296, 296),
         (232, 232),
         (744, 720),
@@ -42,7 +42,12 @@ pub(super) fn providers() -> bool {
             || before.magic >> 24 != u32::from(b'1')
             || after.magic >> 24 != u32::from(b'2')
             || (before.magic & 0xffffff) != (after.magic & 0xffffff)
-            || after.version != if group == 1 || group == 6 { 2 } else { 1 }
+            || after.version
+                != if group == 1 || group == 3 || group == 6 {
+                    2
+                } else {
+                    1
+                }
             || before.flags != after.flags
         {
             return false;
@@ -141,7 +146,7 @@ pub(super) fn providers() -> bool {
         return false;
     }
     super::log(
-        b"[API2] queries=6 slots=515 shared_callbacks=ok legacy_tombstones=zero call=ok\r\n",
+        b"[API2] queries=6 slots=516 shared_callbacks=ok legacy_tombstones=zero call=ok\r\n",
     );
     true
 }
