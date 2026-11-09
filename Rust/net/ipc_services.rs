@@ -874,6 +874,7 @@ fn network_backend_info(
         (
             crate::contract::network_cap_ipv4
                 | crate::contract::network_cap_tcp
+                | crate::contract::network_cap_listen
                 | crate::contract::network_cap_retained_terminal,
             TCP_WRITE_PAYLOAD_MAX.min(3968),
             TCP_RESULT_DATA_MAX.min(4008),

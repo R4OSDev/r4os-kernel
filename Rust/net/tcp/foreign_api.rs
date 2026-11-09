@@ -1126,7 +1126,10 @@ pub(crate) unsafe fn wait_observation_word(slot: usize) -> u64 {
         if matches!(c.state, State::Closed | State::TimeWait | State::LastAck) {
             flags |= 4;
         }
-        if c.state == State::Established && !c.accepted_claimed {
+        if (c.state == State::Established
+            || (c.retained_terminal && c.negotiation_counted && c.state == State::Closed))
+            && !c.accepted_claimed
+        {
             flags |= 8;
             if c.rx_len != 0 {
                 flags |= 16;
@@ -1183,6 +1186,13 @@ pub(crate) fn begin_retained_connect(ip: [u8; 4], port: u16, seq: u32) -> i32 {
         return -1;
     };
     unsafe { connections::begin_live_connect_mode(ip, port, seq, true) }
+}
+
+pub(crate) fn begin_retained_listener(port: u16) -> bool {
+    let Some(_guard) = super::super::tcp_owner::Guard::acquire() else {
+        return false;
+    };
+    unsafe { connections::listen_mode(port, true) }
 }
 
 pub(crate) fn retained_connected(id: u32) -> bool {

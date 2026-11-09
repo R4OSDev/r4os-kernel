@@ -137,6 +137,7 @@ pub(super) fn is_tcp_result_operation(op: u16) -> bool {
         || op == OP_TCP_READ_RESULT
         || op == OP_TCP_CLOSE_RESULT
         || op == OP_TCP_LISTEN_RESULT
+        || op == OP_TCP_LISTEN_RETAINED_RESULT
         || op == OP_TCP_ACCEPT_READ_RESULT
         || op == OP_TCP_CLOSE_LISTEN_RESULT
         || op == OP_TCP_POLL_RESULT
@@ -178,6 +179,7 @@ pub(super) fn make_tcp_result<'a>(
         OP_TCP_READ_RESULT => tcp_read_result(&mut out, request.payload, data_out, client_id),
         OP_TCP_CLOSE_RESULT => tcp_close_result(&mut out, request.payload, client_id),
         OP_TCP_LISTEN_RESULT => tcp_listen_result(&mut out, request.payload),
+        OP_TCP_LISTEN_RETAINED_RESULT => tcp_listen_result_mode(&mut out, request.payload, true),
         OP_TCP_ACCEPT_READ_RESULT => {
             tcp_accept_read_result(&mut out, request.payload, data_out, client_id)
         }
@@ -200,7 +202,7 @@ pub(super) fn tcp_result_action(op: u16) -> u16 {
         OP_TCP_WRITE_RESULT => TCP_ACTION_WRITE,
         OP_TCP_READ_RESULT => TCP_ACTION_READ,
         OP_TCP_CLOSE_RESULT => TCP_ACTION_CLOSE,
-        OP_TCP_LISTEN_RESULT => TCP_ACTION_LISTEN,
+        OP_TCP_LISTEN_RESULT | OP_TCP_LISTEN_RETAINED_RESULT => TCP_ACTION_LISTEN,
         OP_TCP_ACCEPT_READ_RESULT => TCP_ACTION_ACCEPT_READ,
         OP_TCP_CLOSE_LISTEN_RESULT => TCP_ACTION_CLOSE_LISTEN,
         OP_TCP_POLL_RESULT => TCP_ACTION_POLL,
@@ -513,6 +515,14 @@ pub(super) fn tcp_retransmit_result(
 }
 
 pub(super) fn tcp_listen_result(out: &mut TcpServiceResult, payload: &[u8]) -> &'static [u8] {
+    tcp_listen_result_mode(out, payload, false)
+}
+
+fn tcp_listen_result_mode(
+    out: &mut TcpServiceResult,
+    payload: &[u8],
+    retained: bool,
+) -> &'static [u8] {
     if payload.len() < 2 {
         return tcp_bad_request_result(out);
     }
@@ -522,7 +532,11 @@ pub(super) fn tcp_listen_result(out: &mut TcpServiceResult, payload: &[u8]) -> &
     if out.port == 0 {
         return tcp_bad_request_result(out);
     }
-    if net::tcp_listen(out.port) {
+    if if retained {
+        net::tcp_listen_retained(out.port)
+    } else {
+        net::tcp_listen(out.port)
+    } {
         out.result = 0;
         out.flags |= TCP_FLAG_OK | TCP_FLAG_LISTENER;
         set_tcp_lifecycle(out, SOCKET_LIFECYCLE_LISTENER_PUBLIC);
@@ -659,7 +673,12 @@ pub(super) fn tcp_accept_poll_result(
     let got = net::tcp_accept_poll_on_listener(out.port, &mut conn_id);
     out.conn_id = conn_id;
     if got > 0 {
-        let svc_handle = match state::allocate(conn_id, client_id) {
+        let retained = super::super::tcp::retained_terminal_cause(conn_id).is_some();
+        let svc_handle = match if retained {
+            state::allocate_retained(conn_id, client_id)
+        } else {
+            state::allocate(conn_id, client_id)
+        } {
             Some(value) => value,
             None => {
                 let _ = net::tcp_close(conn_id);

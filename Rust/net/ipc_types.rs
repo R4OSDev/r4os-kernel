@@ -38,6 +38,8 @@ pub const OP_TCP_WRITE_RESULT: u16 = 0x0312;
 pub const OP_TCP_READ_RESULT: u16 = 0x0313;
 pub const OP_TCP_CLOSE_RESULT: u16 = 0x0314;
 pub const OP_TCP_LISTEN_RESULT: u16 = 0x0315;
+pub const OP_TCP_LISTEN_RETAINED_RESULT: u16 =
+    crate::contract::net_service_op_tcp_listen_retained_result;
 pub const OP_TCP_ACCEPT_READ_RESULT: u16 = 0x0316;
 pub const OP_TCP_CLOSE_LISTEN_RESULT: u16 = 0x0317;
 pub const OP_TCP_POLL_RESULT: u16 = 0x0318;

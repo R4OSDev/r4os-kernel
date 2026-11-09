@@ -108,12 +108,17 @@ pub(crate) fn finish_listener(identity: ListenerIdentity, abort: bool) {
 }
 
 pub(crate) unsafe fn listen(port: u16) -> bool {
+    unsafe { listen_mode(port, false) }
+}
+
+pub(crate) unsafe fn listen_mode(port: u16, retained: bool) -> bool {
     unsafe {
         if port == 0 {
             return false;
         }
-        if has_listener(port) {
-            return true;
+        if let Some(identity) = listener_identity(port) {
+            // Never upgrade a pre-existing legacy listener behind its owner.
+            return !retained || (*listener(identity.slot)).retained_terminal;
         }
         for slot in 0..MAX_LISTENERS {
             let l = &mut *listener(slot);
@@ -129,6 +134,7 @@ pub(crate) unsafe fn listen(port: u16) -> bool {
                 used: true,
                 port,
                 generation,
+                retained_terminal: retained,
             };
             *NEXT_LISTENER_GENERATION.0.get() = generation.checked_add(1).unwrap_or(0);
             (*stats()).last_error = text(b"listen");
@@ -144,7 +150,23 @@ pub(crate) unsafe fn close_listener(port: u16) {
         for slot in 0..MAX_LISTENERS {
             let l = &mut *listener(slot);
             if l.used && l.port == port {
+                let generation = l.generation;
+                let retained = l.retained_terminal;
                 *l = Listener::EMPTY;
+                if retained {
+                    // Claimed streams have their own exact lifetime. Only
+                    // unclaimed children belong to this listener's rollback.
+                    for index in 0..MAX_CONNECTIONS {
+                        let c = &mut *connection(index);
+                        if c.used
+                            && !c.accepted_claimed
+                            && c.local_port == port
+                            && c.listener_generation == generation
+                        {
+                            reset_connection_slot(c);
+                        }
+                    }
+                }
                 (*stats()).last_error = text(b"listen-close");
                 return;
             }
@@ -180,6 +202,7 @@ pub(crate) unsafe fn accept_inbound(view: SegmentView, initial_seq: u32) -> Opti
         c.generation = next_slot_generation(slot);
         c.state = State::SynReceived;
         c.listener_generation = listener.generation;
+        c.retained_terminal = (*super::listener(listener.slot)).retained_terminal;
         c.local_port = view.dest_port;
         c.remote_port = view.source_port;
         c.remote_ip = view.source_ip;
@@ -341,7 +364,8 @@ pub(crate) unsafe fn connection_on_port(port: u16) -> Option<u32> {
         for slot in 0..MAX_CONNECTIONS {
             let c = &*connection(slot);
             if c.used
-                && c.state == State::Established
+                && (c.state == State::Established
+                    || (c.retained_terminal && c.negotiation_counted && c.state == State::Closed))
                 && c.local_port == port
                 && c.listener_generation == listener.generation
                 && !c.accepted_claimed

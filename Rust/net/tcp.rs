@@ -379,12 +379,14 @@ pub struct Listener {
     pub used: bool,
     pub port: u16,
     pub generation: u64,
+    pub retained_terminal: bool,
 }
 impl Listener {
     pub const EMPTY: Self = Self {
         used: false,
         port: 0,
         generation: 0,
+        retained_terminal: false,
     };
 }
 struct Storage<T>(UnsafeCell<T>);
@@ -875,7 +877,9 @@ pub(super) use contract_checks::{
 };
 use foreign_api::loopback_write_foreign;
 pub(super) use foreign_api::wait_observations;
-pub(crate) use foreign_api::{begin_retained_connect, retained_connected, retained_terminal_cause};
+pub(crate) use foreign_api::{
+    begin_retained_connect, begin_retained_listener, retained_connected, retained_terminal_cause,
+};
 pub use foreign_api::{
     r4os_rust_net_tcp_abort, r4os_rust_net_tcp_abort_all,
     r4os_rust_net_tcp_abort_connections_on_port, r4os_rust_net_tcp_accept_inbound,

@@ -143,6 +143,10 @@ pub(crate) fn tcp_retransmit_last(id: u32) -> i32 {
 pub(crate) fn tcp_listen(port: u16) -> bool {
     unsafe { tcp::r4os_rust_net_tcp_listen(port) }
 }
+
+pub(crate) fn tcp_listen_retained(port: u16) -> bool {
+    tcp::begin_retained_listener(port)
+}
 pub(crate) fn tcp_has_listener(port: u16) -> bool {
     unsafe { tcp::r4os_rust_net_tcp_has_listener(port) }
 }

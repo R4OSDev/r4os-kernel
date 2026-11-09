@@ -102,6 +102,7 @@ static TABLE: Table = Table(UnsafeCell::new(TEMPLATE));
 static TABLE2: contract::ProtocolApi2 = contract::ProtocolApi2 {
     protocol_dispatch: Some(protocol_dispatch),
     link_io: Some(link_io),
+    process_status: Some(crate::program::info::r4os_rust_program_info_handle),
     ..contract::ProtocolApi2::project_provider(&TEMPLATE)
 };
 pub(crate) fn table2() -> *const contract::ProtocolApi2 {

@@ -306,7 +306,9 @@ pub(crate) unsafe fn graceful_close_probe() -> bool {
         if apply_rx_view(ack).is_none() {
             return false;
         }
-        connection_identity(id).is_none() && retained_peer_cause_probe()
+        connection_identity(id).is_none()
+            && retained_peer_cause_probe()
+            && retained_listener_probe()
     }
 }
 
@@ -362,6 +364,105 @@ unsafe fn retained_peer_cause_probe() -> bool {
             }
         }
         true
+    }
+}
+
+// Exercise the original listener and receive owner before Accept: FIN must
+// not erase an unclaimed new-contract child or its precise data/EOF cause.
+unsafe fn retained_listener_probe() -> bool {
+    struct ListenerEnd(u16);
+    impl Drop for ListenerEnd {
+        fn drop(&mut self) {
+            unsafe { close_listener(self.0) };
+        }
+    }
+    unsafe {
+        let port = 65133;
+        let remote = [198, 51, 100, 97];
+        if has_listener(port) || !connections::listen_mode(port, true) {
+            return false;
+        }
+        let _listener_end = ListenerEnd(port);
+        let Some(listener_before) = listener_identity(port) else {
+            return false;
+        };
+        let syn = SegmentView {
+            source_ip: remote,
+            dest_ip: [192, 0, 2, 2],
+            source_port: 65134,
+            dest_port: port,
+            seq: 1000,
+            flags: FLAG_SYN,
+            window: MAX_ADVERTISED_WINDOW,
+            ..SegmentView::EMPTY
+        };
+        let Some(id) = connections::accept_inbound(syn, 0x7000) else {
+            return false;
+        };
+        let _end = ProbeEnd { id, abort: true };
+        let Some(c) = by_id(id) else {
+            return false;
+        };
+        if !(*c).retained_terminal || (*c).listener_generation != listener_before.generation {
+            return false;
+        }
+        let ack = probe_view(remote, c, 1001, 0x7001, FLAG_ACK, b"");
+        if apply_rx_view(ack).is_none() || (*c).state != State::Established {
+            return false;
+        }
+        let data = probe_view(
+            remote,
+            c,
+            (*c).ack,
+            (*c).seq,
+            FLAG_ACK | FLAG_PSH,
+            b"abcdefgh",
+        );
+        if apply_rx_view(data).is_none() {
+            return false;
+        }
+        let fin = probe_view(remote, c, (*c).ack, (*c).seq, FLAG_ACK | FLAG_FIN, b"");
+        if apply_rx_view(fin).is_none()
+            || connection_on_port(port) != Some(id)
+            || foreign_api::wait_observation_word(
+                connection_identity(id).expect("Retained child").slot,
+            ) >> 48
+                & 8
+                == 0
+            || !claim_accepted(id)
+            || connection_on_port(port).is_some()
+        {
+            return false;
+        }
+        let mut bytes = [0; 4];
+        if read(id, &mut bytes) != 4
+            || &bytes != b"abcd"
+            || read(id, &mut bytes) != 4
+            || &bytes != b"efgh"
+            || read(id, &mut bytes) != 0
+            || (*c).terminal_cause != crate::contract::net_service_socket_lifecycle_peer_gone
+        {
+            return false;
+        }
+        close_listener(port);
+        if by_id(id).is_none() || !connections::listen_mode(port, true) {
+            return false;
+        }
+        let listener_after = listener_identity(port).expect("Reopened retained listener");
+        if listener_after.generation == listener_before.generation {
+            return false;
+        }
+        let mut next_syn = syn;
+        next_syn.source_port = 65135;
+        let Some(unclaimed) = connections::accept_inbound(next_syn, 0x8000) else {
+            return false;
+        };
+        close_listener(port);
+        if by_id(unclaimed).is_some() || by_id(id).is_none() || !listen(port) {
+            return false;
+        }
+        let legacy = listener_identity(port).expect("Legacy listener");
+        !(*listener(legacy.slot)).retained_terminal && !connections::listen_mode(port, true)
     }
 }
 
