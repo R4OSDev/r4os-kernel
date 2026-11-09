@@ -1129,6 +1129,8 @@ const _: () = {
 static AUDIO: Table<c::R4XStartR4Audio> = Table::new();
 fn configure_audio() {
     let value = c::R4XStartR4Audio {
+        audio_capture_io: crate::program::domain_api::r4os_rust_program_domain_audio_capture_io
+            as *const () as usize,
         audio_output_catalog:
             crate::program::domain_api::r4os_rust_program_domain_audio_output_catalog as *const ()
                 as usize,
@@ -1181,7 +1183,8 @@ fn configure_audio() {
     AUDIO.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Audio>() == 232);
+    assert!(mem::size_of::<c::R4XStartR4Audio>() == 240);
+    assert!(mem::offset_of!(c::R4XStartR4Audio, audio_capture_io) == 232);
     assert!(mem::offset_of!(c::R4XStartR4Audio, audio_output_catalog) == 224);
     assert!(mem::offset_of!(c::R4XStartR4Audio, magic) == 0);
     assert!(mem::offset_of!(c::R4XStartR4Audio, abi_version) == 4);

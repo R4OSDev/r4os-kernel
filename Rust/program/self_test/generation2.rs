@@ -18,14 +18,14 @@ pub(super) fn providers() -> bool {
     let names: [&[u8]; 6] = [
         b"R4SYS", b"R4DESK", b"R4DRAW", b"R4NET", b"R4AUDIO", b"R4DEV",
     ];
-    // Independent original mapping with DEV21, SYS22, DRAW23 and SYS28 appends;
+    // Independent original mapping through SYS35/AUDIO37 appends;
     // never regenerate expected positions with the production projector.
     let sizes = [
-        (1488, 1480),
+        (1560, 1552),
         (632, 632),
         (920, 920),
         (296, 296),
-        (232, 232),
+        (240, 240),
         (744, 720),
     ];
     for (index, name) in names.iter().enumerate() {
@@ -44,8 +44,8 @@ pub(super) fn providers() -> bool {
             || (before.magic & 0xffffff) != (after.magic & 0xffffff)
             || after.version
                 != if group == 1 {
-                    4
-                } else if group == 3 || group == 6 {
+                    6
+                } else if group == 3 || group == 5 || group == 6 {
                     2
                 } else {
                     1
@@ -147,6 +147,15 @@ pub(super) fn providers() -> bool {
         || sys.waitset_wait == 0
         || sys.waitset_close == 0
         || sys.waitset_source_prepare == 0
+        || sys.byte_pipe_create == 0
+        || sys.byte_pipe_dup == 0
+        || sys.byte_pipe_read == 0
+        || sys.byte_pipe_write == 0
+        || sys.byte_pipe_cancel == 0
+        || sys.byte_pipe_close == 0
+        || sys.byte_pipe_info == 0
+        || sys.program_launch_io == 0
+        || sys.program_stdio == 0
     {
         return false;
     }
@@ -155,8 +164,13 @@ pub(super) fn providers() -> bool {
     if unsafe { ticks() } < before {
         return false;
     }
+    let audio =
+        unsafe { &*(runtime_tables::interface2(5) as *const c::generation2::R4XStartR4Audio2) };
+    if audio.audio_capture_io == 0 {
+        return false;
+    }
     super::log(
-        b"[API2] queries=6 slots=523 shared_callbacks=ok legacy_tombstones=zero waitset_tail=present source_adapters=present call=ok\r\n",
+        b"[API2] queries=6 slots=533 shared_callbacks=ok legacy_tombstones=zero waitset_tail=present source_adapters=present pipe_launch_capture_tail=present call=ok\r\n",
     );
     true
 }

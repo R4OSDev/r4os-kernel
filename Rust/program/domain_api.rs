@@ -52,6 +52,32 @@ pub unsafe extern "C" fn r4os_rust_program_domain_audio_output_catalog(
 }
 
 /// # Safety
+/// Canonical disjoint immutable request and writable reply/PCM loans last
+/// through actual return; infrastructure owns its exact full service lifetime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_program_domain_audio_capture_io(
+    request: *const c::AudioCaptureRequest,
+    out: *mut c::AudioCaptureReply,
+    bytes: *mut u8,
+    capacity: u32,
+) -> i32 {
+    if request.is_null() || !(request as usize).is_multiple_of(8) {
+        return c::audio_capture_error_invalid;
+    }
+    let Some(owner) = (unsafe { context::handle() }) else {
+        return c::audio_capture_error_invalid;
+    };
+    let value = unsafe { &*request };
+    if value.op != c::audio_capture_op_catalog
+        && (value.handle.service.instance_id != owner.instance_id
+            || value.handle.service.generation != owner.generation)
+    {
+        return c::audio_capture_error_stale;
+    }
+    unsafe { crate::driver::api_audio::capture_io(request, out, bytes, capacity) }
+}
+
+/// # Safety
 /// `out` is a writable canonical record for the admitted program invocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_program_domain_audio_stream_progress(

@@ -12,6 +12,12 @@ use core::{
     mem::{MaybeUninit, offset_of, size_of},
     ptr,
 };
+mod capture;
+pub(crate) use capture::{
+    capture_io, close_for_owner as close_capture_for_owner, register_capture2,
+};
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct Record {
     used: bool,
@@ -19,6 +25,10 @@ struct Record {
     name: [u8; 32],
     name_len: usize,
     descriptor: *const a::AudioBackend,
+    input: *const a::AudioCaptureBackend2,
+    input_epoch: u64,
+    input_closing: bool,
+    capture: [capture::Lease; 4],
 }
 impl Record {
     const EMPTY: Self = Self {
@@ -27,6 +37,10 @@ impl Record {
         name: [0; 32],
         name_len: 0,
         descriptor: ptr::null(),
+        input: ptr::null(),
+        input_epoch: 0,
+        input_closing: false,
+        capture: [capture::Lease::EMPTY; 4],
     };
 }
 struct Storage(UnsafeCell<[Record; 8]>);
@@ -280,6 +294,17 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_register(
 /// admission; failure retains the exact callback record and its owner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_audio_unregister(name: *const u8) -> i32 {
+    let bytes = unsafe { text(name) };
+    for i in 0..8 {
+        let r = unsafe { (*STATE.0.get())[i] };
+        if r.used && bytes.eq_ignore_ascii_case(&r.name[..r.name_len]) {
+            let rc = unsafe { capture::retire(i) };
+            if rc != 0 {
+                return rc;
+            }
+            break;
+        }
+    }
     let result = unsafe { audio::unregister_audio_backend_z(name) };
     if result != 0 {
         return result;
@@ -298,6 +323,9 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_unregister(name: *const u8) -> i
 pub extern "C" fn r4os_rust_driver_audio_closing(owner: u32, closing: bool) -> bool {
     for i in 0..8 {
         let r = unsafe { (*STATE.0.get())[i] };
+        if r.used && r.owner == owner && !unsafe { capture::closing(i, closing) } {
+            return false;
+        }
         if r.used
             && r.owner == owner
             && !unsafe { audio::set_audio_backend_closing(&r.name[..r.name_len], closing) }
@@ -324,6 +352,10 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_cleanup(owner: u32, out: *mut Cl
     for i in 0..8 {
         let r = unsafe { (*STATE.0.get())[i] };
         if !r.used || r.owner != owner {
+            continue;
+        }
+        if unsafe { capture::retire(i) } != 0 {
+            result.failed = true;
             continue;
         }
         let (shutdown, context) = if generation2(r) {
@@ -805,5 +837,8 @@ unsafe extern "C" fn output_epoch2(
     unsafe { callback((*d).context as u64, out) }
 }
 const _: () = {
-    assert!(size_of::<Record>() == 56);
+    assert!(size_of::<Record>() == 400);
+    assert!(offset_of!(Record, descriptor) == 48);
+    assert!(offset_of!(Record, input) == 56);
+    assert!(offset_of!(Record, capture) == 80);
 };

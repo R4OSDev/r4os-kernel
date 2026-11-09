@@ -294,9 +294,9 @@ impl Drop for StreamLock {
         unsafe { unlock() }
     }
 }
-struct OutputGuard(task_context::Unwind);
+pub(crate) struct OutputGuard(task_context::Unwind);
 impl OutputGuard {
-    unsafe fn acquire(wait: bool) -> Option<Self> {
+    pub(crate) unsafe fn acquire(wait: bool) -> Option<Self> {
         unsafe {
             let current = scheduler::current();
             let identity = if current.is_null() {

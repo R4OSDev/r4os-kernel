@@ -450,10 +450,13 @@ pub(crate) fn table() -> *mut a::DriverApi {
     value
 }
 
-static TABLE2: a::DriverApi2 = a::DriverApi2::project_provider(
-    &super::api_callbacks::template(),
-    super::api_audio::register2,
-);
+static TABLE2: a::DriverApi2 = a::DriverApi2 {
+    register_audio_capture_backend: Some(super::api_audio::register_capture2),
+    ..a::DriverApi2::project_provider(
+        &super::api_callbacks::template(),
+        super::api_audio::register2,
+    )
+};
 pub(crate) fn table2() -> *const a::DriverApi2 {
     ptr::addr_of!(TABLE2)
 }

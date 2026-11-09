@@ -432,7 +432,8 @@ unsafe fn program_reap_action(
                     instance_id: handle.instance_id,
                     generation: handle.generation,
                 };
-                crate::audio::core::close_synths_for_owner(owner)
+                crate::driver::api_audio::close_capture_for_owner(owner)
+                    && crate::audio::core::close_synths_for_owner(owner)
                     && crate::audio::core::close_streams_for_owner(owner)
             }
             10 => crate::program::instance_storage::detach(
