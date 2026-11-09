@@ -45,6 +45,9 @@ pub struct Options {
     // Synchronous construction-only binding; never copied into an instance
     // or kept after launch returns. Only managed service launches set it.
     pub service_start: *mut super::service_api::Reservation,
+    // A copied parent stack value, borrowed only during synchronous loader
+    // construction. Published instances contain their own child End values.
+    pub launch_io: *const crate::contract::LaunchIo,
 }
 
 fn report(enabled: bool, text: &[u8]) {
@@ -570,6 +573,21 @@ unsafe fn background(
             error(options, -8);
             return FAILED;
         }
+        if !options.launch_io.is_null() {
+            let bindings = super::launch_io::bind(
+                &*options.launch_io,
+                registry::handle_for_reservation(reservation),
+            );
+            match bindings {
+                Ok(io) => (*payload::runtime(instance)).launch_io = io,
+                Err(status) => {
+                    rollback(reservation);
+                    active.write(false);
+                    error(options, status);
+                    return FAILED;
+                }
+            }
+        }
         if fail(2) {
             rollback(reservation);
             active.write(false);
@@ -781,7 +799,7 @@ const _: () = {
     assert!(mem::offset_of!(Loaded, value) == 0);
     assert!(mem::offset_of!(Loaded, origin) == 1936);
     assert!(mem::offset_of!(Loaded, origin_len) == 2064);
-    assert!(mem::size_of::<Options>() == 48);
+    assert!(mem::size_of::<Options>() == 56);
     assert!(mem::offset_of!(Options, owner_handle) == 0);
     assert!(mem::offset_of!(Options, out_handle) == 16);
     assert!(mem::offset_of!(Options, error_out) == 24);
@@ -794,6 +812,7 @@ const _: () = {
     assert!(mem::offset_of!(Options, forced_cpu_present) == 38);
     assert!(mem::offset_of!(Options, reserved) == 39);
     assert!(mem::offset_of!(Options, service_start) == 40);
+    assert!(mem::offset_of!(Options, launch_io) == 48);
 };
 
 unsafe fn program_entry_boot_detail(value: Bytes) {

@@ -98,4 +98,5 @@ mod platform_callbacks_system;
 
 mod byte_pipes;
 mod deadline_policy;
+mod launch_io;
 pub(crate) mod serial_api;

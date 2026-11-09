@@ -35,6 +35,7 @@ pub struct Runtime {
     pub r4xstart_context2: contract::generation2::R4XStartContext2,
     pub start_generation: u8,
     pub wait_sets: super::waitsets::Owner,
+    pub launch_io: contract::LaunchIo,
 }
 
 #[repr(C)]
@@ -438,6 +439,7 @@ pub unsafe fn initialize(kind: u8, memory: *mut u8) {
                 ptr::addr_of_mut!((*payload).r4xstart_context2)
                     .write(contract::generation2::R4XStartContext2::default());
                 (*payload).start_generation = 1;
+                ptr::addr_of_mut!((*payload).launch_io).write(contract::LaunchIo::default());
                 for index in 0..16 {
                     ptr::addr_of_mut!((*payload).r4xstart_imports)
                         .cast::<contract::R4XStartImport>()
@@ -657,7 +659,8 @@ const _: () = {
     assert!(mem::offset_of!(Header, requested_bytes) == 8);
     assert!(mem::offset_of!(Header, kind) == 12);
     assert!(mem::offset_of!(Header, reserved) == 14);
-    assert!(mem::size_of::<Runtime>() == 2272);
+    assert!(mem::size_of::<Runtime>() == 2384);
+    assert!(mem::offset_of!(Runtime, launch_io) == 2272);
     assert!(mem::offset_of!(Runtime, wait_sets) == 2248);
     assert!(mem::align_of::<Runtime>() == 8);
     assert!(mem::offset_of!(Runtime, header) == 800);

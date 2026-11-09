@@ -244,6 +244,92 @@ pub unsafe extern "C" fn r4os_rust_program_api_launch(
         }
     }
 }
+/// Optional copied Start2/stdio construction. Original old launch entrypoints
+/// keep their validation order and output contract unchanged.
+pub(super) unsafe extern "C" fn launch_io(
+    path: *const u8,
+    args: *const u8,
+    io: *const c::LaunchIo,
+    output: *mut Handle,
+) -> i32 {
+    use super::{launch_io as binding, notifications, waitsets};
+    if !waitsets::valid(path, PATH)
+        || !waitsets::valid(args, ARGS)
+        || !waitsets::valid(io, 1)
+        || !waitsets::valid(output, 1)
+        || waitsets::overlaps(
+            io.addr(),
+            mem::size_of::<c::LaunchIo>(),
+            output.addr(),
+            mem::size_of::<Handle>(),
+        )
+    {
+        return c::launch_io_error_invalid;
+    }
+    if !notifications::can_sleep()
+        || super::threads::compute_worker()
+        || unsafe { context::handle() }.is_none()
+    {
+        return c::launch_io_error_context;
+    }
+    unsafe {
+        let io = io.read();
+        if let Err(e) = binding::validate(&io) {
+            return e;
+        }
+        let mut path_buffer = [MaybeUninit::<u8>::uninit(); PATH];
+        let Some(path_copy) = zcopy(path, path_buffer.as_mut_ptr().cast(), PATH) else {
+            return c::launch_io_error_invalid;
+        };
+        let mut args_buffer = [MaybeUninit::<u8>::uninit(); ARGS];
+        let Some(args_copy) = zcopy(args, args_buffer.as_mut_ptr().cast(), ARGS) else {
+            return c::launch_io_error_invalid;
+        };
+        if waitsets::overlaps(
+            path.addr(),
+            path_copy.len() + 1,
+            output.addr(),
+            mem::size_of::<Handle>(),
+        ) || waitsets::overlaps(
+            args.addr(),
+            args_copy.len() + 1,
+            output.addr(),
+            mem::size_of::<Handle>(),
+        ) {
+            return c::launch_io_error_invalid;
+        }
+        let mut resolved = [MaybeUninit::<u8>::uninit(); PATH];
+        let Some(target) = resolve(util::span(path_copy), resolved.as_mut_ptr().cast()) else {
+            return c::launch_io_error_invalid;
+        };
+        let Some(file) = launch::resolve(target.drive, target.path, false) else {
+            return c::launch_io_error_not_found;
+        };
+        let mut handle = Handle::default();
+        let mut failure = 0;
+        let mut options = launch::options();
+        options.owner = true;
+        options.retain_output = true;
+        options.out_handle = &mut handle;
+        options.error_out = &mut failure;
+        options.launch_io = &io;
+        let result = launch::run(
+            &file,
+            2,
+            io.policy,
+            util::span(args_copy),
+            target.drive,
+            io.console_host as u8,
+            &options,
+        );
+        if result != 0 {
+            return binding::error(if failure != 0 { failure } else { -10 });
+        }
+        output.write(handle);
+    }
+    0
+}
+const _: c::R4SysFns::program_launch_io = launch_io;
 unsafe fn window_id() -> i32 {
     unsafe {
         let instance = context::current();

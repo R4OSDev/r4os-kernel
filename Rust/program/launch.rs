@@ -746,6 +746,11 @@ pub(super) unsafe fn run(
         // No load callback retains the reader after image_load returns.
         // Release its cache and kill pin before publishing/running the child.
         drop(reader);
+        if !options.launch_io.is_null() && loaded.start_generation != 2 {
+            stack::r4os_rust_program_image_release(loaded.image.range_id);
+            lifetime::error(options, crate::contract::launch_io_error_unsupported);
+            return 2;
+        }
         if let Some(trace) = trace {
             log_loader(
                 trace,
@@ -827,6 +832,7 @@ pub(super) fn options() -> Options {
         forced_cpu_present: false,
         reserved: 0,
         service_start: ptr::null_mut(),
+        launch_io: ptr::null(),
     }
 }
 /// # Safety

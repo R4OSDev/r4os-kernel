@@ -252,6 +252,83 @@ pub(super) unsafe extern "C" fn create(capacity: u64, output: *mut c::BytePipePa
     }
     0
 }
+/// All three selected references are preflighted under the one canonical
+/// Runtime owner. The private loader owns a fresh unpublished full child
+/// identity. No allocation, caller copy or fallible step occurs after commit.
+/// This is the sole cross-process retain path; raw End copies confer none.
+pub(super) unsafe fn bind_launch(
+    parent: c::ProgramProcessHandle,
+    child: c::ProgramProcessHandle,
+    ends: &mut [c::BytePipeEnd; 3],
+    selected: [bool; 3],
+) -> Result<(), i32> {
+    if parent.instance_id == 0
+        || parent.generation == 0
+        || parent.reserved != 0
+        || child.instance_id == 0
+        || child.generation == 0
+        || child.reserved != 0
+        || same(parent, child)
+    {
+        return Err(c::byte_pipe_error_invalid);
+    }
+    let _guard = runtime::RuntimeGuard::acquire();
+    unsafe {
+        let mut pipes = [ptr::null_mut::<Pipe>(); 3];
+        let mut slots = [0usize; 3];
+        let mut count = 0u64;
+        for i in 0..3 {
+            if !selected[i] {
+                continue;
+            }
+            let r = find(ends[i], parent)?;
+            if !(*r).active {
+                return Err(c::byte_pipe_error_stale);
+            }
+            let direction = if i == 0 {
+                c::byte_pipe_reader
+            } else {
+                c::byte_pipe_writer
+            };
+            if ends[i].direction != direction {
+                return Err(c::byte_pipe_error_direction);
+            }
+            let p = (*r).pipe;
+            let Some(slot) = (0..ENDS).find(|&s| {
+                (*p).ends[s].handle == 0
+                    && !(0..i).any(|j| selected[j] && pipes[j] == p && slots[j] == s)
+            }) else {
+                return Err(c::byte_pipe_error_capacity);
+            };
+            pipes[i] = p;
+            slots[i] = slot;
+            count += 1;
+        }
+        if count > u64::MAX - (*STATE.0.get()).serial {
+            return Err(c::byte_pipe_error_exhausted);
+        }
+        for i in 0..3 {
+            if !selected[i] {
+                continue;
+            }
+            let p = pipes[i];
+            (*STATE.0.get()).serial += 1;
+            if ends[i].direction == c::byte_pipe_reader {
+                (*p).ring.readers += 1;
+            } else {
+                (*p).ring.writers += 1;
+            }
+            ends[i] = add_end(
+                p,
+                slots[i],
+                (*STATE.0.get()).serial,
+                ends[i].direction,
+                child,
+            );
+        }
+    }
+    Ok(())
+}
 pub(super) unsafe extern "C" fn duplicate(end: c::BytePipeEnd, output: *mut c::BytePipeEnd) -> i32 {
     if !waitsets::valid(output, 1) {
         return c::byte_pipe_error_invalid;

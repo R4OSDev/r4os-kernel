@@ -351,12 +351,16 @@ fn configure_sys() {
         byte_pipe_cancel: super::byte_pipes::cancel as *const () as usize,
         byte_pipe_close: super::byte_pipes::close as *const () as usize,
         byte_pipe_info: super::byte_pipes::info as *const () as usize,
+        program_launch_io: super::program_api::launch_io as *const () as usize,
+        program_stdio: super::launch_io::query as *const () as usize,
         ..Default::default()
     };
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1544);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1560);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, program_launch_io) == 1544);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, program_stdio) == 1552);
     assert!(mem::offset_of!(c::R4XStartR4Sys, byte_pipe_create) == 1488);
     assert!(mem::offset_of!(c::R4XStartR4Sys, byte_pipe_info) == 1536);
     assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_source_prepare) == 1480);

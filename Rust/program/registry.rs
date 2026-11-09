@@ -820,7 +820,11 @@ pub(super) unsafe fn finish_cancel_notify(
 ) -> u8 {
     unsafe {
         let slot = (*r).slot;
-        let complete = super::peer_lifetime::cleanup(ptr::addr_of_mut!((*slot).instance));
+        // No registry owner is held here. An unpublished child may already
+        // own atomic LaunchIo references; preserve the reservation and original
+        // retry queue until their actual backing acknowledgement completes.
+        let complete = super::byte_pipes::cleanup(handle_for_reservation(r))
+            && super::peer_lifetime::cleanup(ptr::addr_of_mut!((*slot).instance));
         if !lock() {
             return DEFERRED;
         }
