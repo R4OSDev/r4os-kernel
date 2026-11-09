@@ -344,12 +344,21 @@ fn configure_sys() {
         waitset_close: super::platform_callbacks::sys_waitset_close as *const () as usize,
         waitset_source_prepare: super::platform_callbacks::sys_waitset_source_prepare as *const ()
             as usize,
+        byte_pipe_create: super::byte_pipes::create as *const () as usize,
+        byte_pipe_dup: super::byte_pipes::duplicate as *const () as usize,
+        byte_pipe_read: super::byte_pipes::read as *const () as usize,
+        byte_pipe_write: super::byte_pipes::write as *const () as usize,
+        byte_pipe_cancel: super::byte_pipes::cancel as *const () as usize,
+        byte_pipe_close: super::byte_pipes::close as *const () as usize,
+        byte_pipe_info: super::byte_pipes::info as *const () as usize,
         ..Default::default()
     };
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1488);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1544);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, byte_pipe_create) == 1488);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, byte_pipe_info) == 1536);
     assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_source_prepare) == 1480);
     assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_create) == 1432);
     assert!(mem::offset_of!(c::R4XStartR4Sys, waitset_enroll) == 1440);

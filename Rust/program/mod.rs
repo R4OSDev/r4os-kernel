@@ -96,4 +96,6 @@ mod platform_callbacks_process;
 mod platform_callbacks_services;
 mod platform_callbacks_system;
 
+mod byte_pipes;
+mod deadline_policy;
 pub(crate) mod serial_api;

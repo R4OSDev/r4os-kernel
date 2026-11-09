@@ -44,7 +44,10 @@ unsafe fn action(
                         (*s).instance
                     ))
             }
-            4 => super::peer_lifetime::notifications_cleanup(ptr::addr_of_mut!((*s).instance)),
+            4 => {
+                super::byte_pipes::cleanup(h)
+                    && super::peer_lifetime::notifications_cleanup(ptr::addr_of_mut!((*s).instance))
+            }
             12 => super::peer_lifetime::resource_step(ptr::addr_of_mut!((*s).instance)),
             13 => super::peer_lifetime::vm_release(h.instance_id),
             14 => {
