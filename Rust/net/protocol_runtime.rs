@@ -3,6 +3,9 @@
 use super::{r4p_contract as wire, tcp, tcp_owner};
 use crate::{fs::vfs_types::Bytes, loader::r4p, memory::owner::Guard, sched::sync_types::Text};
 use core::cell::UnsafeCell;
+// The legacy IPv4 accounting set excludes the retired SerialLink slot8.
+// IPv6 owners have separate typed records; this is not the loader catalog.
+pub(super) const PROTOCOL_COUNT: u8 = 8;
 #[repr(u8)]
 #[derive(Clone, Copy)]
 enum Kind {
@@ -74,13 +77,13 @@ impl Counters {
     };
 }
 struct State {
-    protocols: [Counters; 8],
+    protocols: [Counters; PROTOCOL_COUNT as usize],
     tcp_flags: u16,
     tcp_error: Text,
 }
 impl State {
     const EMPTY: Self = Self {
-        protocols: [Counters::EMPTY; 8],
+        protocols: [Counters::EMPTY; PROTOCOL_COUNT as usize],
         tcp_flags: 0,
         tcp_error: Text::literal(b"none"),
     };
@@ -197,7 +200,7 @@ pub unsafe extern "C" fn r4os_rust_net_protocol_runtime(kind: u8, out: *mut Prot
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_net_r4p_runtime(out: *mut R4pRuntimeStatus) {
     let mut s = R4pRuntimeStatus {
-        protocol_count: 8,
+        protocol_count: u32::from(PROTOCOL_COUNT),
         active: 0,
         missing: 0,
         r4p_rx: 0,
@@ -207,7 +210,7 @@ pub unsafe extern "C" fn r4os_rust_net_r4p_runtime(out: *mut R4pRuntimeStatus) {
         r4p_classify: 0,
         dispatch_failures: 0,
     };
-    for code in 0..8 {
+    for code in 0..PROTOCOL_COUNT {
         let row = snapshot(Kind::from_code(code));
         if row.active_r4p {
             s.active += 1;

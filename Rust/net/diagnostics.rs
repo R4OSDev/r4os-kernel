@@ -665,10 +665,12 @@ fn environment_bad_config() -> bool {
 }
 fn r4p_required() -> bool {
     let status = capture(protocol_runtime::r4os_rust_net_r4p_runtime);
-    if status.protocol_count != 9 || status.active + status.missing != status.protocol_count {
+    if status.protocol_count != u32::from(protocol_runtime::PROTOCOL_COUNT)
+        || status.active + status.missing != status.protocol_count
+    {
         return false;
     }
-    for kind in 0..9 {
+    for kind in 0..protocol_runtime::PROTOCOL_COUNT {
         let mut role = MaybeUninit::uninit();
         let mut stats = MaybeUninit::uninit();
         unsafe {
@@ -1371,14 +1373,14 @@ fn corpus_probe() -> bool {
 }
 fn r4p_probe() -> bool {
     let status = capture(protocol_runtime::r4os_rust_net_r4p_runtime);
-    if status.protocol_count != 9
+    if status.protocol_count != u32::from(protocol_runtime::PROTOCOL_COUNT)
         || status.active + status.missing != status.protocol_count
         || status.active != status.protocol_count
     {
         return false;
     }
     let mut failures = 0u64;
-    for kind in 0..9 {
+    for kind in 0..protocol_runtime::PROTOCOL_COUNT {
         let mut stats = MaybeUninit::uninit();
         let stats = unsafe {
             protocol_runtime::r4os_rust_net_protocol_runtime(kind, stats.as_mut_ptr());
