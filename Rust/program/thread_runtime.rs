@@ -34,7 +34,8 @@ pub(super) unsafe fn imported(instance: *const ProgramInstance, address: u64) ->
         if runtime.is_null() {
             return false;
         }
-        let count = usize::from((*runtime).r4l_code_binding_count).min(16);
+        let count =
+            usize::from((*runtime).r4l_code_binding_count).min((*runtime).r4l_code_bindings.len());
         let bindings =
             ptr::addr_of!((*runtime).r4l_code_bindings).cast::<super::payload_types::CodeBinding>();
         for index in 0..count {

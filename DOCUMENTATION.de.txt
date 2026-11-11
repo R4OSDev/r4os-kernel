@@ -132,3 +132,8 @@ auf R4OS Server validiert. Unisolierter Indexvergleich, keine kausale
 Beschleunigungsbehauptung. Physische Sicht/Hoeren/Latenz SKIP.
 Vollstaendige Grenzen, Artefakte und aktuelle Belege:
 Docs/Core/Parallelitaet.txt Abschnitt0.87.65 und dessen Originalarchiv.
+
+
+Importaufnahme fuer Generation2 in Kernel0.1.476
+-----------------------------------------------
+Datei- und Preloadloader, Programmbild und Startuebergabe verwenden dieselbe begrenzte Kapazitaet von32 Imports. R4M0 behaelt seine16Byte-Importrecords. Der private Runtimepayload waechst von2384 auf4176Bytes, die privaten Image-Ladedaten von1936 auf3728Bytes. Shape und Accounting werden aus den tatsaechlichen Typen abgeleitet. Beide oeffentlichen Startkontexte behalten ihre Layouts. Alle aufgenommenen Importnamen und Library-Codebindungen bleiben beim genauen Prozess bis zu dessen physischem Retirement. Fuenf vorhandene Loader-Hostfaelle bestehen einschliesslich vollstaendiger32er-Tabelle und Ablehnung von33 beziehungsweise abgeschnittenem Tabellenende.

@@ -2,6 +2,10 @@
 //! ordered failures stay unchanged; actual file I/O uses the caller cache.
 use crate::fs::vfs_types::Bytes;
 use core::{ffi::c_void, mem::MaybeUninit, ptr};
+
+/// Bounded native import storage shared by file/preload and program admission.
+/// Import records remain 16 bytes in the R4M0 container.
+pub const MAX_IMPORTS: usize = 32;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Header {

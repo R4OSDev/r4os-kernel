@@ -19,7 +19,7 @@ type Resolved = fmt::ResolvedImport;
 const N: usize = 16;
 const LIMITS: r4m::Limits = r4m::Limits {
     max_sections: 16,
-    max_imports: 16,
+    max_imports: r4m::MAX_IMPORTS as u32,
     max_exports: 16,
     max_relocations: u32::MAX,
     require_sections: true,
@@ -279,7 +279,7 @@ struct Tables {
     labels: r4m::VersionLabels,
     header: Header,
     sections: [MaybeUninit<Section>; N],
-    imports: [FileImport; N],
+    imports: [FileImport; r4m::MAX_IMPORTS],
     exports: [query::Export; N],
     name: [u8; 32],
     name_len: usize,
@@ -287,7 +287,7 @@ struct Tables {
 struct Scratch {
     reader: Reader,
     tables: Tables,
-    resolved: [MaybeUninit<Resolved>; N],
+    resolved: [MaybeUninit<Resolved>; r4m::MAX_IMPORTS],
     offsets: [MaybeUninit<usize>; N],
 }
 unsafe fn scratch(load: &state::Prepared) -> *mut Scratch {
@@ -321,7 +321,7 @@ unsafe fn tables(reader: *mut Reader, out: *mut Tables, kind: u16, default: &[u8
         ptr::write_bytes(
             ptr::addr_of_mut!((*out).imports).cast::<u8>(),
             0,
-            mem::size_of::<[FileImport; N]>(),
+            mem::size_of::<[FileImport; r4m::MAX_IMPORTS]>(),
         );
         ptr::write_bytes(
             ptr::addr_of_mut!((*out).exports).cast::<u8>(),
@@ -1060,7 +1060,7 @@ pub unsafe extern "C" fn r4os_rust_mod_prepare(
         }
         (h, unsafe { table_name(table, default) })
     };
-    if h.import_count as usize > N {
+    if h.import_count as usize > r4m::MAX_IMPORTS {
         ctl::add(ctl::UNRESOLVED);
         return report(b"[MOD] too many imports importer=", importer);
     }
@@ -1335,7 +1335,7 @@ unsafe fn resolve_pending(
         return false;
     }
     let h = unsafe { (*table).header };
-    if h.import_count as usize > N {
+    if h.import_count as usize > r4m::MAX_IMPORTS {
         unsafe {
             (*p).state = 4;
         };

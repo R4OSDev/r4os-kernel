@@ -450,7 +450,7 @@ unsafe fn header(reader: *mut Reader, name: &[u8], verbose: bool) -> Option<r4m:
         let io = reader_io(&mut context);
         let limits = r4m::Limits {
             max_sections: 16,
-            max_imports: 16,
+            max_imports: r4m::MAX_IMPORTS as u32,
             max_exports: 16,
             max_relocations: u32::MAX,
             require_sections: true,

@@ -223,7 +223,7 @@ fn tables(h: &Header, b: &[u8]) -> bool {
         || h.header_size != 64
         || h.section_count == 0
         || h.section_count > 16
-        || h.import_count > 16
+        || h.import_count as usize > r4m::MAX_IMPORTS
         || h.export_count > 16
     {
         return false;

@@ -1,9 +1,10 @@
-//! Private payload C views retain every measured original field offset.
+//! Private payload C views have compiler-checked native field offsets.
 //! Large allocations initialize in place; no complete payload temporary is
 //! constructed on a kernel worker's64KB stack.
 use super::local_context;
 use crate::{
     contract,
+    loader::r4m::MAX_IMPORTS,
     sched::sync_types::{Mutex, Text, UnwindGuard, WaitQueue},
 };
 use core::{mem, ptr};
@@ -22,13 +23,13 @@ pub struct Header {
 pub struct Runtime {
     pub local_context: local_context::Owner,
     pub r4xstart_context: contract::R4XStartContext,
-    pub r4xstart_imports: [contract::R4XStartImport; 16],
+    pub r4xstart_imports: [contract::R4XStartImport; MAX_IMPORTS],
     pub header: Header,
     pub r4xstart_import_count: u32,
-    pub r4l_code_bindings: [CodeBinding; 16],
+    pub r4l_code_bindings: [CodeBinding; MAX_IMPORTS],
     pub module_path_len: u32,
-    pub r4xstart_import_module_names: [[u8; 32]; 16],
-    pub r4xstart_import_symbol_names: [[u8; 32]; 16],
+    pub r4xstart_import_module_names: [[u8; 32]; MAX_IMPORTS],
+    pub r4xstart_import_symbol_names: [[u8; 32]; MAX_IMPORTS],
     pub r4l_code_binding_count: u8,
     pub module_path: [u8; 128],
     pub appearance: super::policy::Appearance,
@@ -440,7 +441,7 @@ pub unsafe fn initialize(kind: u8, memory: *mut u8) {
                     .write(contract::generation2::R4XStartContext2::default());
                 (*payload).start_generation = 1;
                 ptr::addr_of_mut!((*payload).launch_io).write(contract::LaunchIo::default());
-                for index in 0..16 {
+                for index in 0..MAX_IMPORTS {
                     ptr::addr_of_mut!((*payload).r4xstart_imports)
                         .cast::<contract::R4XStartImport>()
                         .add(index)
@@ -659,21 +660,21 @@ const _: () = {
     assert!(mem::offset_of!(Header, requested_bytes) == 8);
     assert!(mem::offset_of!(Header, kind) == 12);
     assert!(mem::offset_of!(Header, reserved) == 14);
-    assert!(mem::size_of::<Runtime>() == 2384);
-    assert!(mem::offset_of!(Runtime, launch_io) == 2272);
-    assert!(mem::offset_of!(Runtime, wait_sets) == 2248);
+    assert!(mem::size_of::<Runtime>() == 4176);
+    assert!(mem::offset_of!(Runtime, launch_io) == 4064);
+    assert!(mem::offset_of!(Runtime, wait_sets) == 4040);
     assert!(mem::align_of::<Runtime>() == 8);
-    assert!(mem::offset_of!(Runtime, header) == 800);
+    assert!(mem::offset_of!(Runtime, header) == 1440);
     assert!(mem::offset_of!(Runtime, local_context) == 0);
     assert!(mem::offset_of!(Runtime, r4xstart_context) == 32);
     assert!(mem::offset_of!(Runtime, r4xstart_imports) == 160);
-    assert!(mem::offset_of!(Runtime, r4xstart_import_count) == 816);
-    assert!(mem::offset_of!(Runtime, r4xstart_import_module_names) == 952);
-    assert!(mem::offset_of!(Runtime, r4xstart_import_symbol_names) == 1464);
-    assert!(mem::offset_of!(Runtime, r4l_code_bindings) == 820);
-    assert!(mem::offset_of!(Runtime, r4l_code_binding_count) == 1976);
-    assert!(mem::offset_of!(Runtime, module_path) == 1977);
-    assert!(mem::offset_of!(Runtime, module_path_len) == 948);
+    assert!(mem::offset_of!(Runtime, r4xstart_import_count) == 1456);
+    assert!(mem::offset_of!(Runtime, r4xstart_import_module_names) == 1720);
+    assert!(mem::offset_of!(Runtime, r4xstart_import_symbol_names) == 2744);
+    assert!(mem::offset_of!(Runtime, r4l_code_bindings) == 1460);
+    assert!(mem::offset_of!(Runtime, r4l_code_binding_count) == 3768);
+    assert!(mem::offset_of!(Runtime, module_path) == 3769);
+    assert!(mem::offset_of!(Runtime, module_path_len) == 1716);
     assert!(mem::size_of::<Environment>() == 2064);
     assert!(mem::align_of::<Environment>() == 4);
     assert!(mem::offset_of!(Environment, header) == 0);

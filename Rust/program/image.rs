@@ -56,7 +56,7 @@ pub struct Loaded {
     pub parallel_execution: bool,
     pub parallel_workers: bool,
     pub desktop_host: bool,
-    pub imports: [ImportSeed; 16],
+    pub imports: [ImportSeed; r4m::MAX_IMPORTS],
     pub import_count: u32,
     pub section_count: u32,
     pub relocation_count: u32,
@@ -582,8 +582,8 @@ fn finish(
     if !payload(r, sections, offsets, image) {
         return None;
     }
-    let mut resolved = [Resolved { address: 0 }; 16];
-    let mut seeds = [ImportSeed::EMPTY; 16];
+    let mut resolved = [Resolved { address: 0 }; r4m::MAX_IMPORTS];
+    let mut seeds = [ImportSeed::EMPTY; r4m::MAX_IMPORTS];
     if !imports(r, generation, &mut resolved, &mut seeds) {
         return None;
     }
@@ -705,7 +705,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ImportSeed, module_name_len) == 64);
     assert!(core::mem::offset_of!(ImportSeed, symbol_name) == 72);
     assert!(core::mem::offset_of!(ImportSeed, symbol_name_len) == 104);
-    assert!(core::mem::size_of::<Loaded>() == 1936);
+    assert!(core::mem::size_of::<Loaded>() == 3728);
     assert!(core::mem::offset_of!(Loaded, imports) == 112);
     assert!(core::mem::size_of::<Request>() == 96);
     assert!(core::mem::offset_of!(Request, file_size) == 80);

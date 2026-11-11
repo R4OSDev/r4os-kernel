@@ -1,4 +1,41 @@
 use super::*;
+
+#[test]
+fn import_capacity_admits_complete_tables_and_rejects_oversize_or_truncation() {
+    let limits = Limits {
+        max_sections: 16,
+        max_imports: MAX_IMPORTS as u32,
+        max_exports: 16,
+        max_relocations: u32::MAX,
+        require_sections: true,
+        require_entries: true,
+    };
+    let mut header: Header = unsafe { core::mem::zeroed() };
+    header.version = 1;
+    header.arch = 1;
+    header.kind_raw = 1;
+    header.header_size = 64;
+    header.section_off = 64;
+    header.section_count = 1;
+    header.entry_off = 96;
+    header.entry_count = 1;
+    header.import_off = 112;
+    let (mut source, _) = fixture(0);
+    source.bytes.resize(112 + 33 * 16, 0);
+    let mut io = io(&mut source);
+    for count in [0, 16, 17, 22, 32] {
+        header.import_count = count;
+        assert!(validate(&io, header, 1, limits));
+    }
+    header.import_count = 33;
+    assert!(!validate(&io, header, 1, limits));
+    header.import_count = u32::MAX;
+    assert!(!validate(&io, header, 1, limits));
+    header.import_count = 32;
+    io.file_size = 112 + 32 * 16 - 1;
+    assert!(!validate(&io, header, 1, limits));
+}
+
 struct Source {
     bytes: Vec<u8>,
     calls: usize,

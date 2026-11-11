@@ -106,7 +106,8 @@ pub(super) unsafe fn cancel_published(handle: Handle) {
 unsafe fn imports(instance: *mut ProgramInstance, seeds: &[image::ImportSeed]) {
     unsafe {
         let runtime = payload::runtime(instance);
-        let count = seeds.len().min(16);
+        let count = seeds.len();
+        assert!(count <= (*runtime).r4xstart_imports.len());
         (*runtime).r4xstart_import_count = count as u32;
         (*runtime).r4l_code_binding_count = 0;
         for (i, seed) in seeds.iter().take(count).enumerate() {
@@ -139,7 +140,7 @@ unsafe fn imports(instance: *mut ProgramInstance, seeds: &[image::ImportSeed]) {
                         break;
                     }
                 }
-                if !duplicate && count < 16 {
+                if !duplicate && count < (*runtime).r4l_code_bindings.len() {
                     (*runtime).r4l_code_bindings[count] = t::CodeBinding {
                         module_slot: seed.r4l_module_slot,
                         generation: seed.r4l_generation,
@@ -795,10 +796,10 @@ pub extern "C" fn r4os_rust_program_launch_last(display: bool) -> i32 {
     }
 }
 const _: () = {
-    assert!(mem::size_of::<Loaded>() == 2072);
+    assert!(mem::size_of::<Loaded>() == 3864);
     assert!(mem::offset_of!(Loaded, value) == 0);
-    assert!(mem::offset_of!(Loaded, origin) == 1936);
-    assert!(mem::offset_of!(Loaded, origin_len) == 2064);
+    assert!(mem::offset_of!(Loaded, origin) == 3728);
+    assert!(mem::offset_of!(Loaded, origin_len) == 3856);
     assert!(mem::size_of::<Options>() == 56);
     assert!(mem::offset_of!(Options, owner_handle) == 0);
     assert!(mem::offset_of!(Options, out_handle) == 16);
