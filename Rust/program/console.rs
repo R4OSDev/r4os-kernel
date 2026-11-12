@@ -10,6 +10,7 @@ use crate::{
     sched::{
         sync_locks,
         sync_types::{Mutex, Text},
+        task_context,
     },
 };
 use core::{
@@ -81,20 +82,36 @@ impl Drop for OutputGuard {
         unsafe { sync_locks::r4os_rust_sync_mutex(ptr::addr_of_mut!((*state()).lock), 2, 0) };
     }
 }
-pub(super) struct Lease(pub(super) ProgramInstanceLease);
+pub(super) struct Lease(
+    pub(super) ProgramInstanceLease,
+    // Ownership-only guard: drop after the target is explicitly unpinned.
+    #[allow(dead_code)] task_context::Admission,
+);
 impl Lease {
     pub(super) unsafe fn id(id: u32) -> Option<Self> {
+        // A registry pin protects its target, while this admission protects
+        // the caller's stack through blocking console work and the final Drop.
+        let caller = task_context::Admission::acquire(false)?;
         let mut out = MaybeUninit::uninit();
         if unsafe { registry::r4os_rust_program_registry_pin_id(id, out.as_mut_ptr()) } {
-            Some(Self(unsafe { out.assume_init() }))
+            Some(Self(unsafe { out.assume_init() }, caller))
         } else {
             None
         }
     }
     pub(super) unsafe fn handle(handle: contract::ProgramProcessHandle) -> Option<Self> {
+        unsafe { Self::handle_with_done(handle, false) }
+    }
+    pub(super) unsafe fn handle_with_done(
+        handle: contract::ProgramProcessHandle,
+        include_done: bool,
+    ) -> Option<Self> {
+        let caller = task_context::Admission::acquire(false)?;
         let mut out = MaybeUninit::uninit();
-        if unsafe { registry::r4os_rust_program_registry_pin(handle, false, out.as_mut_ptr()) } {
-            Some(Self(unsafe { out.assume_init() }))
+        if unsafe {
+            registry::r4os_rust_program_registry_pin(handle, include_done, out.as_mut_ptr())
+        } {
+            Some(Self(unsafe { out.assume_init() }, caller))
         } else {
             None
         }

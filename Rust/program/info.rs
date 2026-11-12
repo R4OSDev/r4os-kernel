@@ -6,6 +6,7 @@ use crate::{
         self, ProgramInstanceInfo as Info, ProgramProcessHandle as Handle, ProgramStatus as Status,
     },
     memory::vm_query,
+    sched::task_context,
 };
 use core::{
     mem::MaybeUninit,
@@ -280,6 +281,11 @@ pub unsafe extern "C" fn r4os_rust_program_info_handle(
     if input.is_null() || out.is_null() {
         return -1;
     }
+    // VM statistics and the final caller copy can wait or fault. Keep this
+    // stack-owned target pin releasable before the caller may be hard-killed.
+    let Some(_caller) = task_context::Admission::acquire(false) else {
+        return -5;
+    };
     unsafe {
         out.write(Info::default());
         let h = *input;
@@ -328,6 +334,9 @@ pub unsafe extern "C" fn r4os_rust_program_info_status(out: *mut Status) {
 /// selects under registry and pins only its exact live result before unlocking.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_program_info_index(index: u32, out: *mut Info) -> i32 {
+    let Some(_caller) = task_context::Admission::acquire(false) else {
+        return 0;
+    };
     unsafe {
         out.write(Info::default());
         let mut lease: Option<ProgramInstanceLease> = None;

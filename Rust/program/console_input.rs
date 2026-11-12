@@ -747,11 +747,9 @@ pub extern "C" fn r4os_rust_program_console_input_signal_handle(
     handle: contract::ProgramProcessHandle,
 ) {
     unsafe {
-        let mut lease = MaybeUninit::uninit();
-        if !registry::r4os_rust_program_registry_pin(handle, true, lease.as_mut_ptr()) {
+        let Some(lease) = Lease::handle_with_done(handle, true) else {
             return;
-        }
-        let lease = Lease(lease.assume_init());
+        };
         signal(lease.0.instance);
     }
 }
