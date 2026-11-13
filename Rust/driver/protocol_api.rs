@@ -100,11 +100,28 @@ const TEMPLATE: contract::ProtocolApi = contract::ProtocolApi {
 };
 static TABLE: Table = Table(UnsafeCell::new(TEMPLATE));
 static TABLE2: contract::ProtocolApi2 = contract::ProtocolApi2 {
+    magic: contract::protocol_api2_magic,
+    version: contract::protocol_api2_version,
+    size: mem::size_of::<contract::ProtocolApi2>() as u32,
+    reserved: 0,
+    log_info,
+    log_warn,
+    log_error,
+    register_role,
+    set_status,
+    dependency_status,
+    alloc,
+    free,
+    file_read,
+    cpu_acceleration_info: Some(crate::program::r4dev::cpu_capabilities::acceleration_info),
+    cpu_acceleration_work: Some(crate::program::r4dev::cpu_capabilities::acceleration_work),
+    entropy_source_info: Some(crate::driver::entropy::info),
+    entropy_fill: Some(crate::driver::entropy::fill),
     protocol_dispatch: Some(protocol_dispatch),
     link_io: Some(link_io),
     process_status: Some(crate::program::info::r4os_rust_program_info_handle),
-    ..contract::ProtocolApi2::project_provider(&TEMPLATE)
 };
+
 pub(crate) fn table2() -> *const contract::ProtocolApi2 {
     core::ptr::addr_of!(TABLE2)
 }
