@@ -13,7 +13,7 @@ fn capture(sys: r4os.r4sys.Context, audio: r4os.r4audio.Context) i32 {
     }
     return a.service_api_result_busy;
 }
-pub fn r4_app_main(app: *r4os.App) i32 {
+pub fn r4_app_main(app: *r4os.App2) i32 {
     const sys = app.system();
     const audio = app.audioLowLevel() orelse return 2;
     const service = app.audio() orelse return 3;

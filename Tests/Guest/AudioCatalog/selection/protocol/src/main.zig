@@ -3,10 +3,10 @@ const p = @import("shared.zig");
 const a = r4os.abi;
 var resident: ?*p.State = null;
 comptime {
-    asm (r4os.r4dev.protocolEntriesAsm("p56p_init", "p56p_shutdown", "p56p_query", "p56p_dispatch"));
+    asm (r4os.technical2.protocolEntriesAsm("p56p_init", "p56p_shutdown", "p56p_query", "p56p_dispatch"));
 }
-export fn p56p_init(api: *const r4os.r4dev.ProtocolApi) callconv(.c) i32 {
-    const ctx = r4os.r4dev.ProtocolContext.init(api);
+export fn p56p_init(api: *const r4os.r4dev.ProtocolApi2) callconv(.c) i32 {
+    const ctx = r4os.r4dev.ProtocolContext2.init(api);
     if (ctx.registerRole(p.role, .audio, 0) != 0) return -1;
     return ctx.setStatus(.active, "Private actual output-query observer");
 }

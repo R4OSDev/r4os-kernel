@@ -130,7 +130,7 @@ const Probe = struct {
         return exact and (if (sid) after.sid_stop_acks == before.sid_stop_acks + 1 else after.midi_stop_acks == before.midi_stop_acks + 1) and after.idle_calls == before.idle_calls and after.stop_calls == before.stop_calls and continued == pcm.len and reacquired == 1 and closed == 0 and pcm_close == 0 and released == 0;
     }
 };
-pub fn r4_app_main(app: *r.App) i32 {
+pub fn r4_app_main(app: *r.App2) i32 {
     const args = app.args();
     if (args.len != 1 or (args[0] != 'M' and args[0] != 'T' and args[0] != 'D')) return 2;
     const probe = Probe{ .sys = app.system(), .audio = app.audioLowLevel() orelse return 3, .dev = app.devicesLowLevel() orelse return 3 };

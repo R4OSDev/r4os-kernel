@@ -16,7 +16,7 @@ function Find-CountFixtureElf([string]$name){
    $expected=(Get-FileHash (Join-Path $OutputRoot ('Artifacts/'+$name+'.R4D'))).Hash
    foreach($candidate in $candidates){
     $check=Join-Path $OutputRoot 'elf-provenance-check.R4D'
-    & $packager --r4m --kind r4d --name ('R4D_'+$name) --output $check --elf $candidate.FullName --import R4DEV:Query:1 --export DriverInit:.text:0:1 --export DriverShutdown:.text:5:1 --meta ('r4d.name='+$name) --meta r4d.type=display --meta module.version=0.1.0
+    & $packager --r4m --kind r4d --name ('R4D_'+$name) --output $check --elf $candidate.FullName --import R4DEV:Query2:2 --export DriverInit2:.text:0:2 --export DriverShutdown:.text:10:1 --meta module.version=0.1.1 --meta ('r4d.name='+$name) --meta r4d.type=display
     if($LASTEXITCODE -ne 0){throw 'Canonical provenance repack failed'}
     if((Get-FileHash $check).Hash -ceq $expected){return $candidate.FullName;break}
    }
@@ -28,7 +28,7 @@ for($i=-1;$i -lt $Count;$i++){
  $text=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'driver.c'))
  if($i -lt 0){$text='#define COUNT_FAIL_INIT 1'+[Environment]::NewLine+$text}
  [IO.File]::WriteAllText((Join-Path $project 'main.c'),$text)
- $manifest=@('R4OS_MODULE_MANIFEST=2','KIND=R4D',('NAME='+$name),'VERSION=0.1.0','LANGUAGE=C','SOURCE=main.c',('TARGET=/R4OS/DRIVERS/'+$name+'.R4D'),'IMAGE_SCOPE=none','IMPORT=R4DEV:Query:1',('META=r4d.name='+$name),'META=r4d.type=display',('META=module.name=R4D_'+$name))
+ $manifest=@('R4OS_MODULE_MANIFEST=2','KIND=R4D',('NAME='+$name),'VERSION=0.1.1','LANGUAGE=C','SDK_PROFILE=r4os-c-r4d-generation2','SOURCE=main.c',('TARGET=/R4OS/DRIVERS/'+$name+'.R4D'),'IMAGE_SCOPE=none','IMPORT=R4DEV:Query2:2',('META=r4d.name='+$name),'META=r4d.type=display',('META=module.name=R4D_'+$name))
  [IO.File]::WriteAllLines((Join-Path $project 'module.R4MF'),$manifest)
  if($i -le 0){
  Push-Location $sdk
@@ -41,7 +41,7 @@ for($i=-1;$i -lt $Count;$i++){
  }else{
   # Container identities differ; executable source and its ordinary entry points
   # are identical. Reuse the actual SDK ELF and run the unchanged SDK packager.
-  & $packager --r4m --kind r4d --name ('R4D_'+$name) --output (Join-Path $OutputRoot ('Artifacts/'+$name+'.R4D')) --elf $sharedElf --import R4DEV:Query:1 --export DriverInit:.text:0:1 --export DriverShutdown:.text:5:1 --meta ('r4d.name='+$name) --meta r4d.type=display --meta module.version=0.1.0
+  & $packager --r4m --kind r4d --name ('R4D_'+$name) --output (Join-Path $OutputRoot ('Artifacts/'+$name+'.R4D')) --elf $sharedElf --import R4DEV:Query2:2 --export DriverInit2:.text:0:2 --export DriverShutdown:.text:10:1 --meta module.version=0.1.1 --meta ('r4d.name='+$name) --meta r4d.type=display
   if($LASTEXITCODE -ne 0){throw ('Canonical fixture packaging failed: '+$name)}
  }
  $artifact=Join-Path $OutputRoot ('Artifacts/'+$name+'.R4D')
@@ -51,7 +51,7 @@ for($i=-1;$i -lt $Count;$i++){
 # A second intentional refusal occurs after all large owner/module tables grow.
 $refusalElf=Find-CountFixtureElf 'DC29BAD'
 $artifact=Join-Path $OutputRoot 'Artifacts/DC29END.R4D'
-& $packager --r4m --kind r4d --name R4D_DC29END --output $artifact --elf $refusalElf --import R4DEV:Query:1 --export DriverInit:.text:0:1 --export DriverShutdown:.text:5:1 --meta r4d.name=DC29END --meta r4d.type=display --meta module.version=0.1.0
+& $packager --r4m --kind r4d --name R4D_DC29END --output $artifact --elf $refusalElf --import R4DEV:Query2:2 --export DriverInit2:.text:0:2 --export DriverShutdown:.text:10:1 --meta module.version=0.1.1 --meta r4d.name=DC29END --meta r4d.type=display
 if($LASTEXITCODE -ne 0){throw 'Late refusal fixture packaging failed'}
 $artifacts.Add(@{name='DC29END';path=$artifact;sha256=(Get-FileHash $artifact).Hash.ToLowerInvariant();expected_active=$false;shared_elf=$refusalElf})
 [IO.File]::WriteAllText((Join-Path $OutputRoot 'fixtures.json'),($artifacts|ConvertTo-Json -Depth 4))

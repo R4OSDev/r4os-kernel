@@ -1,7 +1,7 @@
 const std=@import("std");const r4os=@import("r4os");const a=r4os.abi;
 var line:[256]u8=undefined;
 var checksum:u64=0;
-pub fn r4_app_main(app:*r4os.App) i32 {
+pub fn r4_app_main(app:*r4os.App2) i32 {
  const sys=app.system();const audio=app.audioLowLevel() orelse return 2;const desk=app.desktop() orelse return 2;
  const args=app.args();if(args.len<2)return 3;const sid=args[0]=='S';const mode=args[1];
  if(mode=='F'){

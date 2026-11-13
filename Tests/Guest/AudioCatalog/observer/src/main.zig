@@ -158,7 +158,29 @@ const Probe = struct {
         self.report("P55 BOUNDARIES shortCapacity=0/1/255 shortHeader=223 overlap=0/256 negativeCallbacks=0 receiptUntouched=1 extendedHeaderTail=unchanged pass=1", .{});
         return true;
     }
-    fn service(self: *const Probe, app: *r4os.App) bool {
+    // A catalog page may be valid while the service still owns an asynchronous
+    // selection. Observe its completed state; a fixed sleep is no Join receipt.
+    // Retry only the documented transition/Busy state, without selecting again.
+    fn settledServicePage(self: *const Probe, audio: anytype, deadline: u64, page: *a.AudioServiceOutputState) bool {
+        var request: a.AudioServiceOutputRequest = .{};
+        var polls: u32 = 0;
+        while (self.sys.ticks() < deadline) {
+            const timeout = r4os.time_contract.timeoutFinite(.{ .nanoseconds = 100_000_000 });
+            switch (audio.outputs(&request, timeout, page)) {
+                .ok => if (page.reason != a.audio_output_reason_catalog_busy) {
+                    self.report("P55 SERVICE_SETTLED polls={d} reason={d}; completed state, no latency claim", .{ polls, page.reason });
+                    return true;
+                },
+                .failure => |raw| if (raw != a.service_api_result_busy) return false,
+                .timed_out => return false,
+            }
+            polls += 1;
+            self.sys.sleepTicks(@max(self.sys.ticksFromMilliseconds(10), 1));
+        }
+        self.report("P55 SERVICE_SETTLED deadline expired polls={d}", .{polls});
+        return false;
+    }
+    fn service(self: *const Probe, app: *r4os.App2) bool {
         const audio = app.audio() orelse return false;
         const timeout = r4os.time_contract.timeoutFinite(.{ .nanoseconds = 2_000_000_000 });
         if (!self.control(.{ .output_count = 32, .secondary_count = 1 })) return false;
@@ -189,13 +211,15 @@ const Probe = struct {
         };
         const desired = request.id;
         if (!self.control(.{ .output_count = 0, .secondary_count = 1 })) return false;
+        var deadline = self.sys.ticks() +| self.sys.ticksFromMilliseconds(2000);
         self.sys.sleepTicks(self.sys.ticksFromMilliseconds(650));
         request = .{};
-        if (audio.outputs(&request, timeout, &page) != .ok or page.total != 1 or !std.mem.startsWith(u8, &page.active_id, "P55B-0") or !std.mem.eql(u8, &page.desired_id, &desired)) return false;
+        if (!self.settledServicePage(audio, deadline, &page) or page.total != 1 or !std.mem.startsWith(u8, &page.active_id, "P55B-0") or !std.mem.eql(u8, &page.desired_id, &desired)) return false;
         self.report("P55 SERVICE_WITHDRAW total={d} desired=P55-0 active=P55B-0 reason={d} pass=1", .{ page.total, page.reason });
         if (!self.control(.{ .output_count = 2, .secondary_count = 1 })) return false;
+        deadline = self.sys.ticks() +| self.sys.ticksFromMilliseconds(2000);
         self.sys.sleepTicks(self.sys.ticksFromMilliseconds(650));
-        if (audio.outputs(&request, timeout, &page) != .ok or page.total != 3 or !std.mem.eql(u8, &page.active_id, &desired) or page.reason != a.audio_output_reason_preferred) return false;
+        if (!self.settledServicePage(audio, deadline, &page) or page.total != 3 or !std.mem.eql(u8, &page.active_id, &desired) or page.reason != a.audio_output_reason_preferred) return false;
         const retained = page;
         if (!self.control(.{ .output_count = 2, .secondary_count = 1, .fail_at_query = 1 })) return false;
         self.sys.sleepTicks(self.sys.ticksFromMilliseconds(650));
@@ -204,8 +228,9 @@ const Probe = struct {
         if (audio.status(timeout, &status) != .ok or status.flags & a.audio_service_flag_backend_present != 0) return false;
         self.report("P55 SERVICE_BUSY retained={d} reason={d} backendFlag={d} pass=1", .{ page.total, page.reason, status.flags & a.audio_service_flag_backend_present });
         if (!self.control(.{ .output_count = 2, .secondary_count = 1 })) return false;
+        deadline = self.sys.ticks() +| self.sys.ticksFromMilliseconds(2000);
         self.sys.sleepTicks(self.sys.ticksFromMilliseconds(650));
-        if (audio.outputs(&request, timeout, &page) != .ok or !std.mem.eql(u8, &page.active_id, &desired)) return false;
+        if (!self.settledServicePage(audio, deadline, &page) or !std.mem.eql(u8, &page.active_id, &desired)) return false;
         var captures: u32 = 0; var busy: u32 = 0;
         for (0..60) |_| {
             receipt = .{};
@@ -236,7 +261,7 @@ const Probe = struct {
         return observed_mix and after.queries == 6 and after.actives == 5;
     }
 };
-pub fn r4_app_main(app: *r4os.App) i32 {
+pub fn r4_app_main(app: *r4os.App2) i32 {
     const probe = Probe{ .sys = app.system(), .audio = app.audioLowLevel() orelse return 2, .dev = app.devicesLowLevel() orelse return 3 };
     var data: a.ProtocolBuffer = .{};
     var out: a.ProtocolBuffer = .{};

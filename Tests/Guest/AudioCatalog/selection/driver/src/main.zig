@@ -2,29 +2,30 @@ const std = @import("std");
 const r4os = @import("r4os");
 const p = @import("shared.zig");
 const a = r4os.abi;
-var api: *const r4os.r4dev.DriverApi = undefined;
+var api: *const r4os.r4dev.DriverApi2 = undefined;
 var state: p.State = .{};
-var backend: r4os.r4dev.AudioOutputIdleBackend = undefined;
-var secondary: r4os.r4dev.AudioOutputIdleBackend = undefined;
+var backend: a.AudioBackend2 = undefined;
+var secondary: a.AudioBackend2 = undefined;
 var threads: r4os.r4dev.DriverThreadContext = undefined;
 var thread: u64 = 0;
 comptime {
-    asm (r4os.r4dev.driverEntriesAsm("p56_init", "p56_shutdown"));
+    asm (r4os.technical2.driverEntriesAsm("p56_init", "p56_shutdown"));
 }
 fn dispatch(op: u32, data: ?*anyopaque, len: u32) i32 {
-    const ctx = r4os.r4dev.DriverContext.init(api);
+    const ctx = r4os.r4dev.DriverContext2.init(api);
     var input: a.ProtocolBuffer = .{ .data = data, .len = len, .capacity = len };
     var out: a.ProtocolBuffer = .{};
-    return ctx.protocolDispatch(p.role, op, &input, &out);
+    const callback = ctx.function("protocol_dispatch") orelse return a.service_api_result_no_endpoint;
+    return callback(p.role, op, &input, &out);
 }
-export fn p56_init(table: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
+export fn p56_init(table: *const r4os.r4dev.DriverApi2) callconv(.c) i32 {
     api = table;
-    const ctx = r4os.r4dev.DriverContext.init(api);
-    backend = .{ .base = .{ .base = .{ .version = a.audio_backend_idle_version, .size = @sizeOf(r4os.r4dev.AudioOutputIdleBackend), .write_pcm = write, .stop = stop, .status = status, .min_rate = 8000, .max_rate = 192000, .max_channels = 2 }, .outputs = .{ .query = query, .select = select, .active = active } }, .idle = idle };
-    if (ctx.registerAudioOutputIdle("P56D", &backend) != 0 or ctx.registerAudioOutputEpoch("P56D", epoch) != 0) return -10;
+    const ctx = r4os.r4dev.DriverContext2.init(api);
+    backend = .{ .write_pcm = write, .stop = stop, .status = status, .min_rate = 8000, .max_rate = 192000, .max_channels = 2, .output_query = query, .output_select = select, .output_active = active, .idle = idle };
+    if (ctx.registerAudioOutputBackend("P56D", &backend) != 0 or ctx.registerAudioOutputEpoch("P56D", epoch) != 0) return -10;
     secondary = backend;
-    secondary.base.outputs = .{ .query = secondaryQuery, .select = secondarySelect, .active = secondaryActive };
-    if (ctx.registerAudioOutputIdle("P56B", &secondary) != 0 or ctx.registerAudioOutputEpoch("P56B", secondaryEpoch) != 0) return -11;
+    secondary.output_query = secondaryQuery; secondary.output_select = secondarySelect; secondary.output_active = secondaryActive;
+    if (ctx.registerAudioOutputBackend("P56B", &secondary) != 0 or ctx.registerAudioOutputEpoch("P56B", secondaryEpoch) != 0) return -11;
     threads = ctx.threads() orelse return -12;
     if (threads.start(pacer, 0, a.driver_thread_flag_parallel, &thread) != 0) return -13;
     return 0;
@@ -54,7 +55,7 @@ fn idle(_: ?*anyopaque) callconv(.c) i32 {
     _ = p.count(&state.idles);
     return 0;
 }
-fn status(_: ?*anyopaque, out: *a.AudioBackendStatus) callconv(.c) i32 {
+fn status(_: ?*anyopaque, out: *a.AudioBackendStatus2) callconv(.c) i32 {
     var registration: p.Registration = .{ .address = @intFromPtr(&state), .bytes = @sizeOf(p.State) };
     _ = dispatch(p.register, &registration, @sizeOf(p.Registration));
     out.* = .{ .active = 1, .writes = p.load(&state.writes), .refills = p.load(&state.writes), .buffer_bytes = 1920 };
@@ -65,7 +66,7 @@ fn query(_: u64, index: u32, out: *a.AudioOutputInfo) callconv(.c) i32 {
     defer p.release(&state);
     const number = p.count(&state.queries);
     if (p.load(&state.reentrant_at_query) == number) {
-        const ctx = r4os.r4dev.DriverContext.init(api);
+        const ctx = r4os.r4dev.DriverContext2.init(api);
         const result = ctx.unregisterAudioBackend("P56D");
         @atomicStore(i32, &state.reentrant_result, result, .release);
         _ = p.count(&state.reentrant_attempts);
@@ -88,7 +89,7 @@ fn select(_: u64, index: u32) callconv(.c) i32 {
     if (!p.acquire(&state)) return a.service_api_result_busy;
     if (index >= p.load(&state.output_count)) { p.release(&state); return -1; }
     _ = p.count(&state.selections);
-    const ctx = r4os.r4dev.DriverContext.init(api);
+    const ctx = r4os.r4dev.DriverContext2.init(api);
     const hold_ms = @min(p.load(&state.select_hold_ms), 3000);
     const deadline = ctx.tickCount() +| @max((@as(u64, ctx.timerFrequency()) * hold_ms + 999) / 1000, 1);
     @atomicStore(u64, &state.select_entered, ctx.tickCount(), .release);
@@ -147,20 +148,21 @@ fn secondarySelect(_: u64, index: u32) callconv(.c) i32 {
 }
 fn secondaryActive(_: u64) callconv(.c) i32 { return if (p.load(&state.secondary_count) == 0) -1 else 0; }
 fn registryWork(_: usize) callconv(.c) i32 {
-    const ctx = r4os.r4dev.DriverContext.init(api);
+    const ctx = r4os.r4dev.DriverContext2.init(api);
     const removed = ctx.unregisterAudioBackend("P56D");
     if (removed != 0) return removed;
-    const added = ctx.registerAudioOutputIdle("P56D", &backend);
+    const added = ctx.registerAudioOutputBackend("P56D", &backend);
     if (added != 0) return added;
     return ctx.registerAudioOutputEpoch("P56D", epoch);
 }
 fn pacer(_: usize) callconv(.c) i32 {
-    const ctx = r4os.r4dev.DriverContext.init(api);
+    const ctx = r4os.r4dev.DriverContext2.init(api);
     while (p.load(&state.terminal_stop) == 0) {
         const request = p.load(&state.rebind_request);
         if (request != 0 and request != p.load(&state.rebind_completed)) {
             var handle: u32 = 0;
-            if (ctx.workSubmitOwned(registryWork, 0, &handle) != 0) return -30;
+            const submit = ctx.function("driver_work_submit_owned") orelse return -30;
+            if (submit(registryWork, 0, &handle) != 0) return -30;
             var status_value: a.DriverCompletionStatus = .{};
             while (true) {
                 if (ctx.completionStatus(handle, &status_value) != 0) return -31;

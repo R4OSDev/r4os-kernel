@@ -45,7 +45,7 @@ const Controller=struct{
   self.report("P53 BEFORE_ONLY_REPAIR kind={c} stop={d} release={d}; explicit foreign repair after failed owner contract, never a reaper receipt",.{kind,stop,release});
  }
 };
-pub fn r4_app_main(app:*r4os.App)i32{
+pub fn r4_app_main(app:*r4os.App2)i32{
  const dev=app.devices() orelse return 3;
  const c=Controller{.sys=app.system(),.desk=app.desktop() orelse return 2,.audio=app.audioLowLevel() orelse return 3,.performance=dev.performance()};
  const args=app.args();if(args.len<2)return 4;const kind=args[0];const mode=args[1];if(kind!='S' and kind!='M')return 5;

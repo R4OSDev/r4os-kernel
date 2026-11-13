@@ -268,7 +268,7 @@ fn restart(probe: *const Probe, audio: *const r4os.Audio) bool {
     probe.report("P56X SERVICE_RESTART stop={d} pendingState={d} providerStillHeld={d} clientJoin={d} clientExit={d} stopped={d} serviceExit={d} start={d} oldInstance={d} newInstance={d} persistedDesired={d} selectCalls={d} pass={d}", .{ stop, @as(u32, a.service_state_stopping), @intFromBool(held.select_finished == 0), join, exit, stopped.state, stopped.exit_code, start, old.instance_id, fresh.instance_id, @intFromBool(restored), final.selections, @intFromBool(ok) });
     return ok;
 }
-pub fn r4_app_main(app: *r4os.App) i32 {
+pub fn r4_app_main(app: *r4os.App2) i32 {
     const probe = Probe{ .sys = app.system(), .dev = app.devicesLowLevel() orelse return 2 };
     const audio = app.audio() orelse return 3;
     if (app.args().len != 0 and app.args()[0] == 'C') {

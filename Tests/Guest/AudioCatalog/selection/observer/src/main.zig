@@ -50,7 +50,7 @@ const Probe = struct {
         _ = self.dev.protocolDispatch(p.role, p.release_select, &data, &out);
     }
 };
-pub fn r4_app_main(app: *r4os.App) i32 {
+pub fn r4_app_main(app: *r4os.App2) i32 {
     const probe = Probe{ .sys = app.system(), .dev = app.devicesLowLevel() orelse return 2 };
     const audio = app.audio() orelse return 3;
     _ = probe.dev.performanceSummary() orelse return 4;

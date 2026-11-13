@@ -179,7 +179,7 @@ const Probe = struct {
         return first == expected and second == expected and waiting.sid_stop_calls == before.sid_stop_calls + 1 and waiting.idle_acks == before.idle_acks and invalid == -2 and (!resume_source or resumed == expected) and finished == 0 and replayed == 0 and done.sid_stop_calls == before.sid_stop_calls + own and done.sid_stop_acks == before.sid_stop_acks + own and done.idle_acks == before.idle_acks + 1 and replay.idle_calls == done.idle_calls;
     }
 };
-pub fn r4_app_main(app: *r4os.App) i32 {
+pub fn r4_app_main(app: *r4os.App2) i32 {
     const probe = Probe{ .sys = app.system(), .audio = app.audioLowLevel() orelse return 2, .dev = app.devicesLowLevel() orelse return 3 };
     var input: a.ProtocolBuffer = .{};
     var output: a.ProtocolBuffer = .{};

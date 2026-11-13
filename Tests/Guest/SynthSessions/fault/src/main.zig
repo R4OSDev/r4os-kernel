@@ -22,7 +22,7 @@ fn worker(_: u64) callconv(.c) i32 {
     identify(&worker_sys, 'T');
     trap();
 }
-pub fn r4_app_main(app: *r.App) i32 {
+pub fn r4_app_main(app: *r.App2) i32 {
     const sys = app.system();
     const audio = app.audioLowLevel() orelse return 2;
     const args = app.args();

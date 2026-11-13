@@ -354,7 +354,7 @@ const Probe = struct {
         return before > 0 and after > before and epoch > 0 and next_epoch > epoch and registration > 0 and next_registration > registration and acquired == 1 and closing_veto == 0 and unregister_veto == 0 and unload_veto == 0 and retained == 2 and same == registration and write == 0 and closed == 0 and closing == 1 and refused < 0 and restored == 1 and unload == 1 and absent == 0 and stale_heap == a.driver_heap_error_stale and missing == 0 and loaded == 1 and next == 1 and final == 0;
     }
 };
-pub fn r4_app_main(app: *r4os.App) i32 {
+pub fn r4_app_main(app: *r4os.App2) i32 {
     _ = app.desktop() orelse return 8;
     const args = app.args();
     const address = if (args.len > 2 and args[1] == ':') std.fmt.parseInt(usize, args[2..], 16) catch return 9 else 0;

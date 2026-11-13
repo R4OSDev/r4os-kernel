@@ -4,9 +4,9 @@ const a = r4os.abi;
 // The fixture driver explicitly lends its resident State until unregister.
 // Only the scoped test guest loads these modules; no product API is added.
 var resident: ?*p.State = null;
-comptime { asm(r4os.r4dev.protocolEntriesAsm("p52_init", "p52_shutdown", "p52_query", "p52_dispatch")); }
-export fn p52_init(api: *const r4os.r4dev.ProtocolApi) callconv(.c) i32 {
-    const ctx = r4os.r4dev.ProtocolContext.init(api);
+comptime { asm(r4os.technical2.protocolEntriesAsm("p52_init", "p52_shutdown", "p52_query", "p52_dispatch")); }
+export fn p52_init(api: *const r4os.r4dev.ProtocolApi2) callconv(.c) i32 {
+    const ctx = r4os.r4dev.ProtocolContext2.init(api);
     if (ctx.registerRole(p.role, .audio, 0) != 0) return -1;
     return ctx.setStatus(.active, "Temporary real audio callback observer");
 }

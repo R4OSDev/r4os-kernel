@@ -1,3 +1,4 @@
+#include <r4os/app2.h>
 /* Public SDK consumer against actual mounted private-image FAT32/NTFS volumes.
  * Never run on a volume with user-owned N27* files. No mock is a provider proof. */
 #include <r4os/storage_helpers.h>
@@ -5,12 +6,12 @@
 static uint32_t cases, failures;
 static uint32_t length(const char *s) { uint32_t n=0; while(s[n])++n; return n; }
 static void text(R4App *a,const char *s) {
-    ((R4SysWriteFn)(uintptr_t)a->system.table->write)((const uint8_t *)s,length(s));
+    ((R4SysWriteFn)(uintptr_t)R4SYS_SLOT(&a->system,write))((const uint8_t *)s,length(s));
 }
 static void number(R4App *a,int64_t v) {
     uint8_t b[24];uint32_t n=0;uint64_t u=v<0?(uint64_t)(-(v+1))+1:(uint64_t)v;
     if(v<0)text(a,"-");do{b[n++]=(uint8_t)('0'+u%10);u/=10;}while(u);
-    while(n)((R4SysWriteFn)(uintptr_t)a->system.table->write)(&b[--n],1);
+    while(n)((R4SysWriteFn)(uintptr_t)R4SYS_SLOT(&a->system,write))(&b[--n],1);
 }
 static void field(R4App *a,const char *name,int64_t value) { text(a,name);number(a,value); }
 static int equal(const uint8_t *a,const uint8_t *b,uint32_t n) {
@@ -26,23 +27,23 @@ static void join(char *out,const char *prefix,const char *name) {
     while(*prefix)*out++=*prefix++;while(*name)*out++=*name++;*out=0;
 }
 static int32_t remove_file(R4App *a,const char *path) {
-    return ((R4SysFileDeleteFn)(uintptr_t)a->system.table->file_delete)((const uint8_t *)path);
+    return ((R4SysFileDeleteFn)(uintptr_t)R4SYS_SLOT(&a->system,file_delete))((const uint8_t *)path);
 }
 static int32_t read_file(R4App *a,const char *path,uint8_t *out,uint32_t capacity) {
-    return ((R4SysFileReadFn)(uintptr_t)a->system.table->file_read)((const uint8_t *)path,out,capacity);
+    return ((R4SysFileReadFn)(uintptr_t)R4SYS_SLOT(&a->system,file_read))((const uint8_t *)path,out,capacity);
 }
 static int32_t store(R4App *a,const char *path,const uint8_t *data,uint32_t count) {
-    int32_t rc=((R4SysFileStreamBeginFn)(uintptr_t)a->system.table->file_stream_begin)(
+    int32_t rc=((R4SysFileStreamBeginFn)(uintptr_t)R4SYS_SLOT(&a->system,file_stream_begin))(
         (const uint8_t *)path,R4OS_FILE_STREAM_OPEN_CREATE);
     if(rc!=0)return rc;
-    rc=((R4SysFileStreamWriteFn)(uintptr_t)a->system.table->file_stream_write)(
+    rc=((R4SysFileStreamWriteFn)(uintptr_t)R4SYS_SLOT(&a->system,file_stream_write))(
         (const uint8_t *)path,0,data,count,0);
     if(rc==(int32_t)count) {
-        rc=((R4SysFileStreamFinishFn)(uintptr_t)a->system.table->file_stream_finish)(
+        rc=((R4SysFileStreamFinishFn)(uintptr_t)R4SYS_SLOT(&a->system,file_stream_finish))(
             (const uint8_t *)path,count,0);
         if(rc==0)return 0;
     }
-    ((R4SysFileStreamAbortFn)(uintptr_t)a->system.table->file_stream_abort)((const uint8_t *)path);
+    ((R4SysFileStreamAbortFn)(uintptr_t)R4SYS_SLOT(&a->system,file_stream_abort))((const uint8_t *)path);
     return rc<0?rc:R4OS_FILE_STREAM_ERROR_IO;
 }
 static void probe(R4App *a,const char *prefix,const char *label,const char *name,int32_t expected) {
@@ -75,7 +76,7 @@ static void atomic_probe(R4App *a,const char *prefix,int long_stage,int long_tar
     check(a,store(a,target,old,sizeof old-1)==0,"atomic target preparation");
     check(a,store(a,stage,data,sizeof data-1)==0,"atomic stage preparation");
     if(long_stage)check(a,store(a,backup,guard,sizeof guard-1)==0,"atomic backup sentinel");
-    int32_t rc=((R4SysFileReplaceAtomicFn)(uintptr_t)a->system.table->file_replace_atomic)(
+    int32_t rc=((R4SysFileReplaceAtomicFn)(uintptr_t)R4SYS_SLOT(&a->system,file_replace_atomic))(
         (const uint8_t *)target,(const uint8_t *)stage,(const uint8_t *)backup,
         R4SYS_FILE_REPLACE_ATOMIC_CONSUME_STAGE);
     text(a,"N27 atomic path=");text(a,prefix);field(a," long-stage=",long_stage);
@@ -134,11 +135,11 @@ static void suite(R4App *a,const char *prefix,uint32_t provider) {
     check(a,n==sizeof data-1&&equal(out,data,n),"SDK long target complete readback");
     remove_file(a,saved);
 }
-int32_t r4_app_main(R4App *a) {
+static int32_t run(R4App *a) {
     text(a,"N27-BEGIN SDK109\n");
     for(uint32_t index=0;index<26;++index){
         R4DriveInfo drive={0};
-        int32_t rc=((R4SysDriveInfoGeometryFn)(uintptr_t)a->system.table->drive_info_geometry)(index,&drive);
+        int32_t rc=((R4SysDriveInfoGeometryFn)(uintptr_t)R4SYS_SLOT(&a->system,drive_info_geometry))(index,&drive);
         if(rc==1&&(drive.kind==2||drive.kind==3)){
             char prefix[]="C:\\";prefix[0]=(char)drive.letter;suite(a,prefix,drive.kind);
         }
@@ -158,7 +159,7 @@ int32_t r4_app_main(R4App *a) {
     check(a,r4sys_file_name_limits(&a->system,boundary,&untouched)==R4OS_FILE_STREAM_ERROR_NAME_TOO_LONG,
         "1024-byte path query overflow");
     char overlong[1100];for(uint32_t i=0;i<1099;++i)overlong[i]='X';overlong[1099]=0;
-    int32_t rc=((R4SysFileStreamBeginFn)(uintptr_t)a->system.table->file_stream_begin)(
+    int32_t rc=((R4SysFileStreamBeginFn)(uintptr_t)R4SYS_SLOT(&a->system,file_stream_begin))(
         (const uint8_t *)overlong,R4OS_FILE_STREAM_OPEN_CREATE);
     check(a,rc==R4OS_FILE_STREAM_ERROR_NAME_TOO_LONG,"raw path byte overflow");
     check(a,r4sys_file_name_limits(&a->system,overlong,&untouched)==R4OS_FILE_STREAM_ERROR_NAME_TOO_LONG,"query raw path overflow");
@@ -166,3 +167,5 @@ int32_t r4_app_main(R4App *a) {
     field(a,"N27-DONE checks=",cases);field(a," failures=",failures);text(a,"\n");
     return failures?1:0;
 }
+
+int32_t r4_app_main(R4App2 *actual){R4App facade;int32_t rc=r4_app2_facade(actual,&facade);return rc<0?rc:run(&facade);}
