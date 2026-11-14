@@ -57,6 +57,7 @@ struct State {
     playback_position: playback::Position,
     playback_valid: bool,
     playback_observed_ns: u64,
+    playback_room_frames: Option<u64>,
     audio_backends: [AudioBackend; MAX_AUDIO_BACKENDS],
     active_audio_slot: Option<usize>,
     initial_output_pending: bool,
@@ -135,6 +136,7 @@ static STATE: Resident<State> = Resident(UnsafeCell::new(State {
     },
     playback_valid: false,
     playback_observed_ns: 0,
+    playback_room_frames: None,
     audio_backends: [const { AudioBackend::EMPTY }; MAX_AUDIO_BACKENDS],
     active_audio_slot: None,
     initial_output_pending: false,
@@ -259,6 +261,8 @@ struct SidOutputTarget {
 static PROGRESS: Resident<Event> = Resident(UnsafeCell::new(Event::AUTO));
 static MIX_DUE: AtomicU64 = AtomicU64::new(u64::MAX);
 static BACKEND_DUE: AtomicU64 = AtomicU64::new(u64::MAX);
+// Updated only after a device observation; contending workers need no borrow.
+static BACKEND_RETRY_MS: AtomicU64 = AtomicU64::new(10);
 
 pub(super) fn log(s: &[u8]) {
     unsafe { audio_log(s.as_ptr(), s.len()) }
@@ -375,6 +379,8 @@ pub(crate) unsafe fn init() {
     unsafe {
         MIX_DUE.store(u64::MAX, Ordering::Release);
         BACKEND_DUE.store(u64::MAX, Ordering::Release);
+        BACKEND_RETRY_MS.store(10, Ordering::Release);
+        g!(playback_room_frames) = None;
         for i in 0..MAX_STREAMS {
             let p = stream(i);
             let ring = (*p).ring;
@@ -603,7 +609,7 @@ use playback_progress::{
 };
 pub(crate) use playback_progress::{set_stream_expectation_for_owner, stream_progress_for_owner};
 use progress::schedule_progress;
-pub(crate) use progress::start_progress_worker;
+pub(crate) use progress::{notify_backend_progress, start_progress_worker};
 pub(crate) use sessions::{
     close_synths_for_owner, midi_close_for_owner, midi_open_synth_for_owner, midi_send_for_owner,
     opl3_render_block, opl3_reset, opl3_stop, opl3_write_register, set_synth_driver_closing,

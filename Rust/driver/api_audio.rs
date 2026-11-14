@@ -68,6 +68,12 @@ fn puts(bytes: &[u8]) {
     unsafe { log::r4os_rust_bootlog_write(bytes.as_ptr(), bytes.len()) }
 }
 
+/// Task-context wake hint only; a late or unrelated period cannot acknowledge
+/// PCM or mutate the selected output's generation-bound playback cursor.
+pub(crate) extern "C" fn output_progress() {
+    audio::notify_backend_progress();
+}
+
 /// # Safety
 /// The R4D supplies its resident epoch callback for its own registered backend.
 /// The Core output permit authenticates the exact context and retains the

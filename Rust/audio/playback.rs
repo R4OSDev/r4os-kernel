@@ -15,6 +15,26 @@ pub struct Position {
     pub consumed: u64,
 }
 
+/// Device work is the primary wakeup. Keep a bounded fallback at the next
+/// attributed block end; short, not-yet-running tails still need start work.
+pub fn observation_delay_ms(remaining_frames: Option<u64>, running: bool, rate: u32) -> u64 {
+    if !running || rate == 0 {
+        return 2;
+    }
+    remaining_frames.map_or(10, |frames| {
+        frames
+            .saturating_mul(1000)
+            .div_ceil(rate as u64)
+            .clamp(1, 10)
+    })
+}
+
+/// No queue size means the backend did not publish an admission limit.
+pub fn queue_room(accepted: u64, consumed: u64, maximum: u32) -> Option<u64> {
+    (maximum != 0 && consumed <= accepted)
+        .then(|| (maximum as u64).saturating_sub(accepted - consumed))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stage {
     Dma,
@@ -87,6 +107,18 @@ impl<const SOURCES: usize, const SPANS: usize> Ledger<SOURCES, SPANS> {
     }
     pub fn empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub fn next_consumption_frames(&self, position: Position) -> Option<u64> {
+        if self.empty() {
+            return None;
+        }
+        let span = &self.spans[self.head];
+        (span.tracking_valid && span.epoch == position.epoch).then(|| {
+            (span.first + span.frames)
+                .saturating_sub(position.consumed)
+                .max(1)
+        })
     }
 
     pub fn push(&mut self, span: Span<SOURCES>) -> bool {
@@ -312,7 +344,10 @@ impl<const STAMPS: usize> Source<STAMPS> {
     }
 
     pub fn pending_deadline(&self) -> Option<u64> {
-        (self.continuous && !self.starvation_latched && self.expected_due_ns != 0)
+        (self.continuous
+            && !self.starvation_latched
+            && self.accepted == self.retired
+            && self.expected_due_ns != 0)
             .then_some(self.expected_due_ns)
     }
 
@@ -343,6 +378,69 @@ impl<const STAMPS: usize> Source<STAMPS> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn next_observation_tracks_partial_head_and_rejects_stale_epochs() {
+        let epoch = Epoch {
+            backend: 7,
+            output: 3,
+            reset: 11,
+        };
+        let mut ledger = Ledger::<1, 2>::EMPTY;
+        assert!(ledger.push(Span {
+            epoch,
+            first: 96,
+            frames: 480,
+            count: 1,
+            sources: [key(0, 1)],
+            ..Span::EMPTY
+        }));
+        for (consumed, expected) in [(96, 10), (336, 5), (575, 1)] {
+            let position = Position {
+                epoch,
+                dma: 576,
+                consumed,
+            };
+            assert_eq!(
+                observation_delay_ms(ledger.next_consumption_frames(position), true, 48000),
+                expected
+            );
+            assert_eq!(
+                observation_delay_ms(ledger.next_consumption_frames(position), false, 48000),
+                2
+            );
+        }
+        let stale = Position {
+            epoch: Epoch { reset: 12, ..epoch },
+            dma: 576,
+            consumed: 336,
+        };
+        assert_eq!(ledger.next_consumption_frames(stale), None);
+        assert_eq!(observation_delay_ms(None, true, 48000), 10);
+        ledger.observe(
+            Position {
+                epoch,
+                dma: 576,
+                consumed: 576,
+            },
+            None,
+            |_, _, _| {},
+        );
+        assert!(ledger.empty());
+        assert_eq!(ledger.next_consumption_frames(stale), None);
+        assert_eq!(observation_delay_ms(Some(u64::MAX), true, 48000), 10);
+        assert_eq!(observation_delay_ms(Some(480), true, 0), 2);
+    }
+
+    #[test]
+    fn bounded_queue_room_preserves_unknown_limits_and_full_backpressure() {
+        assert_eq!(queue_room(960, 480, 1920), Some(1440));
+        assert_eq!(queue_room(1920, 0, 1920), Some(0));
+        assert_eq!(queue_room(u64::MAX, 0, 1920), Some(0));
+        assert_eq!(queue_room(1920, 480, 1920), Some(480));
+        assert_eq!(queue_room(960, 480, 0), None);
+        assert_eq!(queue_room(1, 2, 1920), None);
+    }
+
     fn key(slot: usize, generation: u64) -> Contribution {
         Contribution {
             key: SourceKey { slot, generation },
@@ -434,9 +532,11 @@ mod tests {
         assert!(s.retire(1, 17, true));
         assert_eq!(s.queue_age_ns(350), 150);
         assert!(s.expectation(true, 400));
+        assert_eq!(s.pending_deadline(), None); // Buffered PCM cannot starve yet.
         s.check_source(500);
         assert_eq!(s.starvations, 0); // PCM still queued.
         assert!(s.retire(1, 48, true));
+        assert_eq!(s.pending_deadline(), Some(400)); // Preserve the original promise.
         s.check_source(500);
         assert_eq!(s.starvations, 1);
         for _ in 0..100 {

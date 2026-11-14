@@ -37,12 +37,14 @@ pub(super) unsafe fn refresh_playback_owned() -> bool {
     unsafe {
         let mut value = a::AudioBackendPlayback::default();
         let mut generation = 0;
+        let mut tracks_playback = false;
         let result = if let Some(slot) = g!(active_audio_slot) {
             let p = backend(slot);
             generation = (*p).generation;
             if !(*p).registered || (*p).closing {
                 NO_ENDPOINT
             } else if let Some(callback) = (*p).playback {
+                tracks_playback = true;
                 callback((*p).config.context, &mut value)
             } else {
                 NO_ENDPOINT
@@ -105,6 +107,15 @@ pub(super) unsafe fn refresh_playback_owned() -> bool {
         });
         g!(playback_position) = current;
         g!(playback_valid) = valid;
+        g!(playback_room_frames) = if valid {
+            playback::queue_room(
+                value.accepted_frames,
+                value.consumed_frames,
+                value.max_queue_frames,
+            )
+        } else {
+            None
+        };
         g!(playback_observed_ns) = now_ns();
         let now = g!(playback_observed_ns);
         let mut next_due = None::<u64>;
@@ -123,9 +134,23 @@ pub(super) unsafe fn refresh_playback_owned() -> bool {
                 }
             }
         }
+        let retry_ms = if tracks_playback {
+            playback::observation_delay_ms(
+                (*ledger).next_consumption_frames(current),
+                valid && value.flags & a::audio_playback_running != 0,
+                value.rate,
+            )
+        } else {
+            // Cursorless providers still publish period-work hints. Their
+            // finite fallback is one canonical mixer quantum (480/48000 s),
+            // without manufacturing a consumed-frame receipt.
+            10
+        };
+        BACKEND_RETRY_MS.store(retry_ms, Ordering::Release);
         if !(*ledger).empty() {
-            schedule_progress(&BACKEND_DUE, 2);
-        } else if let Some(due) = next_due {
+            schedule_progress(&BACKEND_DUE, retry_ms);
+        }
+        if let Some(due) = next_due {
             schedule_progress(
                 &BACKEND_DUE,
                 due.saturating_sub(now).div_ceil(1_000_000).max(1),

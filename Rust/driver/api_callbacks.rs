@@ -334,5 +334,6 @@ pub(super) const fn template2() -> DriverApi2 {
         serial_query: Some(crate::serial::driver_query),
         register_audio_output_epoch: Some(crate::driver::api_audio::register_output_epoch),
         register_audio_capture_backend: Some(crate::driver::api_audio::register_capture2),
+        audio_output_progress: Some(crate::driver::api_audio::output_progress),
     }
 }

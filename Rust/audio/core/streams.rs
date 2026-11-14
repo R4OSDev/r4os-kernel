@@ -644,7 +644,14 @@ unsafe fn pump_output_owned(goal: PumpGoal) -> i32 {
                 return 0;
             }
             if g!(playback_ledger).full() {
-                schedule_progress(&BACKEND_DUE, 2);
+                schedule_progress(&BACKEND_DUE, progress::backend_retry_ms());
+                return BUSY;
+            }
+            // Preserve unaccepted PCM in the source rings. A full published
+            // device queue must not repeatedly mix the same block into scratch.
+            if g!(playback_room_frames)
+                .is_some_and(|room| room < (chunk_bytes / pcm::TARGET_FRAME_BYTES) as u64)
+            {
                 return BUSY;
             }
             let mut sources = [mixer::Source::EMPTY; MAX_STREAMS];
@@ -718,6 +725,12 @@ unsafe fn pump_output_owned(goal: PumpGoal) -> i32 {
                 && receipt.reset_generation != 0
                 && receipt.first_frame.checked_add(receipt.frames).is_some();
             contribution.tracking_valid = valid_receipt;
+            g!(playback_room_frames) =
+                if valid_receipt && g!(playback_position).epoch == contribution.epoch {
+                    g!(playback_room_frames).map(|room| room.saturating_sub(contribution.frames))
+                } else {
+                    None
+                };
             if !valid_receipt {
                 contribution.first = 0;
                 contribution.epoch = playback::Epoch::default();
@@ -725,7 +738,7 @@ unsafe fn pump_output_owned(goal: PumpGoal) -> i32 {
             // An unavailable receipt retains its FIFO position; retiring it
             // immediately would skip older still-valid mixed PCM.
             assert!(g!(playback_ledger).push(contribution));
-            schedule_progress(&BACKEND_DUE, 2);
+            schedule_progress(&BACKEND_DUE, progress::backend_retry_ms());
             for (i, value) in selected.iter().enumerate() {
                 if !*value {
                     continue;

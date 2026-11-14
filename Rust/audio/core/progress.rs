@@ -1,6 +1,17 @@
 //! Exact progress operations of the parent owner; no duplicated state.
 use super::*;
 
+/// A coalesced task-context hint from completed driver period work. It carries
+/// no cursor, pointer, permit or PCM ownership into the existing audio worker.
+pub(crate) fn notify_backend_progress() {
+    schedule_progress(&MIX_DUE, 0);
+    schedule_progress(&BACKEND_DUE, 0);
+}
+
+pub(super) fn backend_retry_ms() -> u64 {
+    BACKEND_RETRY_MS.load(Ordering::Acquire)
+}
+
 pub(crate) unsafe fn start_progress_worker() -> bool {
     unsafe {
         if g!(progress_worker_started) {
@@ -106,7 +117,7 @@ pub(super) unsafe fn run_progress_if_due(now: u64) -> bool {
                 BUSY
             };
             if result == BUSY {
-                schedule_progress(&MIX_DUE, 2);
+                schedule_progress(&MIX_DUE, backend_retry_ms());
             }
         }
         if claim_progress(&BACKEND_DUE, now) {
