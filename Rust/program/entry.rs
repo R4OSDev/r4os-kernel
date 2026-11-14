@@ -7,9 +7,7 @@ use super::{
 use crate::{
     arch::{callback_abort as abort, percpu},
     boot::foundation as console,
-    contract::{
-        self, ProgramProcessHandle as Handle, R4XStartContext as Context, R4XStartImport as Import,
-    },
+    contract::{self, ProgramProcessHandle as Handle, R4XStartImport as Import},
     fs::vfs_types::Bytes,
     platform::{monotonic, timer},
     sched::{scheduler, task::task_registry},
@@ -124,7 +122,7 @@ fn cstring(bytes: &[u8]) -> usize {
     }
     len
 }
-unsafe extern "C" fn should_close(_context: *const Context) -> u32 {
+unsafe extern "C" fn should_close2(_: *const contract::generation2::R4XStartContext2) -> u32 {
     let instance = unsafe { super::context::current() };
     if instance.is_null() {
         1
@@ -135,12 +133,6 @@ unsafe extern "C" fn should_close(_context: *const Context) -> u32 {
         })
     }
 }
-unsafe extern "C" fn yield_current(_context: *const Context) {
-    scheduler::yield_task();
-}
-unsafe extern "C" fn should_close2(_: *const contract::generation2::R4XStartContext2) -> u32 {
-    unsafe { should_close(ptr::null()) }
-}
 unsafe extern "C" fn yield_current2(_: *const contract::generation2::R4XStartContext2) {
     scheduler::yield_task();
 }
@@ -149,11 +141,7 @@ unsafe fn prepare(instance: *mut ProgramInstance) -> View {
         let runtime = super::payload::runtime(instance);
         let process = super::payload::process(instance);
         let view = View {
-            context: if (*runtime).start_generation == 2 {
-                ptr::addr_of_mut!((*runtime).r4xstart_context2).cast()
-            } else {
-                ptr::addr_of_mut!((*runtime).r4xstart_context).cast()
-            },
+            context: ptr::addr_of_mut!((*runtime).r4xstart_context2).cast(),
             args: Bytes {
                 data: ptr::addr_of!((*process).args).cast(),
                 len: 128,
@@ -167,11 +155,9 @@ unsafe fn prepare(instance: *mut ProgramInstance) -> View {
             flags |= contract::r4xstart_flag_imports_valid;
         }
         let len = cstring(bytes(view.args));
-        if (*runtime).start_generation == 2 {
-            let context = view
-                .context
-                .cast::<contract::generation2::R4XStartContext2>();
-            context.write(contract::generation2::R4XStartContext2 {
+        view.context
+            .cast::<contract::generation2::R4XStartContext2>()
+            .write(contract::generation2::R4XStartContext2 {
                 flags,
                 instance_id: u64::from((*instance).id),
                 app_class: u32::from((*instance).app_class) + 1,
@@ -187,40 +173,6 @@ unsafe fn prepare(instance: *mut ProgramInstance) -> View {
                 r#yield: yield_current2 as *const () as usize as u64,
                 ..contract::generation2::R4XStartContext2::default()
             });
-            return view;
-        }
-        view.context.cast::<Context>().write(Context {
-            magic: contract::r4xstart_magic,
-            abi_major: contract::r4xstart_abi_major,
-            abi_minor: contract::r4xstart_abi_minor,
-            size: contract::r4xstart_context_size,
-            flags,
-            instance_id: u64::from((*instance).id),
-            app_class: match (*instance).app_class {
-                0 => 1,
-                1 => 2,
-                2 => 3,
-                _ => unreachable!(),
-            },
-            reserved0: 0,
-            program_path: 0,
-            args: view.args.data.addr() as u64,
-            args_len: len as u64,
-            imports: if view.import_count > 0 {
-                view.imports.addr() as u64
-            } else {
-                0
-            },
-            import_count: view.import_count,
-            reserved1: 0,
-            reserved_memory0: 0,
-            reserved_memory1: 0,
-            exit: 0,
-            should_close: should_close as *const () as usize as u64,
-            r#yield: yield_current as *const () as usize as u64,
-            reserved_runtime: 0,
-            reserved2: 0,
-        });
         view
     }
 }

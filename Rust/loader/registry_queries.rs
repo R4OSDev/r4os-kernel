@@ -253,13 +253,13 @@ pub(crate) unsafe fn init_export(entry: &EntryView) -> Option<(u8, u64)> {
             continue;
         }
         let name = &export.name[..export.name_len];
-        let generation: u8 = if name.eq_ignore_ascii_case(first) {
-            1
-        } else if name.eq_ignore_ascii_case(second) {
-            2
-        } else {
+        if name.eq_ignore_ascii_case(first) {
+            return None;
+        }
+        if !name.eq_ignore_ascii_case(second) {
             continue;
-        };
+        }
+        let generation: u8 = 2;
         if selected.is_some()
             || export.version != u32::from(generation)
             || export.address == 0

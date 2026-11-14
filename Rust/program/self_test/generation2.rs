@@ -1,5 +1,5 @@
 //! One explicit case in the existing program-storage diagnostic. Independent
-//! initial slot map, both real registry exports and a real new-table call.
+//! published2 slot/header map, retired-name refusal and a real table call.
 use crate::{contract as c, loader::registry_control as registry, program::runtime_tables};
 use core::{mem, ptr};
 #[derive(Clone, Copy)]
@@ -18,30 +18,22 @@ pub(super) fn providers() -> bool {
     let names: [&[u8]; 6] = [
         b"R4SYS", b"R4DESK", b"R4DRAW", b"R4NET", b"R4AUDIO", b"R4DEV",
     ];
-    // Independent original mapping through SYS35/AUDIO37 appends;
-    // never regenerate expected positions with the production projector.
-    let sizes = [
-        (1560, 1552),
-        (632, 632),
-        (920, 920),
-        (296, 296),
-        (240, 240),
-        (744, 720),
+    // Independent frozen94 published2 ABI. These literal positions and sizes
+    // survive removal of the old live providers; no production regeneration
+    // constructs this expected map. Every original active tail/call follows.
+    let sizes = [1552, 632, 920, 296, 240, 720];
+    let magics = [
+        0x32595352, 0x32454452, 0x32574452, 0x32454e52, 0x32554152, 0x32564452,
     ];
     for (index, name) in names.iter().enumerate() {
         let group = (index + 1) as u32;
-        let old = runtime_tables::interface(group);
         let new = runtime_tables::interface2(group);
-        if old == 0 || new == 0 || old == new {
+        if new == 0 {
             return false;
         }
-        let before = unsafe { ptr::read(old as *const Header) };
         let after = unsafe { ptr::read(new as *const Header) };
-        if before.size != sizes[index].0
-            || after.size != sizes[index].1
-            || before.magic >> 24 != u32::from(b'1')
-            || after.magic >> 24 != u32::from(b'2')
-            || (before.magic & 0xffffff) != (after.magic & 0xffffff)
+        if after.size != sizes[index]
+            || after.magic != magics[index]
             || after.version
                 != if group == 1 {
                     6
@@ -50,84 +42,62 @@ pub(super) fn providers() -> bool {
                 } else {
                     1
                 }
-            || before.flags != after.flags
+            || after.flags != 0
         {
             return false;
         }
-        let mut target = 0;
-        for slot in 0..((before.size as usize - 16) / 8) {
-            let address = unsafe { ptr::read((old + 16 + 8 * slot) as *const u64) };
-            let dropped =
-                (group == 1 && slot == 49) || (group == 6 && [27, 29, 30].contains(&slot));
-            if dropped {
-                if address != 0 {
-                    return false;
-                }
-            } else {
-                if unsafe { ptr::read((new + 16 + 8 * target) as *const u64) } != address {
-                    return false;
-                }
-                target += 1;
+        for slot in 0..((after.size as usize - 16) / 8) {
+            let reserved = match group {
+                1 => [24, 25].contains(&slot),
+                2 => slot == 37,
+                5 => [19, 20].contains(&slot),
+                6 => [25, 26].contains(&slot),
+                _ => false,
+            };
+            let address = unsafe { ptr::read((new + 16 + 8 * slot) as *const u64) };
+            if (address == 0) != reserved {
+                return false;
             }
         }
-        if target * 8 + 16 != after.size as usize {
-            return false;
-        }
-        let mut first = mem::MaybeUninit::uninit();
-        let mut second = mem::MaybeUninit::uninit();
+        let mut info = mem::MaybeUninit::uninit();
         if !unsafe {
-            registry::r4os_rust_mod_resolve_info(
-                registry::span(name),
-                registry::span(b"Query"),
-                1,
-                first.as_mut_ptr(),
-            )
-        } || !unsafe {
             registry::r4os_rust_mod_resolve_info(
                 registry::span(name),
                 registry::span(b"Query2"),
                 2,
-                second.as_mut_ptr(),
+                info.as_mut_ptr(),
             )
         } {
             return false;
         }
-        let first = unsafe { first.assume_init() };
-        let second = unsafe { second.assume_init() };
-        if first.available_size != 32
-            || second.available_size != 24
-            || first.version != 1
-            || second.version != 2
-            || first.module_slot != second.module_slot
-            || first.generation != second.generation
-            || first.address == second.address
+        let info = unsafe { info.assume_init() };
+        if info.available_size != 24 || info.version != 2 || info.kind != 5 || info.generation == 0
         {
             return false;
         }
-        let old_query = unsafe { &*(first.address as *const c::R4LQuery) };
-        let new_query = unsafe { &*(second.address as *const c::generation2::R4LQuery2) };
-        if old_query.magic != c::r4l_abi_magic
-            || old_query.abi_version != 1
-            || old_query.size != 32
-            || old_query.group != group
-            || old_query.kernel_bridge != 0
-            || new_query.magic != c::generation2::QUERY_MAGIC
-            || new_query.abi_version != 2
-            || new_query.size != 24
-            || new_query.group != group
-            || new_query.reserved != 0
+        let query = unsafe { &*(info.address as *const c::generation2::R4LQuery2) };
+        if query.magic != c::generation2::QUERY_MAGIC
+            || query.abi_version != 2
+            || query.size != 24
+            || query.group != group
+            || query.reserved != 0
         {
             return false;
         }
         let mut rejected = mem::MaybeUninit::<registry::ExportInfo>::uninit();
+        for minimum in [1, 2] {
+            if unsafe {
+                registry::r4os_rust_mod_resolve_info(
+                    registry::span(name),
+                    registry::span(b"Query"),
+                    minimum,
+                    rejected.as_mut_ptr(),
+                )
+            } {
+                return false;
+            }
+        }
         if unsafe {
-            registry::r4os_rust_mod_resolve_info(
-                registry::span(name),
-                registry::span(b"Query"),
-                2,
-                rejected.as_mut_ptr(),
-            )
-        } || unsafe {
             registry::r4os_rust_mod_resolve_info(
                 registry::span(name),
                 registry::span(b"Query2"),
@@ -170,7 +140,7 @@ pub(super) fn providers() -> bool {
         return false;
     }
     super::log(
-        b"[API2] queries=6 slots=533 shared_callbacks=ok legacy_tombstones=zero waitset_tail=present source_adapters=present pipe_launch_capture_tail=present call=ok\r\n",
+        b"[API2] queries=6 slots=533 active_callbacks=526 reserves=7 retired_query1=absent waitset_tail=present source_adapters=present pipe_launch_capture_tail=present call=ok\r\n",
     );
     true
 }
@@ -180,7 +150,7 @@ fn start_admission() -> bool {
     let old = b"r4x.start=r4xstart\0";
     let new = b"r4x.start=r4xstart2\0r4x.entry=R4XStart2\0r4x.start_abi=2\0r4x.context=R4XStartContext2\0";
     for (metadata, first, second, expected) in [
-        (old.as_slice(), true, false, Some(1)),
+        (old.as_slice(), true, false, None),
         (new.as_slice(), false, true, Some(2)),
         (old.as_slice(), false, true, None),
         (new.as_slice(), true, false, None),
@@ -194,6 +164,7 @@ fn start_admission() -> bool {
     }
     let (mut first, mut second) = (false, false);
     if policy::start_export(&mut first, &mut second, b"R4XStart", 2)
+        || policy::start_export(&mut first, &mut second, b"R4XStart", 1)
         || policy::start_export(&mut first, &mut second, b"R4XStart2", 1)
         || !policy::start_export(&mut first, &mut second, b"R4XStart2", 2)
         || policy::start_export(&mut first, &mut second, b"R4XStart2", 2)
@@ -206,7 +177,7 @@ fn start_admission() -> bool {
     true
 }
 
-/// Both physical context layouts borrow the same resident instance storage.
+/// The sole active120-byte context borrows the resident instance storage.
 pub(super) unsafe fn contexts(heap: &super::heap::Stats, baseline: &super::t::Stats) -> bool {
     unsafe {
         let owner = 0xfffd_0014;
@@ -239,21 +210,11 @@ pub(super) unsafe fn contexts(heap: &super::heap::Stats, baseline: &super::t::St
             && second.reserved2 == 0
             && second.should_close != 0
             && second.r#yield != 0;
-        (*runtime).start_generation = 1;
-        crate::program::entry::r4os_rust_program_entry_context(&mut instance);
-        let first = &(*runtime).r4xstart_context;
-        let valid = valid
-            && first.magic == c::r4xstart_magic
-            && first.size == 128
-            && first.abi_major == 1
-            && first.reserved_runtime == 0
-            && first.args == (*runtime).r4xstart_context2.args
-            && first.imports == (*runtime).r4xstart_context2.imports;
         super::storage::rollback(owner, &mut storage);
         let valid = valid && super::baseline(heap, baseline);
         if valid {
             super::log(
-                b"[API2] contexts=128/120 borrowed_args=shared imports=shared rollback=ok\r\n",
+                b"[API2] context=120 retired_start1=reject borrowed_args=shared imports=shared rollback=ok\r\n",
             );
         }
         valid
@@ -318,7 +279,35 @@ pub(super) fn query_admission() -> bool {
     }
     section.mem_size = 24;
     let valid = accepted(&input);
-    core::hint::black_box((&query, &section));
+    // Frozen94 exact positive Query1 prefix: magic/ABI1,32 bytes, independent
+    // group0 and zero bridge/reserved. It is now refused before record access.
+    let legacy: [u64; 4] = [0x00000001314c3452, 32, 0, 0];
+    section.file_size = 32;
+    section.mem_size = 32;
+    input.name = super::span(b"Query");
+    input.version = 1;
+    input.image = crate::fs::vfs_types::Bytes {
+        data: legacy.as_ptr().cast(),
+        len: 32,
+    };
+    let reason = unsafe { r4os_rust_mod_loaded_export(&input) };
+    if unsafe { core::slice::from_raw_parts(reason.data, reason.len) }
+        != b"retired-platform-generation"
+    {
+        return false;
+    }
+    // Empty section/image bounds remain valid inputs; the same retirement
+    // result must precede even section/range or payload interpretation.
+    input.section_count = 0;
+    input.offset_count = 0;
+    input.image = super::span(&[]);
+    let reason = unsafe { r4os_rust_mod_loaded_export(&input) };
+    if unsafe { core::slice::from_raw_parts(reason.data, reason.len) }
+        != b"retired-platform-generation"
+    {
+        return false;
+    }
+    core::hint::black_box((&query, &section, &legacy));
     if valid {
         super::log(b"[API2] runtime_query2=24 bad_revision/size/group/reserved/range=reject\r\n");
     }

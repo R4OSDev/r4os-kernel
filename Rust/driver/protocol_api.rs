@@ -1,4 +1,4 @@
-//! Original PPI1 table and exact task-bound execution scopes. Module owners
+//! Canonical PPI2 table and exact task-bound execution scopes. Module owners
 //! serialize stateful callbacks; nested calls restore their previous identity.
 use crate::{
     arch::runtime::RuntimeGuard,
@@ -10,7 +10,6 @@ use crate::{
 };
 use crate::{contract, driver::protocol_registry, memory::heap};
 use core::{
-    cell::UnsafeCell,
     ffi::c_void,
     mem,
     sync::atomic::{AtomicUsize, Ordering},
@@ -76,29 +75,6 @@ fn current_slot() -> usize {
         unsafe { (*task_registry::core(task)).protocol_slot }
     }
 }
-struct Table(UnsafeCell<contract::ProtocolApi>);
-// The table is installed before R4P init and retained through module calls.
-unsafe impl Sync for Table {}
-const TEMPLATE: contract::ProtocolApi = contract::ProtocolApi {
-    magic: contract::protocol_magic,
-    version: contract::protocol_api_version,
-    size: mem::size_of::<contract::ProtocolApi>() as u32,
-    reserved: 0,
-    log_info,
-    log_warn,
-    log_error,
-    register_role,
-    set_status,
-    dependency_status,
-    alloc,
-    free,
-    file_read,
-    cpu_acceleration_info: Some(crate::program::r4dev::cpu_capabilities::acceleration_info),
-    cpu_acceleration_work: Some(crate::program::r4dev::cpu_capabilities::acceleration_work),
-    entropy_source_info: Some(crate::driver::entropy::info),
-    entropy_fill: Some(crate::driver::entropy::fill),
-};
-static TABLE: Table = Table(UnsafeCell::new(TEMPLATE));
 static TABLE2: contract::ProtocolApi2 = contract::ProtocolApi2 {
     magic: contract::protocol_api2_magic,
     version: contract::protocol_api2_version,
@@ -245,23 +221,6 @@ unsafe extern "C" fn free(pointer: *mut c_void, bytes: u32) {
 unsafe extern "C" fn file_read(path: *const u8, out: *mut u8, len: u32) -> i32 {
     unsafe { protocol_file_read(path, out, len) }
 }
-/// # Safety
-/// R4P receives the canonical Contract table for its existing guarded module
-/// lifetime. Trusted consumers preserve the established table contents.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_protocol_table() -> *mut contract::ProtocolApi {
-    TABLE.0.get()
-}
-const _: () = {
-    assert!(mem::size_of::<contract::ProtocolApi>() == 120);
-    assert!(mem::offset_of!(contract::ProtocolApi, entropy_source_info) == 104);
-    assert!(mem::offset_of!(contract::ProtocolApi, entropy_fill) == 112);
-    assert!(mem::offset_of!(contract::ProtocolApi, file_read) == 80);
-    assert!(mem::offset_of!(contract::ProtocolApi, cpu_acceleration_info) == 88);
-    assert!(mem::offset_of!(contract::ProtocolApi, cpu_acceleration_work) == 96);
-    assert!(contract::protocol_api_version == 1);
-};
-
 unsafe fn protocol_file_read(path: *const u8, out: *mut u8, len: u32) -> i32 {
     unsafe { crate::program::system::io::r4os_rust_sys_file_read(path.cast(), out.cast(), len) }
 }

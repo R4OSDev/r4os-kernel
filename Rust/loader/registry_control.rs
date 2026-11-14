@@ -24,7 +24,6 @@ static LIBRARIES_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub struct Platform {
     pub name: Bytes,
     pub group: u32,
-    pub query: u64,
 }
 #[repr(C)]
 pub struct ExportInfo {
@@ -251,7 +250,7 @@ pub unsafe extern "C" fn r4os_rust_mod_init(peers: &state::Peers) {
             kind: 5,
             state: 1,
             resolver_status: 1,
-            export_count: 2,
+            export_count: 1,
             generation: load.generation,
             pinned: true,
             ..state::Entry::EMPTY
@@ -260,13 +259,9 @@ pub unsafe extern "C" fn r4os_rust_mod_init(peers: &state::Peers) {
         e.path_len = copy(b"builtin:", &mut e.path);
         e.path_len += copy(unsafe { bytes(meta.name) }, &mut e.path[e.path_len..]);
         e.exports[0].used = true;
-        e.exports[0].version = 1;
-        e.exports[0].address = meta.query;
-        e.exports[0].name_len = copy(b"Query", &mut e.exports[0].name);
-        e.exports[1].used = true;
-        e.exports[1].version = 2;
-        e.exports[1].address = ptr::from_ref(query2) as u64;
-        e.exports[1].name_len = copy(b"Query2", &mut e.exports[1].name);
+        e.exports[0].version = 2;
+        e.exports[0].address = ptr::from_ref(query2) as u64;
+        e.exports[0].name_len = copy(b"Query2", &mut e.exports[0].name);
         unsafe { ptr::write(p, e) };
         let committed = unsafe { state::r4os_rust_mod_commit(&mut load, peers) };
         unsafe { state::r4os_rust_mod_abort(&mut load, peers) };
@@ -436,7 +431,7 @@ pub unsafe extern "C" fn r4os_rust_mod_export_info(
         if unsafe { bytes(symbol) }.eq_ignore_ascii_case(b"Query2") {
             core::mem::size_of::<crate::contract::generation2::R4LQuery2>() as u32
         } else {
-            crate::contract::r4l_query_struct_size
+            return false;
         }
     } else {
         if index >= view.section_count || index >= 16 {
@@ -517,10 +512,9 @@ pub unsafe extern "C" fn r4os_rust_mod_resources(
 }
 const _: () = {
     use core::mem::{offset_of, size_of};
-    assert!(size_of::<Platform>() == 32);
+    assert!(size_of::<Platform>() == 24);
     assert!(offset_of!(Platform, name) == 0);
     assert!(offset_of!(Platform, group) == 16);
-    assert!(offset_of!(Platform, query) == 24);
     assert!(size_of::<ExportInfo>() == 24);
     assert!(offset_of!(ExportInfo, address) == 0);
     assert!(offset_of!(ExportInfo, version) == 8);
@@ -544,27 +538,6 @@ unsafe fn mod_log(op: u8, value: u64, data: *const u8, len: usize) {
 }
 
 use crate::{build_config::config as kernel_config, contract as platform_contract};
-const fn platform_queries() -> [platform_contract::R4LQuery; kernel_config::PLATFORM_API_COUNT] {
-    let mut out = [const {
-        platform_contract::R4LQuery {
-            magic: platform_contract::r4l_abi_magic,
-            abi_version: platform_contract::r4l_abi_version,
-            size: platform_contract::r4l_query_struct_size,
-            group: 0,
-            kernel_bridge: 0,
-            reserved: 0,
-        }
-    }; kernel_config::PLATFORM_API_COUNT];
-    let mut i = 0;
-    while i < out.len() {
-        out[i].group = kernel_config::PLATFORM_APIS[i].1;
-        i += 1;
-    }
-    out
-}
-static PLATFORM_QUERIES: [platform_contract::R4LQuery; kernel_config::PLATFORM_API_COUNT] =
-    platform_queries();
-
 const fn platform_queries2()
 -> [platform_contract::generation2::R4LQuery2; kernel_config::PLATFORM_API_COUNT] {
     let mut out = [const {
@@ -597,7 +570,6 @@ unsafe fn mod_platform(index: usize, out: *mut Platform) -> bool {
                 len: name.len(),
             },
             group,
-            query: core::ptr::addr_of!(PLATFORM_QUERIES[index]) as u64,
         });
     }
     true

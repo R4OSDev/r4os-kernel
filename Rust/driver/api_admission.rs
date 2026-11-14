@@ -13,7 +13,6 @@ use crate::{
 };
 use core::{
     cell::UnsafeCell,
-    mem::MaybeUninit,
     ptr,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
@@ -418,36 +417,6 @@ pub unsafe extern "C" fn r4os_rust_driver_api_invoke_owned(
     let result = unsafe { handler(context) };
     r4os_rust_driver_api_leave();
     result
-}
-
-struct TableStorage {
-    value: UnsafeCell<MaybeUninit<a::DriverApi>>,
-    initialized: UnsafeCell<bool>,
-}
-// SAFETY: bootstrap/lifecycle owner initializes once from the fixed stateless
-// C callback template; its canonical table stays resident for every R4D call.
-unsafe impl Sync for TableStorage {}
-static TABLE: TableStorage = TableStorage {
-    value: UnsafeCell::new(MaybeUninit::uninit()),
-    initialized: UnsafeCell::new(false),
-};
-/// # Safety
-/// Fixed C callback template is valid under bootstrap/lifecycle admission.
-pub(crate) fn table() -> *mut a::DriverApi {
-    let value = TABLE.value.get().cast::<a::DriverApi>();
-    if !unsafe { *TABLE.initialized.get() } {
-        let input = super::api_callbacks::template();
-        assert!(
-            input.magic == 0x31495044
-                && input.version == a::driver_api_version
-                && input.size == core::mem::size_of::<a::DriverApi>() as u32
-        );
-        unsafe {
-            ptr::write(value, input);
-            *TABLE.initialized.get() = true;
-        }
-    }
-    value
 }
 
 static TABLE2: a::DriverApi2 = super::api_callbacks::template2();

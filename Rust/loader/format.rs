@@ -527,23 +527,6 @@ pub unsafe extern "C" fn r4os_rust_mod_reloc_record(
     unsafe { r4m::r4os_rust_r4m_decode(raw.as_ptr(), 24, out) };
     true
 }
-fn loaded_query(table: &[u8], version: u32) -> &'static [u8] {
-    if table.len() < 32 {
-        return b"query-range";
-    }
-    let size = le32(&table[8..]);
-    if version != 1
-        || le32(table) != 0x314c3452
-        || le32(&table[4..]) != 1
-        || size < 32
-        || size & 7 != 0
-        || size as usize > table.len()
-        || le64(&table[24..]) != 0
-    {
-        return b"query-header";
-    }
-    b""
-}
 fn loaded_query2(table: &[u8], version: u32) -> &'static [u8] {
     if table.len() < 24 {
         return b"query2-range";
@@ -588,9 +571,11 @@ fn loaded_interface(table: &[u8], version: u32, major: u16) -> &'static [u8] {
 }
 unsafe fn loaded_export(io: &LoadedExport) -> &'static [u8] {
     let name = unsafe { view(io.name) };
-    let query = names_equal(name, b"Query");
+    if names_equal(name, b"Query") {
+        return b"retired-platform-generation";
+    }
     let query2 = names_equal(name, b"Query2");
-    if !query && !query2 && !prefix(name) {
+    if !query2 && !prefix(name) {
         return b"";
     }
     if io.section_index as usize >= io.section_count || io.section_index as usize >= io.offset_count
@@ -611,9 +596,6 @@ unsafe fn loaded_export(io: &LoadedExport) -> &'static [u8] {
     let table = &image[runtime..runtime + available];
     if table.as_ptr() as usize & 7 != 0 {
         return b"alignment";
-    }
-    if query {
-        return loaded_query(table, io.version);
     }
     if query2 {
         return loaded_query2(table, io.version);

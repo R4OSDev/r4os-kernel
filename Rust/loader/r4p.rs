@@ -21,19 +21,7 @@ use core::{
 };
 const N: usize = 32;
 const DEP: usize = 16;
-#[derive(Clone, Copy)]
-enum Init {
-    Legacy(unsafe extern "C" fn(*const api::ProtocolApi) -> i32),
-    Current(unsafe extern "C" fn(*const api::ProtocolApi2) -> i32),
-}
-impl Init {
-    unsafe fn call(self) -> i32 {
-        match self {
-            Self::Legacy(entry) => unsafe { entry(ppi::r4os_rust_protocol_table()) },
-            Self::Current(entry) => unsafe { entry(ppi::table2()) },
-        }
-    }
-}
+type Init = unsafe extern "C" fn(*const api::ProtocolApi2) -> i32;
 type Shutdown = unsafe extern "C" fn() -> i32;
 type Query = unsafe extern "C" fn(*mut api::ProtocolStatus) -> i32;
 type Dispatch =
@@ -625,19 +613,10 @@ impl Prepared {
     }
     fn init(&self) -> Option<Init> {
         let (generation, address) = loader::prepared_init(&self.value)?;
-        Some(match generation {
-            1 => Init::Legacy(unsafe {
-                mem::transmute::<usize, unsafe extern "C" fn(*const api::ProtocolApi) -> i32>(
-                    address as usize,
-                )
-            }),
-            2 => Init::Current(unsafe {
-                mem::transmute::<usize, unsafe extern "C" fn(*const api::ProtocolApi2) -> i32>(
-                    address as usize,
-                )
-            }),
-            _ => return None,
-        })
+        if generation != 2 {
+            return None;
+        }
+        Some(unsafe { mem::transmute::<usize, Init>(address as usize) })
     }
     fn commit(&mut self) -> Option<usize> {
         let slot = unsafe { image::r4os_rust_mod_commit(&mut self.value, &self.peers) };
@@ -891,7 +870,7 @@ fn init_module(index: usize) {
             mutate(slot, 1, 0, -5, b"execution scope unavailable");
             return;
         };
-        unsafe { init.call() }
+        unsafe { init(ppi::table2()) }
     };
     super::performance::add_r4p_init_ticks(start);
     if result != 0 {

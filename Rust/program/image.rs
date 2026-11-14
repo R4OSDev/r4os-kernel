@@ -329,7 +329,8 @@ fn imports(
     resolved: &mut [Resolved],
     seeds: &mut [ImportSeed],
 ) -> bool {
-    if r.header.import_count as usize > resolved.len()
+    if generation != 2
+        || r.header.import_count as usize > resolved.len()
         || r.header.import_count as usize > seeds.len()
     {
         return false;
@@ -350,11 +351,7 @@ fn imports(
             return false;
         }
         let platform = unsafe { modules::r4os_rust_mod_platform_group(span(module)) };
-        let query = if generation == 2 {
-            b"Query2".as_slice()
-        } else {
-            b"Query".as_slice()
-        };
+        let query = b"Query2".as_slice();
         if (platform != u64::MAX || symbol == b"Query" || symbol == b"Query2")
             && (symbol != query || v.min_version != u32::from(generation))
         {
@@ -418,11 +415,7 @@ fn imports(
             return false;
         }
         if symbol == query {
-            let table = if generation == 2 {
-                super::runtime_tables::interface2(group)
-            } else {
-                super::runtime_tables::interface(group)
-            } as u64;
+            let table = super::runtime_tables::interface2(group) as u64;
             if table != 0 {
                 seed.flags |= contract::r4xstart_import_flag_group_interface;
                 seed.table = table;
@@ -612,11 +605,7 @@ fn finish(
     }
     // The advertised generation must name the code actually entered, rather
     // than a second unrelated export. Old packager artifacts obey this too.
-    let expected = if generation == 2 {
-        b"R4XStart2".as_slice()
-    } else {
-        b"R4XStart".as_slice()
-    };
+    let expected = b"R4XStart2".as_slice();
     let mut matched = false;
     for index in 0..r.header.export_count as usize {
         let export = record::<r4m::ExportRecord>(r, index, 3, b"r4x-entry-export")?;

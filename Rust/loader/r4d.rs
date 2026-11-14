@@ -38,19 +38,7 @@ const FILE_MISSING: u8 = 3;
 const INVALID_FILE: u8 = 4;
 const INIT_FAILED: u8 = 5;
 const LOAD_FAILED: u8 = 6;
-#[derive(Clone, Copy)]
-enum Init {
-    Legacy(unsafe extern "C" fn(*const api::DriverApi) -> i32),
-    Current(unsafe extern "C" fn(*const api::DriverApi2) -> i32),
-}
-impl Init {
-    unsafe fn call(self) -> i32 {
-        match self {
-            Self::Legacy(entry) => unsafe { entry(admission::table()) },
-            Self::Current(entry) => unsafe { entry(admission::table2()) },
-        }
-    }
-}
+type Init = unsafe extern "C" fn(*const api::DriverApi2) -> i32;
 type Shutdown = unsafe extern "C" fn() -> i32;
 #[derive(Clone, Copy)]
 struct Name {
@@ -558,19 +546,10 @@ impl Prepared {
     }
     fn init(&self) -> Option<Init> {
         let (generation, address) = loader::prepared_init(&self.value)?;
-        Some(match generation {
-            1 => Init::Legacy(unsafe {
-                mem::transmute::<usize, unsafe extern "C" fn(*const api::DriverApi) -> i32>(
-                    address as usize,
-                )
-            }),
-            2 => Init::Current(unsafe {
-                mem::transmute::<usize, unsafe extern "C" fn(*const api::DriverApi2) -> i32>(
-                    address as usize,
-                )
-            }),
-            _ => return None,
-        })
+        if generation != 2 {
+            return None;
+        }
+        Some(unsafe { mem::transmute::<usize, Init>(address as usize) })
     }
     fn commit(&mut self) -> Option<usize> {
         let slot = unsafe { modules::r4os_rust_mod_commit(&mut self.value, &self.peers) };
@@ -761,7 +740,7 @@ fn init_module(slot: usize, source: u8) -> u8 {
     assert!(admission::configure_callbacks(owner, unsafe {
         (*p).parallel_callbacks
     }));
-    let result = unsafe { init.call() };
+    let result = unsafe { init(admission::table2()) };
     admission::r4os_rust_driver_api_leave();
     if result != 0 {
         log(b"[R4D] init failed code=");

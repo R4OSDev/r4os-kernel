@@ -10,35 +10,13 @@ unsafe fn bytes<'a>(data: *const u8, len: usize) -> &'a [u8] {
     }
 }
 
-fn start_state(metadata: &[u8]) -> u8 {
-    let mut current: usize = 0;
-    let mut unknown: usize = 0;
-    for item in metadata.split(|value| *value == 0) {
-        if item.starts_with(b"r4x.start=") {
-            if item == b"r4x.start=r4xstart" {
-                current += 1;
-            } else {
-                unknown += 1;
-            }
-        }
-    }
-    if current == 0 && unknown == 0 {
-        1 // missing
-    } else if current == 0 {
-        if unknown == 1 { 2 } else { 3 }
-    } else if unknown != 0 {
-        4 // conflicting
-    } else if current != 1 {
-        3 // duplicate
-    } else {
-        0 // valid
-    }
-}
-
 /// Export names distinguish incompatible generations; minimum revisions do not.
 pub(super) fn start_export(v1: &mut bool, v2: &mut bool, name: &[u8], revision: u32) -> bool {
     let (seen, expected) = match name {
-        b"R4XStart" => (v1, 1),
+        b"R4XStart" => {
+            *v1 = true;
+            return false;
+        }
         b"R4XStart2" => (v2, 2),
         _ => return true,
     };
@@ -50,11 +28,8 @@ pub(super) fn start_export(v1: &mut bool, v2: &mut bool, name: &[u8], revision: 
 }
 
 pub(super) fn start_generation(metadata: &[u8], v1: bool, v2: bool, exports: u32) -> Option<u8> {
-    if exports == 0 || v1 == v2 {
+    if exports == 0 || v1 || !v2 {
         return None;
-    }
-    if v1 {
-        return (start_state(metadata) == 0).then_some(1);
     }
     // New artifacts carry one complete, unambiguous SDK-owned start identity.
     for (key, expected) in [
@@ -71,25 +46,6 @@ pub(super) fn start_generation(metadata: &[u8], v1: bool, v2: bool, exports: u32
         }
     }
     Some(2)
-}
-
-/// # Safety
-/// The metadata pointer names the caller's resident bytes for this call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_program_start_state(data: *const u8, len: usize) -> u8 {
-    start_state(unsafe { bytes(data, len) })
-}
-
-/// # Safety
-/// The metadata pointer names the caller's resident bytes for this call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_program_start_accepts(
-    data: *const u8,
-    len: usize,
-    has_entry_export_v1: bool,
-    export_count: u32,
-) -> bool {
-    start_state(unsafe { bytes(data, len) }) == 0 && has_entry_export_v1 && export_count >= 1
 }
 
 /// # Safety
