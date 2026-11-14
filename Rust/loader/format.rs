@@ -535,8 +535,7 @@ fn loaded_query2(table: &[u8], version: u32) -> &'static [u8] {
     if version != 2
         || le32(table) != 0x324c3452
         || le32(&table[4..]) != 2
-        || size < 24
-        || size & 7 != 0
+        || size != 24
         || size as usize > table.len()
         || le32(&table[12..]) != 0
         || le64(&table[16..]) != 0
