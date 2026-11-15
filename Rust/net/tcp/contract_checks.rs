@@ -302,6 +302,32 @@ pub(crate) unsafe fn graceful_close_probe() -> bool {
         if !commit_sent(id, FLAG_ACK | FLAG_FIN, b"", 2) || !fin_waiting(id) || close_ready(id) {
             return false;
         }
+        let Some(fin) = plan_retransmit(id, RetransmitKind::Fin) else {
+            return false;
+        };
+        for _ in 0..2 {
+            let stale = probe_view(remote, c, (*c).ack, (*c).seq.wrapping_sub(1), FLAG_ACK, b"");
+            if apply_rx_view(stale).is_none()
+                || !fin_waiting(id)
+                || connection_identity(id).is_none()
+                || outstanding_count(id) != 1
+            {
+                return false;
+            }
+            let Some(retry) = plan_retransmit(id, RetransmitKind::Fin) else {
+                return false;
+            };
+            if retry.token != fin.token
+                || retry.seq != fin.seq
+                || retry.flags != fin.flags
+                || retry.sent_tick != fin.sent_tick
+                || retry.retransmits != fin.retransmits
+                || retry.payload_len != 0
+                || (*c).seq != fin.seq.wrapping_add(1)
+            {
+                return false;
+            }
+        }
         let ack = probe_view(remote, c, (*c).ack, (*c).seq, FLAG_ACK, b"");
         if apply_rx_view(ack).is_none() {
             return false;

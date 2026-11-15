@@ -107,7 +107,13 @@ pub(crate) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
                 }
             } else if c.state == State::FinWait && view.flags & FLAG_ACK != 0 {
                 update_tx_window(c, view);
-                if view.flags & FLAG_FIN != 0 && view.seq == c.ack {
+                let peer_fin =
+                    view.flags & FLAG_FIN != 0 && view.payload.len == 0 && view.seq == c.ack;
+                if view.ack != c.seq && !peer_fin {
+                    (*stats()).last_error = text(b"fin-unacked");
+                    return Some(view);
+                }
+                if peer_fin {
                     c.ack = c.ack.wrapping_add(1);
                 }
                 c.state = State::Closed;
