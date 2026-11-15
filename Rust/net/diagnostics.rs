@@ -1414,7 +1414,104 @@ fn corpus_udp() -> bool {
     if unsafe { io::udp_rx(ip_view(17, source, &data[..len]), false) }.is_some() {
         return false;
     }
-    udp_stats().checksum_errors > before
+    udp_stats().checksum_errors > before && corpus_udp_retained()
+}
+fn corpus_udp_retained() -> bool {
+    let local_mac = [2, 0, 0, 0, 0, 1];
+    let mut descriptor = adapters::NativeAdapter::EMPTY;
+    descriptor.name = Text::literal(b"diag-udp-retained");
+    descriptor.driver = Text::literal(b"diag");
+    descriptor.link = 2;
+    descriptor.mac = local_mac;
+    let index = unsafe { adapters::r4os_rust_net_adapter_register(&descriptor) };
+    if index == usize::MAX {
+        return false;
+    }
+    let _adapter = DiagnosticAdapter(index);
+    let mut error = MaybeUninit::uninit();
+    let handle = unsafe { udp_sockets::r4os_rust_udp_socket_bind(64235, error.as_mut_ptr()) };
+    if handle < 0 {
+        return false;
+    }
+    let _socket = UdpSocket(handle as u32);
+    let source = [203, 0, 113, 10];
+    let dest = config::settings().local_ip;
+    let mut datagram = [0; 1536];
+    let mut frame = [0; 1536];
+    // Queue different packet sizes, then overwrite all decoder inputs before
+    // draining. The socket must retain each exact message after RX returns.
+    for (port, payload) in [(1234, &[0xa5; 1024][..]), (1235, &b"next packet"[..])] {
+        let Some(len) = (unsafe {
+            io::build_udp(
+                builders::WireUdpBuild {
+                    source_ip: source,
+                    dest_ip: dest,
+                    source_port: port,
+                    dest_port: 64235,
+                },
+                payload.as_ptr(),
+                payload.len(),
+                datagram.as_mut_ptr(),
+                datagram.len(),
+            )
+        }) else {
+            return false;
+        };
+        let Some(len) = (unsafe {
+            io::build_ipv4(
+                builders::WireIpv4Build {
+                    source_mac: [2, 0, 0, 0, 0, 2],
+                    dest_mac: local_mac,
+                    source_ip: source,
+                    dest_ip: dest,
+                    protocol: 17,
+                },
+                datagram.as_ptr(),
+                len,
+                frame.as_mut_ptr(),
+                frame.len(),
+            )
+        }) else {
+            return false;
+        };
+        if !unsafe {
+            frames::r4os_rust_frames_receive(
+                index,
+                frame.as_ptr(),
+                len,
+                &super::rx_handoff::Metadata::default(),
+            )
+        } {
+            return false;
+        }
+        datagram.fill(0x33);
+        frame.fill(0x55);
+    }
+    let mut output = [0; 1024];
+    for (port, expected) in [(1234, &[0xa5; 1024][..]), (1235, &b"next packet"[..])] {
+        let mut info = MaybeUninit::uninit();
+        let received = unsafe {
+            udp_sockets::r4os_rust_udp_socket_recv(
+                handle as u32,
+                info.as_mut_ptr(),
+                output.as_mut_ptr(),
+                output.len(),
+                error.as_mut_ptr(),
+            )
+        };
+        if received != expected.len() as i32 || output[..expected.len()] != *expected {
+            return false;
+        }
+        let info = unsafe { info.assume_init() };
+        if info.source_ip != source
+            || info.dest_ip != dest
+            || info.source_port != port
+            || info.dest_port != 64235
+        {
+            return false;
+        }
+    }
+    true
 }
 struct RestoreDhcp {
     pending: bool,
@@ -1547,7 +1644,7 @@ fn corpus_probe() -> bool {
     if !corpus_tcp() {
         return false;
     }
-    cleanup::r4os_rust_net_note_packet_corpus(25);
+    cleanup::r4os_rust_net_note_packet_corpus(27);
     true
 }
 fn r4p_probe() -> bool {

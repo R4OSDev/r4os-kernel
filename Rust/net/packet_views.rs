@@ -1,7 +1,19 @@
-//! Private bounded owned payload messages. A returned view borrows its exact
-//! caller-owned message after transfer, rather than shared global scratch or
-//! the stack frame of a decoder that has already returned.
+//! Private payload messages and views of caller-retained wire operations.
+//! A view borrows its exact calling activation; asynchronous consumers still
+//! take their own bounded copy. Never use global or returned decoder scratch.
 use super::r4p_contract as wire;
+// The completed operation remains retained by the caller for the entire view.
+pub(super) fn ipv4_operation_view(op: &wire::Ipv4Op) -> super::ipv4::PacketView {
+    super::ipv4::PacketView {
+        protocol: op.protocol,
+        source_ip: op.source_ip,
+        dest_ip: op.dest_ip,
+        payload: crate::sched::sync_types::Text {
+            pointer: op.payload.as_ptr(),
+            len: (op.payload_len as usize).min(op.payload.len()),
+        },
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct OwnedIpv4Packet {

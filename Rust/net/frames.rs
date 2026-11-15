@@ -3,8 +3,9 @@
 //! span R4P/driver work. Network admission never spans callbacks or waits.
 use super::{
     adapters, app_ipv4, builders, cleanup, config, core_bytes, dhcp_client, dns_client, ethernet,
-    ipv4, packet_io as io, packet_views::OwnedIpv4Packet, protocol_stats as stats, rx_handoff,
-    rx_runtime, tcp_wire, transmit, udp_sockets,
+    ipv4, packet_io as io,
+    packet_views::{self, OwnedIpv4Packet},
+    protocol_stats as stats, rx_handoff, rx_runtime, tcp_wire, transmit, udp_sockets,
 };
 use crate::{build_config::config as build_config, memory::owner::Guard, sched::sync_types::Text};
 use core::{cell::UnsafeCell, mem::MaybeUninit, ptr};
@@ -176,8 +177,8 @@ fn send_arp(index: usize, target: [u8; 4]) -> u8 {
     unsafe { transmit(index, frame.as_ptr(), length) }
 }
 unsafe fn arp_reply(index: usize, data: *const u8, len: usize) {
-    if index >= count() || len < 42 || unsafe { io::ethernet_type(data, len) } != ethernet::TYPE_ARP
-    {
+    // The only caller already accepted this exact frame as Ethernet/ARP.
+    if index >= count() || len < 42 {
         return;
     }
     let mut header = [0; 42];
@@ -279,13 +280,12 @@ unsafe fn received(
         }
         return false;
     }
-    if !unsafe { io::ethernet_rx(mac(index), data, len) } {
+    let Some(kind) = (unsafe { io::ethernet_rx_type(mac(index), data, len) }) else {
         unsafe {
             adapters::r4os_rust_net_adapter_drop(index, ether_error());
         }
         return false;
-    }
-    let kind = unsafe { io::ethernet_type(data, len) };
+    };
     if kind == ethernet::TYPE_ARP {
         let before = arp_stats().cache_updates;
         unsafe {
@@ -308,13 +308,14 @@ unsafe fn received(
         return false;
     }
     if kind == ethernet::TYPE_IPV4 {
-        let Some(packet) = (unsafe { io::ipv4_rx(data, len) }) else {
+        let mut ipv4_operation = MaybeUninit::uninit();
+        let Some(packet) = (unsafe { io::ipv4_rx_in(data, len, &mut ipv4_operation) }) else {
             unsafe {
                 adapters::r4os_rust_net_adapter_drop(index, ip_error());
             }
             return false;
         };
-        let view = ip_view(&packet);
+        let view = packet_views::ipv4_operation_view(packet);
         assert!(len >= 12, "Accepted Ethernet header shape");
         let mut source_mac = [0; 6];
         unsafe {
@@ -336,7 +337,9 @@ unsafe fn received(
         let echo_request = unsafe { io::icmp_rx(view) };
         let l4 = metadata.l4_checksum_valid && (view.protocol == 17 || view.protocol == 6);
         rx_runtime::r4os_rust_net_rx_runtime_l4(view.protocol, l4);
-        if let Some(udp) = unsafe { io::udp_rx(view, l4) } {
+        let mut udp_operation = MaybeUninit::uninit();
+        if let Some(udp) = unsafe { io::udp_rx_in(view, l4, &mut udp_operation) } {
+            let payload_len = (udp.payload_len as usize).min(udp.payload.len());
             let info = udp_sockets::Info {
                 source_ip: udp.source_ip,
                 dest_ip: udp.dest_ip,
@@ -348,8 +351,8 @@ unsafe fn received(
             if unsafe {
                 udp_sockets::r4os_rust_udp_socket_dispatch(
                     &info,
-                    udp.data.as_ptr(),
-                    udp.payload_len,
+                    udp.payload.as_ptr(),
+                    payload_len,
                     reason.as_mut_ptr(),
                 )
             } {
@@ -361,14 +364,14 @@ unsafe fn received(
                 && !udp_sockets::r4os_rust_udp_socket_bound(udp.dest_port)
             {
                 unsafe {
-                    dhcp_client::r4os_rust_dhcp_client_message(udp.data.as_ptr(), udp.payload_len);
+                    dhcp_client::r4os_rust_dhcp_client_message(udp.payload.as_ptr(), payload_len);
                 }
             }
             if (udp.dest_port == 53 || udp.source_port == 53)
                 && !udp_sockets::r4os_rust_udp_socket_bound(udp.dest_port)
             {
                 unsafe {
-                    dns_client::r4os_rust_dns_client_response(udp.data.as_ptr(), udp.payload_len);
+                    dns_client::r4os_rust_dns_client_response(udp.payload.as_ptr(), payload_len);
                 }
             }
         }

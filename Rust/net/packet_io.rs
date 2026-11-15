@@ -1,6 +1,6 @@
-//! Original R4P packet I/O with native statistics and owned decoded payloads.
-//! Wire/protocol work and caller copies precede metadata publication. Packet
-//! views are formed only from a retained owned message in the calling frame.
+//! R4P packet I/O with native statistics and caller-retained wire operations.
+//! RX can borrow the completed operation; legacy owned-message bridges retain
+//! their bounded copy. No view outlives its exact storage in the calling frame.
 use super::ipv4::PacketView as NativeIpView;
 use super::{
     adapters, builders, config, core_bytes,
@@ -329,6 +329,9 @@ pub unsafe extern "C" fn r4os_rust_packet_build_tcp(
     unsafe { tcp_client::build(params, data, len, out, capacity) }.unwrap_or(usize::MAX)
 }
 pub(super) unsafe fn ethernet_rx(mac: [u8; 6], data: *const u8, len: usize) -> bool {
+    unsafe { ethernet_rx_type(mac, data, len) }.is_some()
+}
+pub(super) unsafe fn ethernet_rx_type(mac: [u8; 6], data: *const u8, len: usize) -> Option<u16> {
     let mut read_input = empty_input();
     read_input.own_mac = mac;
     let mut op = MaybeUninit::<wire::EthernetFrameOp>::uninit();
@@ -345,7 +348,7 @@ pub(super) unsafe fn ethernet_rx(mac: [u8; 6], data: *const u8, len: usize) -> b
     let report = unsafe { report.assume_init() };
     ethernet_report(report);
     if !report.completed {
-        return false;
+        return None;
     }
     let op = unsafe { op.assume_init() };
     unsafe {
@@ -354,7 +357,9 @@ pub(super) unsafe fn ethernet_rx(mac: [u8; 6], data: *const u8, len: usize) -> b
     if report.accepted {
         runtime::r4os_rust_net_note_ethernet_r4p_rx(1);
     }
-    report.accepted
+    report
+        .accepted
+        .then(|| u16::try_from(report.value).expect("Original EtherType bounds"))
 }
 pub(super) unsafe fn ethernet_tx(data: *const u8, len: usize) -> bool {
     let read_input = empty_input();
@@ -436,8 +441,22 @@ pub(super) unsafe fn arp_tx(data: *const u8, len: usize) {
     runtime::r4os_rust_net_note_arp_r4p_tx(1);
 }
 pub(super) unsafe fn ipv4_rx(data: *const u8, len: usize) -> Option<OwnedIpv4Packet> {
+    let mut op = MaybeUninit::uninit();
+    let op = unsafe { ipv4_rx_in(data, len, &mut op) }?;
+    let mut value = MaybeUninit::uninit();
+    unsafe {
+        packet_views::r4os_rust_wire_ipv4_view(op, value.as_mut_ptr());
+    }
+    Some(unsafe { value.assume_init() })
+}
+// The caller retains the operation through all consumers of its payload.
+// A failed/incomplete reader never exposes uninitialized output storage.
+pub(super) unsafe fn ipv4_rx_in(
+    data: *const u8,
+    len: usize,
+    op: &mut MaybeUninit<wire::Ipv4Op>,
+) -> Option<&wire::Ipv4Op> {
     let read_input = empty_input();
-    let mut op = MaybeUninit::<wire::Ipv4Op>::uninit();
     let mut report = MaybeUninit::<readers::WireReadReport>::uninit();
     unsafe {
         readers::r4os_rust_wire_read_ipv4_rx(
@@ -453,19 +472,15 @@ pub(super) unsafe fn ipv4_rx(data: *const u8, len: usize) -> Option<OwnedIpv4Pac
     if !report.completed {
         return None;
     }
-    let op = unsafe { op.assume_init() };
+    let op = unsafe { op.assume_init_ref() };
     unsafe {
-        stats::r4os_rust_net_ipv4_owned_rx(&op);
+        stats::r4os_rust_net_ipv4_owned_rx(op);
     }
     if !report.accepted {
         return None;
     }
     runtime::r4os_rust_net_note_ipv4_r4p_rx(1);
-    let mut value = MaybeUninit::uninit();
-    unsafe {
-        packet_views::r4os_rust_wire_ipv4_view(&op, value.as_mut_ptr());
-    }
-    Some(unsafe { value.assume_init() })
+    Some(op)
 }
 pub(super) unsafe fn ipv4_tx(data: *const u8, len: usize) -> Option<OwnedIpv4Packet> {
     let read_input = empty_input();
@@ -553,8 +568,22 @@ pub(super) unsafe fn icmp_tx(packet: NativeIpView) {
     }
 }
 pub(super) unsafe fn udp_rx(packet: NativeIpView, checksum: bool) -> Option<OwnedUdpPacket> {
+    let mut op = MaybeUninit::uninit();
+    let op = unsafe { udp_rx_in(packet, checksum, &mut op) }?;
+    let mut value = MaybeUninit::uninit();
+    unsafe {
+        packet_views::r4os_rust_wire_udp_view(op, value.as_mut_ptr());
+    }
+    Some(unsafe { value.assume_init() })
+}
+// The caller retains the operation through all consumers of its payload.
+// A failed/incomplete reader never exposes uninitialized output storage.
+pub(super) unsafe fn udp_rx_in(
+    packet: NativeIpView,
+    checksum: bool,
+    op: &mut MaybeUninit<wire::UdpOp>,
+) -> Option<&wire::UdpOp> {
     let read_input = input(packet, checksum);
-    let mut op = MaybeUninit::<wire::UdpOp>::uninit();
     let mut report = MaybeUninit::<readers::WireReadReport>::uninit();
     unsafe {
         readers::r4os_rust_wire_read_udp_rx(
@@ -570,19 +599,15 @@ pub(super) unsafe fn udp_rx(packet: NativeIpView, checksum: bool) -> Option<Owne
     if !report.completed {
         return None;
     }
-    let op = unsafe { op.assume_init() };
+    let op = unsafe { op.assume_init_ref() };
     unsafe {
-        stats::r4os_rust_net_udp_owned_rx(&op);
+        stats::r4os_rust_net_udp_owned_rx(op);
     }
     if !report.accepted {
         return None;
     }
     runtime::r4os_rust_net_note_udp_r4p_rx(1);
-    let mut value = MaybeUninit::uninit();
-    unsafe {
-        packet_views::r4os_rust_wire_udp_view(&op, value.as_mut_ptr());
-    }
-    Some(unsafe { value.assume_init() })
+    Some(op)
 }
 pub(super) unsafe fn udp_tx(packet: NativeIpView) -> Option<OwnedUdpPacket> {
     let read_input = input(packet, false);
