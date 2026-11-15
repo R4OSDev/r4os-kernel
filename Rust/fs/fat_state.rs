@@ -512,9 +512,9 @@ pub(super) unsafe fn fat_entry(v: Volume, c: u32) -> Option<u32> {
     }
 }
 pub fn alloc_end(v: Volume) -> u32 {
-    let fat = v.sectors_per_fat * SECTOR as u32 / 4;
-    let data = v.total_clusters() + 2;
-    if data >= 2 && data < fat { data } else { fat }
+    let fat = u64::from(v.sectors_per_fat) * SECTOR as u64 / 4;
+    let data = u64::from(v.total_clusters()) + 2;
+    u32::try_from(data.min(fat).min(u64::from(RESERVED))).expect("bounded FAT capacity")
 }
 #[inline(never)]
 pub(super) unsafe fn device(index: usize) -> Option<block_registry::CacheView> {
