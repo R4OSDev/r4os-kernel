@@ -21,6 +21,8 @@ pub type Handler = unsafe extern "C" fn(u8, usize) -> u32;
 struct Entry {
     lifetime: Lifetime,
     shared: bool,
+    flags: u32,
+    deferred: bool,
     handler: Option<Handler>,
     context: usize,
     owner: u32,
@@ -29,6 +31,8 @@ impl Entry {
     const EMPTY: Self = Self {
         lifetime: Lifetime::EMPTY,
         shared: false,
+        flags: 0,
+        deferred: false,
         handler: None,
         context: 0,
         owner: 0,
@@ -199,6 +203,10 @@ fn enable(irq: u8, flags: u32) -> bool {
             unsafe { (*stats(index)).masked = 0 };
             return true;
         }
+        if flags & 8 != 0 {
+            // Never silently turn deferred level service into an edge route.
+            return false;
+        }
         if ioapic::r4os_rust_ioapic_control(2, irq, false) {
             if irq < 16 {
                 pic::unmask(irq);
@@ -208,7 +216,7 @@ fn enable(irq: u8, flags: u32) -> bool {
         }
         return false;
     }
-    if irq < 16 {
+    if irq < 16 && flags & 8 == 0 {
         pic::unmask(irq);
         unsafe { (*stats(index)).masked = 0 };
         return true;
@@ -224,6 +232,11 @@ fn disable(irq: u8) {
     unsafe { (*stats(irq as usize)).masked = 1 };
 }
 fn register_inner(irq: u8, handler: Handler, context: usize, flags: u32, owner: u32) -> i32 {
+    // Deferred service masks the whole physical line. It requires one owned
+    // level-low handler; sharing, MSI and the PIC cascade cannot use it.
+    if flags & 8 != 0 && (flags != 10 || owner == 0 || kernel_owned(irq) || irq == 2) {
+        return -1;
+    }
     let shared = flags & 1 != 0;
     let index = irq as usize;
     let mut free = None;
@@ -241,7 +254,9 @@ fn register_inner(irq: u8, handler: Handler, context: usize, flags: u32, owner: 
             return if e.owner != owner {
                 -2
             } else if e.lifetime.active {
-                0
+                // Idempotence cannot silently exchange deferred service for
+                // an ordinary registration with the same callback identity.
+                if (e.flags ^ flags) & 8 != 0 { -2 } else { 0 }
             } else {
                 -6
             };
@@ -264,6 +279,8 @@ fn register_inner(irq: u8, handler: Handler, context: usize, flags: u32, owner: 
         entry(index, slot).write(Entry {
             lifetime: Lifetime::new(generation),
             shared,
+            flags,
+            deferred: false,
             handler: Some(handler),
             context,
             owner,
@@ -324,7 +341,7 @@ fn cleanup_inner(owner: u32, remove: bool) -> Cleanup {
                 continue;
             }
             unsafe { (*entry(index, slot)).lifetime.retire() };
-            busy |= e.lifetime.in_flight;
+            busy |= e.lifetime.in_flight || (remove && e.deferred);
             changed = true;
         }
         if changed {
@@ -391,10 +408,44 @@ pub unsafe extern "C" fn r4os_rust_irq_router_unregister(
         }
         // Never wait under runtime or a caller's device/lifecycle lock.
         // Nonzero preserves the caller's context; retry completes removal.
-        result = if e.lifetime.in_flight {
+        result = if e.lifetime.in_flight || e.deferred {
             -3
         } else {
             unsafe { entry(index, slot).write(Entry::EMPTY) };
+            0
+        };
+        break;
+    }
+    runtime::restore_runtime(saved);
+    result
+}
+/// Acknowledge completed deferred device service. A withdrawn registration
+/// can discharge its debt, but never regains hardware admission. Identity,
+/// owner and the admitted callback's actual return are checked under Runtime.
+pub(crate) fn rearm(irq: u8, handler: Handler, context: usize, owner: u32) -> i32 {
+    if irq as usize >= MAX_IRQS || owner == 0 || in_dispatch() {
+        return -1;
+    }
+    let saved = runtime::save_runtime();
+    let mut result = -2;
+    for slot in 0..MAX_HANDLERS {
+        let e = unsafe { entry(irq as usize, slot).read() };
+        if !e.lifetime.occupied()
+            || e.owner != owner
+            || !e.handler.is_some_and(|h| h as usize == handler as usize)
+            || e.context != context
+            || e.flags & 8 == 0
+        {
+            continue;
+        }
+        result = if e.lifetime.in_flight {
+            -3
+        } else if !e.deferred {
+            0
+        } else if e.lifetime.active && !enable(irq, e.flags) {
+            -5
+        } else {
+            unsafe { (*entry(irq as usize, slot)).deferred = false };
             0
         };
         break;
@@ -523,7 +574,7 @@ pub(crate) unsafe fn dispatch_observed(irq: u8, rip: u64) {
     let saved = runtime::save_runtime();
     let generations: [u64; MAX_HANDLERS] = core::array::from_fn(|slot| {
         let e = unsafe { entry(index, slot).read() };
-        if e.lifetime.active {
+        if e.lifetime.active && !e.deferred {
             e.lifetime.generation
         } else {
             0
@@ -573,7 +624,7 @@ pub(crate) unsafe fn dispatch_observed(irq: u8, rip: u64) {
         }
         let saved = runtime::save_runtime();
         let e = unsafe { entry(index, slot).read() };
-        if !e.lifetime.active || e.lifetime.generation != generation {
+        if !e.lifetime.active || e.deferred || e.lifetime.generation != generation {
             runtime::restore_runtime(saved);
             continue;
         }
@@ -629,6 +680,12 @@ pub(crate) unsafe fn dispatch_observed(irq: u8, rip: u64) {
         };
         let saved = runtime::save_runtime();
         scheduler::irq_leave_owned(guard);
+        if e.flags & 8 != 0 && last_result & 2 != 0 {
+            // Mask before releasing the callback flight and before the
+            // architecture's EOI. The task performs the device's real ACK.
+            disable(irq);
+            unsafe { (*entry(index, slot)).deferred = true };
+        }
         unsafe { (*entry(index, slot)).lifetime.finish(generation) };
         if config::ENABLE_METRICS {
             unsafe {

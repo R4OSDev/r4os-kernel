@@ -139,6 +139,15 @@ pub(super) unsafe extern "C" fn driver_irq_stats(irq: u8, out: *mut IrqStats) ->
     unsafe { crate::driver::irq_router::r4os_rust_irq_router_stats(irq, false, out.cast()) }
 }
 
+pub(super) unsafe extern "C" fn driver_irq_rearm(
+    irq: u8,
+    handler: unsafe extern "C" fn(u8, usize) -> u32,
+    context: usize,
+) -> i32 {
+    let owner = super::api_admission::r4os_rust_driver_api_runtime_owner(true);
+    super::irq_router::rearm(irq, handler, context, owner)
+}
+
 pub(super) unsafe extern "C" fn driver_tick_count() -> u64 {
     crate::platform::timer::tick_count()
 }
@@ -335,5 +344,6 @@ pub(super) const fn template2() -> DriverApi2 {
         register_audio_output_epoch: Some(crate::driver::api_audio::register_output_epoch),
         register_audio_capture_backend: Some(crate::driver::api_audio::register_capture2),
         audio_output_progress: Some(crate::driver::api_audio::output_progress),
+        irq_rearm: Some(super::api_callbacks::driver_irq_rearm),
     }
 }
