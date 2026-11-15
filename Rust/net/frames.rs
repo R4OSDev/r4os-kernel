@@ -220,7 +220,7 @@ unsafe fn arp_reply(index: usize, data: *const u8, len: usize) {
     }
 }
 unsafe fn echo_reply(index: usize, data: *const u8, len: usize, packet: ipv4::PacketView) {
-    if index >= count() || len < 14 {
+    if index >= count() || len < 14 || packet.protocol != 1 {
         return;
     }
     let mut dest_mac = [0; 6];
@@ -332,8 +332,8 @@ unsafe fn received(
         };
         unsafe {
             app_ipv4::r4os_rust_app_ipv4_enqueue(&info, view.payload.pointer, view.payload.len);
-            io::icmp_rx(view);
         }
+        let echo_request = unsafe { io::icmp_rx(view) };
         let l4 = metadata.l4_checksum_valid && (view.protocol == 17 || view.protocol == 6);
         rx_runtime::r4os_rust_net_rx_runtime_l4(view.protocol, l4);
         if let Some(udp) = unsafe { io::udp_rx(view, l4) } {
@@ -375,7 +375,7 @@ unsafe fn received(
         unsafe {
             tcp_wire::rx(view, l4);
         }
-        if unsafe { io::icmp_echo(view.payload.pointer, view.payload.len) } {
+        if echo_request {
             unsafe {
                 echo_reply(index, data, len, view);
             }

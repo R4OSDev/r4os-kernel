@@ -499,7 +499,7 @@ pub(super) unsafe fn ipv4_tx(data: *const u8, len: usize) -> Option<OwnedIpv4Pac
     }
     Some(unsafe { value.assume_init() })
 }
-pub(super) unsafe fn icmp_rx(packet: NativeIpView) {
+pub(super) unsafe fn icmp_rx(packet: NativeIpView) -> bool {
     let read_input = input(packet, false);
     let mut op = MaybeUninit::<wire::IcmpOp>::uninit();
     let mut report = MaybeUninit::<readers::WireReadReport>::uninit();
@@ -515,7 +515,7 @@ pub(super) unsafe fn icmp_rx(packet: NativeIpView) {
     let report = unsafe { report.assume_init() };
     icmp_report(report);
     if !report.completed {
-        return;
+        return false;
     }
     let op = unsafe { op.assume_init() };
     unsafe {
@@ -524,6 +524,7 @@ pub(super) unsafe fn icmp_rx(packet: NativeIpView) {
     if report.accepted {
         runtime::r4os_rust_net_note_icmp_r4p_rx(1);
     }
+    report.accepted && report.value != 0
 }
 pub(super) unsafe fn icmp_tx(packet: NativeIpView) {
     let read_input = input(packet, false);

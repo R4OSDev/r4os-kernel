@@ -1,4 +1,4 @@
-//! Existing network diagnostic bodies, unchanged assertions and case counts.
+//! Existing network diagnostics, original assertions and bounded regressions.
 //! Fixtures retire only their own handles/adapters; no metadata/TCP owner spans
 //! packet dispatch, callbacks, waiting, console output or another owner.
 use super::{
@@ -1190,7 +1190,186 @@ fn corpus_icmp() -> bool {
     unsafe {
         io::icmp_rx(packet);
     }
-    icmp_stats().checksum_errors > before
+    icmp_stats().checksum_errors > before && corpus_echo_protocol()
+}
+fn icmp_runtime() -> protocol_runtime::ProtocolRuntimeStats {
+    let mut out = MaybeUninit::uninit();
+    // Slot3 is the existing ICMP member of the original eight-role inventory.
+    unsafe {
+        protocol_runtime::r4os_rust_net_protocol_runtime(3, out.as_mut_ptr());
+        out.assume_init()
+    }
+}
+unsafe extern "C" fn corpus_echo_transmit(_: usize, _: usize, data: *const u8, len: usize) -> u8 {
+    // Synchronous fixture callback; the caller retains these exact bytes.
+    let frame = unsafe { slice::from_raw_parts(data, len) };
+    if len < 34 || frame[12..14] != [8, 0] {
+        return 6;
+    }
+    if frame[23] != 1 {
+        return 0;
+    }
+    let total = usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+    if frame[14] != 0x45
+        || total != 36
+        || len < 14 + total
+        || bytes::internet_checksum(&frame[14..34]) != 0
+    {
+        return 6;
+    }
+    let payload = &frame[34..14 + total];
+    if payload[..2] != [0, 0]
+        || payload[4..8] != [0x23, 0x45, 0, 7]
+        || payload[8..] != *b"R4OSPING"
+        || bytes::internet_checksum(payload) != 0
+    {
+        return 6;
+    }
+    0
+}
+fn corpus_echo_protocol() -> bool {
+    let local_mac = [2, 0, 0, 0, 0, 1];
+    let remote_mac = [2, 0, 0, 0, 0, 2];
+    let mut descriptor = adapters::NativeAdapter::EMPTY;
+    descriptor.name = Text::literal(b"diag-echo-protocol");
+    descriptor.driver = Text::literal(b"diag");
+    descriptor.link = 2;
+    descriptor.mac = local_mac;
+    descriptor.ops.transmit = Some(corpus_echo_transmit);
+    let index = unsafe { adapters::r4os_rust_net_adapter_register(&descriptor) };
+    if index == usize::MAX {
+        return false;
+    }
+    let _adapter = DiagnosticAdapter(index);
+    let dest = config::settings().local_ip;
+    // A valid UDP datagram from2048 with checksum disabled also has ICMP sum0.
+    let udp = [8, 0, 0xf7, 0xf7, 0, 8, 0, 0];
+    let mut tcp = [0; 64];
+    // Make the pseudo-header sumffff, so a valid TCP checksum also gives
+    // checksum0 over just the segment. Its source port still begins08 00.
+    let mut sum = 0xc000u32
+        + u32::from(u16::from_be_bytes([dest[0], dest[1]]))
+        + u32::from(u16::from_be_bytes([dest[2], dest[3]]))
+        + 6
+        + 20;
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    let low = !(sum as u16);
+    let tcp_source = [192, 0, (low >> 8) as u8, low as u8];
+    let Some(tcp_len) = (unsafe {
+        tcp_client::build(
+            builders::WireTcpBuild {
+                source_ip: tcp_source,
+                dest_ip: dest,
+                source_port: 2048,
+                dest_port: 63480,
+                seq: 1,
+                ack: 0,
+                flags: tcp::FLAG_SYN,
+                window: 1024,
+                options: 0,
+            },
+            ptr::null(),
+            0,
+            tcp.as_mut_ptr(),
+            tcp.len(),
+        )
+    }) else {
+        return false;
+    };
+    if tcp_len != 20 || bytes::internet_checksum(&tcp[..tcp_len]) != 0 {
+        return false;
+    }
+    for (protocol, source, payload) in [
+        (17, [203, 0, 113, 10], &udp[..]),
+        (6, tcp_source, &tcp[..tcp_len]),
+        (99, [203, 0, 113, 10], &udp[..]),
+    ] {
+        let before = icmp_runtime();
+        let mut frame = [0; 128];
+        let Some(len) = (unsafe {
+            io::build_ipv4(
+                builders::WireIpv4Build {
+                    source_mac: remote_mac,
+                    dest_mac: local_mac,
+                    source_ip: source,
+                    dest_ip: dest,
+                    protocol,
+                },
+                payload.as_ptr(),
+                payload.len(),
+                frame.as_mut_ptr(),
+                frame.len(),
+            )
+        }) else {
+            return false;
+        };
+        if !unsafe {
+            frames::r4os_rust_frames_receive(
+                index,
+                frame.as_ptr(),
+                len,
+                &super::rx_handoff::Metadata::default(),
+            )
+        } {
+            return false;
+        }
+        let after = icmp_runtime();
+        if after.r4p_rx != before.r4p_rx
+            || after.r4p_classify != before.r4p_classify
+            || after.r4p_build != before.r4p_build
+        {
+            return false;
+        }
+    }
+    let mut payload = [0; 32];
+    let Some(payload_len) = (unsafe {
+        io::build_icmp_request(
+            builders::WireIcmpBuild {
+                ident: 0x2345,
+                seq: 7,
+            },
+            payload.as_mut_ptr(),
+            payload.len(),
+        )
+    }) else {
+        return false;
+    };
+    let before = icmp_runtime();
+    let transmitted = adapter(index).stats.tx_packets;
+    let mut frame = [0; 128];
+    let Some(len) = (unsafe {
+        io::build_ipv4(
+            builders::WireIpv4Build {
+                source_mac: remote_mac,
+                dest_mac: local_mac,
+                source_ip: [203, 0, 113, 10],
+                dest_ip: dest,
+                protocol: 1,
+            },
+            payload.as_ptr(),
+            payload_len,
+            frame.as_mut_ptr(),
+            frame.len(),
+        )
+    }) else {
+        return false;
+    };
+    if !unsafe {
+        frames::r4os_rust_frames_receive(
+            index,
+            frame.as_ptr(),
+            len,
+            &super::rx_handoff::Metadata::default(),
+        )
+    } {
+        return false;
+    }
+    let after = icmp_runtime();
+    after.r4p_rx == before.r4p_rx + 1
+        && after.r4p_build == before.r4p_build + 1
+        && after.r4p_classify == before.r4p_classify
+        && adapter(index).stats.tx_packets == transmitted + 1
 }
 fn corpus_udp() -> bool {
     let source = [10, 0, 2, 2];
@@ -1368,7 +1547,7 @@ fn corpus_probe() -> bool {
     if !corpus_tcp() {
         return false;
     }
-    cleanup::r4os_rust_net_note_packet_corpus(21);
+    cleanup::r4os_rust_net_note_packet_corpus(25);
     true
 }
 fn r4p_probe() -> bool {
