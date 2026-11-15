@@ -38,6 +38,27 @@ pub(crate) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
         }
         if let Some(c) = match_connection(view) {
             let c = &mut *c;
+            if matches!(c.state, State::Established | State::FinWait) && view.flags & FLAG_ACK != 0
+            {
+                let reason = if !segment_seq_acceptable(c, view) {
+                    Some(b"seq-stale".as_slice())
+                } else if tcp_runtime::seq_after(view.ack, c.seq) {
+                    Some(b"ack-unsent".as_slice())
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    c.rx_drops = c.rx_drops.saturating_add(1);
+                    (*stats()).rx_drops += 1;
+                    (*stats()).last_error = text(reason);
+                    // Publish only an immediate reply intent under this owner.
+                    // Existing transport work runs after the owner is released.
+                    c.delayed_ack_pending = true;
+                    c.delayed_ack_immediate = true;
+                    c.delayed_ack_deadline = 0;
+                    return Some(view);
+                }
+            }
             if c.state == State::SynSent
                 && view.flags & (FLAG_SYN | FLAG_ACK) == FLAG_SYN | FLAG_ACK
                 && view.ack == c.seq.wrapping_add(1)
@@ -61,7 +82,8 @@ pub(crate) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
                 (*stats()).accepts += 1;
                 (*stats()).last_error = text(b"accepted");
             } else if c.state == State::Established {
-                if (view.payload.len != 0 || view.flags & FLAG_FIN != 0)
+                if view.flags & FLAG_ACK == 0
+                    && (view.payload.len != 0 || view.flags & FLAG_FIN != 0)
                     && !segment_seq_acceptable(c, view)
                 {
                     c.rx_drops = c.rx_drops.saturating_add(1);

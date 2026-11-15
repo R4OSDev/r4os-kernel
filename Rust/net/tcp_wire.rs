@@ -133,7 +133,7 @@ pub(super) unsafe fn rx(packet: NativeIpView, checksum: bool) {
                 tcp_client::send(id, tcp::FLAG_SYN | tcp::FLAG_ACK, b"".as_ptr(), 0);
             }
         }
-    } else if (parsed.payload.len != 0 || parsed.flags & tcp::FLAG_FIN != 0)
+    } else if (parsed.payload.len != 0 || parsed.flags & (tcp::FLAG_FIN | tcp::FLAG_ACK) != 0)
         && parsed.flags & tcp::FLAG_RST == 0
         && let Some(id) = id
         && unsafe {

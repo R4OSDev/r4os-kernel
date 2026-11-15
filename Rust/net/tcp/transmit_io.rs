@@ -215,6 +215,9 @@ pub(crate) unsafe fn request_ack(
         };
         let c = &mut *c;
         if view.payload.len == 0 && view.flags & FLAG_FIN == 0 {
+            if c.delayed_ack_pending && c.delayed_ack_immediate {
+                return AckRequest::Immediate;
+            }
             return AckRequest::None;
         }
         let immediate = view.flags & FLAG_FIN != 0

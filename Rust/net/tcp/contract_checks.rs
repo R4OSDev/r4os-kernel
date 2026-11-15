@@ -604,6 +604,128 @@ pub(crate) unsafe fn performance_contract_probe() -> bool {
             return false;
         }
         (*stats()).self_tests = (*stats()).self_tests.wrapping_add(1);
+        ack_validity_probe()
+    }
+}
+
+// Reject ACKs for unsent bytes and pure ACKs outside the receive window before
+// mutating the retained send state. Check serial ordering across u32 wrap too.
+unsafe fn ack_validity_probe() -> bool {
+    unsafe {
+        let remote = [198, 51, 100, 97];
+        for initial in [0x9000u32, 0xffff_fff0] {
+            let raw = begin_live_connect(remote, 65097, initial);
+            if raw <= 0 {
+                return false;
+            }
+            let id = raw as u32;
+            let _end = ProbeEnd { id, abort: true };
+            if !commit_sent(id, FLAG_SYN, b"", 1) {
+                return false;
+            }
+            let Some(c) = by_id(id) else {
+                return false;
+            };
+            let handshake = probe_view(
+                remote,
+                c,
+                0xa000,
+                initial.wrapping_add(1),
+                FLAG_SYN | FLAG_ACK,
+                b"",
+            );
+            if apply_rx_view(handshake).is_none() || !established(id) {
+                return false;
+            }
+            let bytes = [0x5a; 40];
+            if !commit_sent(id, FLAG_ACK | FLAG_PSH, &bytes, 2) {
+                return false;
+            }
+            let Some(before) = plan_retransmit(id, RetransmitKind::Data) else {
+                return false;
+            };
+            let before_ack = (*c).tx_ack;
+            let before_window = (*c).tx_window;
+            let before_seq = (*c).seq;
+            let before_rx = (*c).ack;
+            let next_token = (*c).sent.next_token;
+            for (seq, ack) in [
+                (before_rx, before_seq.wrapping_add(1000)),
+                (before_rx.wrapping_sub(1), before_seq),
+                (before_rx.wrapping_add(rx_free(&*c) as u32 + 1), before_seq),
+            ] {
+                let mut rejected = probe_view(remote, c, seq, ack, FLAG_ACK, b"");
+                rejected.window = 0;
+                if apply_rx_view(rejected).is_none()
+                    || (*c).state != State::Established
+                    || (*c).tx_ack != before_ack
+                    || (*c).tx_window != before_window
+                    || (*c).seq != before_seq
+                    || (*c).ack != before_rx
+                    || (*c).sent.next_token != next_token
+                    || outstanding_count(id) != 1
+                    || outstanding_bytes(id) != bytes.len()
+                {
+                    return false;
+                }
+                let Some(after) = plan_retransmit(id, RetransmitKind::Data) else {
+                    return false;
+                };
+                if after.token != before.token
+                    || after.seq != before.seq
+                    || after.ack != before.ack
+                    || after.flags != before.flags
+                    || after.sent_tick != before.sent_tick
+                    || after.retransmits != before.retransmits
+                    || after.payload_len != before.payload_len
+                    || after.payload_storage != before.payload_storage
+                    || request_ack(id, before_rx, rejected, 10, 5) != AckRequest::Immediate
+                {
+                    return false;
+                }
+                let Some(reply) = plan_send(id, FLAG_ACK) else {
+                    return false;
+                };
+                if reply.seq != before_seq || reply.ack != before_rx {
+                    return false;
+                }
+                note_ack_sent(id, false, reply.rx_window);
+            }
+            let partial = probe_view(
+                remote,
+                c,
+                before_rx,
+                before.seq.wrapping_add(10),
+                FLAG_ACK,
+                b"",
+            );
+            if apply_rx_view(partial).is_none()
+                || outstanding_count(id) != 1
+                || outstanding_bytes(id) != 30
+                || (*c).tx_ack != partial.ack
+                || request_ack(id, before_rx, partial, 20, 5) != AckRequest::None
+            {
+                return false;
+            }
+            let Some(tail) = plan_retransmit(id, RetransmitKind::Data) else {
+                return false;
+            };
+            if tail.seq != partial.ack
+                || tail.payload_len != 30
+                || tail.payload_storage[..30] != bytes[10..]
+            {
+                return false;
+            }
+            let full = probe_view(remote, c, before_rx, before_seq, FLAG_ACK, b"");
+            if apply_rx_view(full).is_none()
+                || outstanding_count(id) != 0
+                || outstanding_bytes(id) != 0
+                || (*c).tx_ack != before_seq
+                || request_ack(id, before_rx, full, 21, 5) != AckRequest::None
+            {
+                return false;
+            }
+        }
         true
     }
 }
