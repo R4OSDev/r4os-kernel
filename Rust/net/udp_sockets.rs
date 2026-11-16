@@ -139,6 +139,14 @@ unsafe fn by_port(port: u16) -> Option<usize> {
             .position(|s| s.active && s.port == port)
     }
 }
+
+/// Read-only acknowledgment for a retained boot-unique handle. Failure to
+/// acquire the exact owner is unknown, never proof of absence.
+pub(super) fn exists(handle: u32) -> Option<bool> {
+    let _guard = Guard::acquire()?;
+    Some(unsafe { by_handle(handle).is_some() })
+}
+
 unsafe fn bind(port: u16) -> (i32, Text) {
     unsafe {
         if port == 0 {

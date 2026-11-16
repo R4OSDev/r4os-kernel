@@ -1544,3 +1544,14 @@ unsafe fn program_service_boot(op: u8, name: Bytes, stage: Bytes) {
         }
     }
 }
+
+/// # Safety
+/// Caller retains exclusive complete handle output for this snapshot call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_program_service_client(
+    handle: u32,
+    request_id: u32,
+    out: *mut c::ProgramProcessHandle,
+) -> i32 {
+    unsafe { crate::service::endpoint::client(handle, request_id, out) }
+}

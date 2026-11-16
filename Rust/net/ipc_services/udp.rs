@@ -27,6 +27,9 @@ pub(super) fn handle_udp_result_operation(
     id: u32,
     payload: &[u8],
 ) -> i32 {
+    if op == OP_UDP_STATUS_RESULT {
+        return socket_presence_reply(response, channel, op, id, payload);
+    }
     if op == crate::contract::network_op_recv {
         return truncated_datagram_reply(response, channel, op, id, payload);
     }
@@ -43,6 +46,53 @@ pub(super) fn handle_udp_result_operation(
         RESULT_OK,
         &payload_buf[..base + result.data.len()],
     )
+}
+
+/// Provider-only read-only handle presence; no datagram consumption or close.
+/// The original UDP result record carries the exact queried kernel identity.
+fn socket_presence_reply(
+    response: &mut [u8],
+    channel: u32,
+    op: u16,
+    id: u32,
+    payload: &[u8],
+) -> i32 {
+    let mut out = UdpServiceResult {
+        action: UDP_ACTION_CLOSE,
+        ..UdpServiceResult::EMPTY
+    };
+    if payload.len() != 4 {
+        udp_bad_request_result(&mut out);
+    } else {
+        out.handle = read_u32(payload, 0);
+        out.flags |= UDP_FLAG_HANDLE_VALID;
+        match super::super::udp_sockets::exists(out.handle) {
+            Some(true) => {
+                out.result = 0;
+                out.flags |= UDP_FLAG_OK;
+                set_udp_service_status(&mut out, Status::Ok);
+                copy_bounded(&mut out.last_error, b"socket-present".as_slice());
+                out.lifecycle_cause = SOCKET_LIFECYCLE_ACTIVE_PUBLIC;
+                out.flags |= UDP_FLAG_LIFECYCLE_VALID;
+            }
+            Some(false) => {
+                out.result = -1;
+                set_udp_service_status(&mut out, Status::Failed);
+                copy_bounded(&mut out.last_error, b"socket-absent".as_slice());
+                out.lifecycle_cause = SOCKET_LIFECYCLE_BAD_HANDLE_PUBLIC;
+                out.flags |= UDP_FLAG_LIFECYCLE_VALID;
+            }
+            None => {
+                out.result = RESULT_BAD_SERVICE;
+                set_udp_service_status(&mut out, Status::Failed);
+                copy_bounded(&mut out.last_error, b"socket-unknown".as_slice());
+            }
+        }
+    }
+    fill_udp_result_status(&mut out);
+    let mut body = [0; TCP_MESSAGE_PAYLOAD_MAX];
+    let size = out.encode(&mut body);
+    write_response(response, channel, op, id, RESULT_OK, &body[..size])
 }
 
 /// Private new NIPC recv: exact6byte handle/capacity request; original fixed
@@ -505,6 +555,12 @@ pub(super) fn write_udp_close(w: &mut Writer<'_>, payload: &[u8]) {
 /// Existing explicit NETWORK LIMIT case only. The caller owns both bound
 /// sockets and presents an empty receiver; all predecessor errors are real.
 pub(super) fn status_contract_probe(sender: u32, receiver: u32, port: u16) -> bool {
+    if super::super::udp_sockets::exists(sender) != Some(true)
+        || super::super::udp_sockets::exists(receiver) != Some(true)
+        || super::super::udp_sockets::exists(u32::MAX) != Some(false)
+    {
+        return false;
+    }
     let mut info: super::super::udp_sockets::Info = unsafe { core::mem::zeroed() };
     let mut data = [0u8; 2];
     if net::udp_recv_from(receiver, &mut info, &mut data) != 0

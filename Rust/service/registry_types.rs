@@ -187,6 +187,7 @@ pub struct RequestSlot {
     pub response_available: WaitQueue,
     pub request_payload: [u8; 4096],
     pub response_payload: [u8; 4096],
+    pub client_process: c::ProgramProcessHandle,
 }
 impl RequestSlot {
     pub const EMPTY: Self = Self {
@@ -201,6 +202,11 @@ impl RequestSlot {
         response_available: WaitQueue::EMPTY,
         request_payload: [0; 4096],
         response_payload: [0; 4096],
+        client_process: c::ProgramProcessHandle {
+            instance_id: 0,
+            reserved: 0,
+            generation: 0,
+        },
     };
 }
 impl Default for RequestSlot {
@@ -543,7 +549,8 @@ const _: () = {
     assert!(core::mem::offset_of!(RequestSlot, response_available) == 32);
     assert!(core::mem::offset_of!(RequestSlot, request_payload) == 112);
     assert!(core::mem::offset_of!(RequestSlot, response_payload) == 4208);
-    assert!(core::mem::size_of::<RequestSlot>() == 8304);
+    assert!(core::mem::offset_of!(RequestSlot, client_process) == 8304);
+    assert!(core::mem::size_of::<RequestSlot>() == 8320);
     assert!(core::mem::align_of::<RequestSlot>() == 8);
     assert!(core::mem::offset_of!(Endpoint, lock) == 0);
     assert!(core::mem::offset_of!(Endpoint, generation) == 168);
@@ -576,7 +583,7 @@ const _: () = {
     assert!(core::mem::offset_of!(Endpoint, queued_slots) == 1016);
     assert!(core::mem::offset_of!(Endpoint, queued_count) == 1080);
     assert!(core::mem::offset_of!(Endpoint, queue) == 1088);
-    assert!(core::mem::size_of::<Endpoint>() == 67552);
+    assert!(core::mem::size_of::<Endpoint>() == 67680);
     assert!(core::mem::align_of::<Endpoint>() == 8);
     assert!(core::mem::offset_of!(PerformanceSummary, max_services) == 0);
     assert!(core::mem::offset_of!(PerformanceSummary, used_services) == 4);

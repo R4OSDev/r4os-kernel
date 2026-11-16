@@ -95,6 +95,8 @@ fn configure_sys2() {
             as *const () as usize) as u64,
         service_endpoint_poll: (super::platform_callbacks::sys_service_endpoint_poll as *const ()
             as usize) as u64,
+        service_endpoint_client: (crate::program::service_api::r4os_rust_program_service_client
+            as *const () as usize) as u64,
         service_endpoint_recv: (crate::program::service_api::r4os_rust_program_service_recv
             as *const () as usize) as u64,
         service_endpoint_reply: (crate::program::service_api::r4os_rust_program_service_reply

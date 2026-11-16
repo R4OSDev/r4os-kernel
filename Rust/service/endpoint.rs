@@ -100,6 +100,7 @@ pub(super) unsafe fn reset_slot(p: *mut RequestSlot) {
         (*p).state = REQUEST_FREE;
         (*p).request_id = 0;
         (*p).client_id = 0;
+        (*p).client_process = c::ProgramProcessHandle::default();
         (*p).op = 0;
         (*p).flags = 0;
         (*p).request_len = 0;
@@ -330,9 +331,29 @@ unsafe fn clear_header(out: *mut c::ServiceMessageHeader) {
         });
     }
 }
+// The original execution context is present for both direct calls and Async
+// continuations. Copy it before endpoint ownership, never reopen a numeric ID.
+#[derive(Clone, Copy)]
+struct Client {
+    id: u32,
+    process: c::ProgramProcessHandle,
+}
+impl Client {
+    unsafe fn capture(id: u32) -> Self {
+        let mut process = c::ProgramProcessHandle::default();
+        if !unsafe { crate::program::context::r4os_rust_program_context_handle(&mut process) }
+            || process.instance_id != id
+            || process.reserved != 0
+            || process.generation == 0
+        {
+            process = c::ProgramProcessHandle::default();
+        }
+        Self { id, process }
+    }
+}
 unsafe fn publish(
     ep: *mut Endpoint,
-    client: u32,
+    client: Client,
     op: u16,
     data: Bytes,
     deadline: Option<u64>,
@@ -347,7 +368,8 @@ unsafe fn publish(
         let id = allocate_request(ep, reg::NEXT_REQUEST.as_ptr());
         reset_slot(s);
         (*s).request_id = id;
-        (*s).client_id = client;
+        (*s).client_id = client.id;
+        (*s).client_process = client.process;
         (*s).op = op;
         (*s).flags = (*ep).flags;
         (*s).request_len = data.len as u16;
@@ -384,6 +406,7 @@ unsafe fn publish(
 }
 pub(super) unsafe fn submit(handle: u32, client: u32, op: u16, data: Bytes) -> i32 {
     unsafe {
+        let client = Client::capture(client);
         if op == 0 {
             return c::service_api_result_invalid;
         }
@@ -412,7 +435,7 @@ pub(super) unsafe fn leave_unwind(unwind: *mut task_context::Unwind) {
 }
 unsafe fn publish_guarded(
     ep: *mut Endpoint,
-    client: u32,
+    client: Client,
     op: u16,
     data: Bytes,
     output: *mut task_context::Unwind,
@@ -422,7 +445,7 @@ unsafe fn publish_guarded(
 }
 unsafe fn publish_guarded_at(
     ep: *mut Endpoint,
-    client: u32,
+    client: Client,
     op: u16,
     data: Bytes,
     output: *mut task_context::Unwind,
@@ -467,6 +490,7 @@ pub(crate) unsafe fn submit_async(
     output: *mut task_context::Unwind,
 ) -> i32 {
     unsafe {
+        let client = Client::capture(client);
         if op == 0 {
             return c::service_api_result_invalid;
         }
@@ -506,6 +530,7 @@ pub(super) unsafe fn submit_wait(
     output: *mut task_context::Unwind,
 ) -> i32 {
     unsafe {
+        let client = Client::capture(client);
         if !output.is_null() {
             output.write(task_context::Unwind::EMPTY);
         }
@@ -632,6 +657,30 @@ pub(super) unsafe fn recv(
         (*s).state = REQUEST_DELIVERED;
         (*ep).max_active_workers = (*ep).max_active_workers.max(counts(ep).delivered);
         len as i32
+    }
+}
+/// Copy only the original identity of a still-delivered native request.
+/// No endpoint owner or resident borrow spans the pageable caller output.
+pub(crate) unsafe fn client(handle: u32, id: u32, out: *mut c::ProgramProcessHandle) -> i32 {
+    unsafe {
+        if out.is_null() || id == 0 {
+            return c::service_api_result_invalid;
+        }
+        let value = {
+            let Some(lease) = reg::lock_handle(handle, 4) else {
+                return c::service_api_result_bad_handle;
+            };
+            let Some(index) = find_request(lease.endpoint, id, Some(REQUEST_DELIVERED)) else {
+                return c::service_api_result_not_found;
+            };
+            let value = (*slot(lease.endpoint, index)).client_process;
+            if value.instance_id == 0 || value.reserved != 0 || value.generation == 0 {
+                return c::service_api_result_invalid;
+            }
+            value
+        };
+        out.write(value);
+        c::service_api_result_ok
     }
 }
 pub(super) unsafe fn reply(handle: u32, id: u32, status: i32, data: Bytes) -> i32 {

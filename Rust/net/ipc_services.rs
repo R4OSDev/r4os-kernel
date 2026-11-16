@@ -508,6 +508,11 @@ fn handle(channel: u32, request: &[u8], response: &mut [u8]) -> i32 {
         return handle_tcp_result_operation(response, channel, op, id, payload, client);
     }
     if channel == 5 && op == OP_UDP_STATUS_RESULT {
+        // Empty is the unchanged global status. The provider-only exact
+        // handle query returns the existing UDP operation result record.
+        if !payload.is_empty() {
+            return handle_udp_result_operation(response, channel, op, id, payload);
+        }
         return wire_reply(
             response,
             &mut scratch,
