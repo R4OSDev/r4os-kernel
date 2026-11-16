@@ -284,7 +284,14 @@ pub fn index_header(s: &[u8]) -> Option<IndexHeader> {
         allocated_size: le32(s, 8),
         flags: s[12],
     };
-    if h.entries_offset < 16 || h.index_length < h.entries_offset {
+    if h.entries_offset < 16
+        || !h.entries_offset.is_multiple_of(8)
+        || !h.index_length.is_multiple_of(8)
+        || h.index_length < h.entries_offset
+        || h.allocated_size < h.index_length
+        || h.allocated_size as usize > s.len()
+        || h.flags & !1 != 0
+    {
         None
     } else {
         Some(h)
@@ -329,17 +336,22 @@ pub fn index_entry(s: &[u8], state: &mut IteratorState) -> Option<IndexEntry> {
         return None;
     }
     let base = state.offset;
-    if base + 16 > s.len() {
+    if base > s.len() || s.len() - base < 16 {
         state.done = true;
         return None;
     }
     let length = le16(s, base + 8);
-    if length < 16 || base + usize::from(length) > s.len() {
+    if length < 16 || !length.is_multiple_of(8) || usize::from(length) > s.len() - base {
         state.done = true;
         return None;
     }
     let key_length = le16(s, base + 10);
     let flags = le16(s, base + 12);
+    let trailer = if flags & 1 != 0 { 8 } else { 0 };
+    if flags & !3 != 0 || 16 + usize::from(key_length) + trailer > usize::from(length) {
+        state.done = true;
+        return None;
+    }
     let key = if key_length > 0 {
         if 16 + usize::from(key_length) > usize::from(length) {
             state.done = true;
@@ -370,6 +382,27 @@ pub fn index_entry(s: &[u8], state: &mut IteratorState) -> Option<IndexEntry> {
         has_sub_node_vcn: flags & 1 != 0,
         sub_node_vcn: node,
     })
+}
+/// Validate the entire $I30 node before a writer uses raw offsets or moves bytes.
+/// A valid prefix is insufficient: even an early match must not hide a broken tail.
+pub fn directory_index_entries(s: &[u8], children: bool) -> bool {
+    let mut it = IteratorState::default();
+    while let Some(entry) = index_entry(s, &mut it) {
+        if entry.has_sub_node_vcn != children {
+            return false;
+        }
+        if entry.flags & 2 != 0 {
+            return entry.key_length == 0 && it.offset == s.len();
+        }
+        // The parser returned a bounded view of the still-borrowed input.
+        let Some(name) = file_name(unsafe { entry.key.get() }) else {
+            return false;
+        };
+        if name.name_length == 0 {
+            return false;
+        }
+    }
+    false // A missing/truncated end entry is corruption, not an empty directory.
 }
 pub fn volume_info(s: &[u8]) -> Option<VolumeInformation> {
     if s.len() < 12 {

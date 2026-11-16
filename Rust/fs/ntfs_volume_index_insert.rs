@@ -94,6 +94,13 @@ pub(super) unsafe fn root_insert(v: Volume, dir: u64, entry: View) -> WriteStatu
 #[inline(never)]
 pub(super) unsafe fn push_down(v: Volume, dir: u64) -> WriteStatus {
     unsafe {
+        // Validate before allocating or publishing an index allocation/bitmap.
+        let Some(h) = r::load(v, dir, v.record()) else {
+            return WriteStatus::Io;
+        };
+        if idx::Root::locate(r::view(v.record()), h).is_none() {
+            return WriteStatus::Invalid;
+        }
         let Some(vcn) = allocation::allocate(v, dir) else {
             return WriteStatus::NoSpace;
         };

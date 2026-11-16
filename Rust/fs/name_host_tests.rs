@@ -144,3 +144,142 @@ fn vfat_pairs_cross_slots_and_long_names_never_become_aliases() {
     assert!(!fat_names::short_equals(&raw, "\u{e4}".as_bytes()));
     assert!(fat_names::make_entry(&raw, &fat_names::Lfn::EMPTY, 0, 0).is_none());
 }
+
+fn index_put16(s: &mut [u8], at: usize, value: u16) {
+    s[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+fn index_put32(s: &mut [u8], at: usize, value: u32) {
+    s[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+fn index_entries(units: usize, children: bool) -> Vec<u8> {
+    let key = 0x42 + units * 2;
+    let length = (16 + key + 7) & !7;
+    let length = length + if children { 8 } else { 0 };
+    let mut s = vec![0; length + if children { 24 } else { 16 }];
+    index_put16(&mut s, 8, length as u16);
+    index_put16(&mut s, 10, key as u16);
+    index_put16(&mut s, 12, u16::from(children));
+    s[0x50] = units as u8;
+    for i in 0..units {
+        s[0x52 + i * 2] = b'A';
+    }
+    index_put16(&mut s, length + 8, if children { 24 } else { 16 });
+    index_put16(&mut s, length + 12, if children { 3 } else { 2 });
+    s
+}
+
+#[test]
+fn ntfs_index_entries_require_progress_whole_names_and_terminal_tail() {
+    use ntfs_format_records as fmt;
+    for children in [false, true] {
+        for units in [1, 255] {
+            let s = index_entries(units, children);
+            assert!(fmt::directory_index_entries(&s, children));
+            assert!(!fmt::directory_index_entries(&s, !children));
+            for cut in 0..s.len() {
+                assert!(!fmt::directory_index_entries(&s[..cut], children));
+            }
+        }
+    }
+    let original = index_entries(1, false);
+    for (at, value) in [
+        (8, 0),
+        (8, 8),
+        (8, 87),
+        (8, 65528),
+        (10, 0),
+        (10, 65),
+        (10, 89),
+        (12, 4),
+        (12, 1),
+        (88 + 8, 0),
+        (88 + 10, 1),
+        (88 + 12, 0),
+    ] {
+        let mut bad = original.clone();
+        index_put16(&mut bad, at, value);
+        let unchanged = bad.clone();
+        assert!(
+            !fmt::directory_index_entries(&bad, false),
+            "offset {at}, value {value}"
+        );
+        assert_eq!(bad, unchanged);
+    }
+    let mut bad = original.clone();
+    bad[0x50] = 255;
+    assert!(!fmt::directory_index_entries(&bad, false));
+    bad[0x50] = 0;
+    assert!(!fmt::directory_index_entries(&bad, false));
+    // A valid first match cannot hide a malformed later entry.
+    let mut tail = original[..88].to_vec();
+    tail.extend_from_slice(&bad);
+    assert!(!fmt::directory_index_entries(&tail, false));
+    // The child VCN is not part of the key, even when both fit the entry.
+    let mut child = index_entries(1, true);
+    index_put16(&mut child, 10, 80);
+    assert!(!fmt::directory_index_entries(&child, true));
+    let mut it = ntfs_format_types::IteratorState {
+        offset: usize::MAX,
+        ..Default::default()
+    };
+    assert!(fmt::index_entry(&original, &mut it).is_none());
+    assert!(it.done);
+}
+
+#[test]
+fn ntfs_index_headers_and_fixed_up_block_end_stay_bounded() {
+    use ntfs_format_records as fmt;
+    let entries = index_entries(1, false);
+    let mut root = vec![0; 32 + entries.len()];
+    index_put32(&mut root, 0, 0x30);
+    index_put32(&mut root, 4, 1);
+    index_put32(&mut root, 8, 4096);
+    index_put32(&mut root, 16, 16);
+    index_put32(&mut root, 20, 16 + entries.len() as u32);
+    index_put32(&mut root, 24, 16 + entries.len() as u32);
+    root[32..].copy_from_slice(&entries);
+    assert!(fmt::index_root(&root).is_some());
+    for cut in 0..root.len() {
+        assert!(fmt::index_root(&root[..cut]).is_none());
+    }
+    for (at, value) in [
+        (16, 0),
+        (16, 17),
+        (16, u32::MAX),
+        (20, 8),
+        (20, 121),
+        (20, u32::MAX),
+        (24, 119),
+        (24, u32::MAX),
+        (28, 2),
+    ] {
+        let mut bad = root.clone();
+        index_put32(&mut bad, at, value);
+        assert!(fmt::index_root(&bad).is_none());
+    }
+    let mut block = vec![0; 4096];
+    let start = block.len() - entries.len();
+    index_put32(&mut block, 0, 0x58444e49);
+    index_put16(&mut block, 4, 0x28);
+    index_put16(&mut block, 6, 9);
+    index_put32(&mut block, 24, (start - 24) as u32);
+    index_put32(&mut block, 28, 4096 - 24);
+    index_put32(&mut block, 32, 4096 - 24);
+    block[start..].copy_from_slice(&entries);
+    for corruption in [0, 1, 2] {
+        let mut wire = block.clone();
+        if corruption == 1 {
+            index_put16(&mut wire, start + 8, 0);
+        }
+        if corruption == 2 {
+            wire[start + 0x50] = 255;
+        }
+        assert_eq!(fmt::fixup(&mut wire, Some(1)), 0);
+        assert_eq!(fmt::fixup(&mut wire, None), 0); // valid USA, deliberately bad index
+        let parsed = fmt::index_block(&wire).expect("bounded INDX header");
+        assert_eq!(
+            fmt::directory_index_entries(unsafe { parsed.entries.get() }, false),
+            corruption == 0
+        );
+    }
+}

@@ -1,4 +1,4 @@
-//! Original direct/cached INDX I/O and private raw entry geometry.
+//! Validated direct/cached INDX I/O and private raw entry geometry.
 use super::{
     ntfs_format_records as fmt, ntfs_format_types::*, ntfs_volume_edit as edit,
     ntfs_volume_io as io, ntfs_volume_records as r, ntfs_volume_types::*,
@@ -23,7 +23,7 @@ pub(super) unsafe fn load_into(v: Volume, runs: io::Runs, vcn: u64, out: Buffer)
         if !io::runs(v.io, runs, offset, b, None, ptr::null_mut()) {
             return false;
         }
-        fmt::fixup(r::mutable(b), None) == 0
+        fmt::fixup(r::mutable(b), None) == 0 && valid_block(r::view(b), vcn)
     }
 }
 pub(super) unsafe fn load(v: Volume, runs: io::Runs, vcn: u64) -> bool {
@@ -39,7 +39,7 @@ pub(super) unsafe fn cached(v: Volume, dir: u64, runs: io::Runs, vcn: u64) -> bo
                 cache.lookup_index(dir, vcn, r::mutable(b))
             })
         {
-            return true;
+            return valid_block(r::view(b), vcn);
         }
         if !load(v, runs, vcn) {
             return false;
@@ -61,6 +61,9 @@ pub(super) unsafe fn store_from(
 ) -> bool {
     unsafe {
         let b = r::part(buffer, 0, v.index_block_bytes as usize);
+        if !valid_block(r::view(b), vcn) {
+            return false;
+        }
         let usn = le16(r::view(b), usize::from(le16(r::view(b), 4)));
         if fmt::fixup(r::mutable(b), Some(usn)) != 0 {
             return false;
@@ -85,6 +88,21 @@ pub(super) unsafe fn store_from(
 pub(super) unsafe fn store(v: Volume, dir: u64, runs: io::Runs, vcn: u64) -> bool {
     unsafe { store_from(v, dir, runs, vcn, block(v)) }
 }
+fn valid_block(bytes: &[u8], vcn: u64) -> bool {
+    let Some(block) = fmt::index_block(bytes) else {
+        return false;
+    };
+    let usa = usize::from(le16(bytes, 4));
+    let count = usize::from(le16(bytes, 6));
+    let start = 24 + le32(bytes, 24) as usize;
+    block.vcn == vcn
+        && usa >= 0x28
+        && count == bytes.len() / 512 + 1
+        && usa + count * 2 <= start
+        && fmt::directory_index_entries(unsafe { block.entries.get() }, has_children(bytes))
+}
+// Callers only traverse a fully validated Root/load/cached node or entries
+// constructed from one. Mutations preserve the terminal entry and alignment.
 pub fn entry_len(bytes: &[u8], pos: usize) -> usize {
     le16(bytes, pos + 8) as usize
 }
@@ -148,12 +166,41 @@ pub struct Root {
 }
 impl Root {
     pub fn locate(record: &[u8], h: FileRecordHeader) -> Option<Self> {
-        let span = edit::find(record, h, 0x90, &I30)?;
-        let offset = le16(record, span.offset + 0x14) as usize;
-        Some(Self {
-            span,
-            value_offset: offset,
-            header_at: span.offset + offset + 16,
-        })
+        let record = record.get(..h.bytes_in_use as usize)?;
+        let mut position = usize::from(h.attrs_offset);
+        loop {
+            let at = position;
+            let attr = fmt::attribute(record, &mut position)?;
+            if attr.attr_type != 0x90 || unsafe { attr.name.get() } != I30 {
+                continue;
+            }
+            if attr.non_resident {
+                return None;
+            }
+            let offset = usize::from(le16(record, at + 0x14));
+            let name_offset = usize::from(le16(record, at + 10));
+            if name_offset < 0x18 || offset < name_offset + I30.len() {
+                return None;
+            }
+            // Parser views remain bounded by this immutable record borrow.
+            let root = fmt::index_root(unsafe { attr.value.get() })?;
+            if root.indexed_attr_type != 0x30
+                || root.collation_rule != 1
+                || !fmt::directory_index_entries(
+                    unsafe { root.entries.get() },
+                    root.header.flags & 1 != 0,
+                )
+            {
+                return None;
+            }
+            return Some(Self {
+                span: edit::Span {
+                    offset: at,
+                    length: attr.length as usize,
+                },
+                value_offset: offset,
+                header_at: at + offset + 16,
+            });
+        }
     }
 }

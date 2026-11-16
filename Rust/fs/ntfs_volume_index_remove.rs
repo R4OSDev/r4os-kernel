@@ -344,7 +344,10 @@ pub(super) unsafe fn eliminate(v: Volume, dir: u64, first: u64) -> WriteStatus {
             }
             if !parent.is_end {
                 if parent.in_root {
-                    if r::load(v, dir, v.record()).is_none()
+                    let Some(h) = r::load(v, dir, v.record()) else {
+                        return WriteStatus::Io;
+                    };
+                    if idx::Root::locate(r::view(v.record()), h).is_none()
                         || !copy_plain(v, v.record(), parent.pos)
                     {
                         return WriteStatus::Io;
