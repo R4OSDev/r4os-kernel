@@ -422,8 +422,11 @@ pub unsafe extern "C" fn r4os_rust_wire_dns_dispatch(
 ) -> bool {
     unsafe { dns_dispatch(opcode, op, flags) }
 }
+pub(super) fn activate_tcp() -> bool {
+    unsafe { r4p::r4os_rust_r4p_has_active(role(b"net.tcp")) }
+}
 pub(super) fn new_tcp_op() -> Option<wire::TcpOp> {
-    if unsafe { r4p::r4os_rust_r4p_has_active(role(b"net.tcp")) } {
+    if activate_tcp() {
         Some(wire::TcpOp::default())
     } else {
         None

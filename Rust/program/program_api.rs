@@ -405,15 +405,17 @@ pub unsafe extern "C" fn r4os_rust_program_api_window(
             super::gui_pointer::associate(gui, owner, old, value, source);
             let pointer_changed = before_pointer != super::gui_pointer::revision();
             (*gui).window_info.window_id = value;
-            AtomicBool::from_ptr(ptr::addr_of_mut!((*gui).start_attach_pending))
-                .store(false, Ordering::Release);
+            let attached = AtomicBool::from_ptr(ptr::addr_of_mut!((*gui).start_attach_pending))
+                .swap(false, Ordering::AcqRel);
             if old != value {
                 registry::epoch();
             }
             drop(_guard);
             drop(_registry);
-            if pointer_changed {
+            if attached || pointer_changed {
                 super::gui_activity::signal(gui);
+            }
+            if pointer_changed {
                 crate::service::desktop_events::r4os_rust_desktop_signal();
             }
             0

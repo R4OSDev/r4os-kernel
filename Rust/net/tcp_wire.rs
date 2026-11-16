@@ -2,7 +2,7 @@
 //! A segment view borrows this activation's owned wire record. That record
 //! stays in the same frame through native TCP operations and any send/wait.
 use super::{
-    ipv4, protocol_runtime, r4p_contract as wire, readers, tcp, tcp_client, tcp_rto,
+    ipv4, operations, protocol_runtime, r4p_contract as wire, readers, tcp, tcp_client, tcp_rto,
     tcp_runtime::ConnectionIdentity, timing,
 };
 use crate::sched::sync_types::Text;
@@ -83,6 +83,16 @@ fn bad_view() {
     }
 }
 pub(super) unsafe fn rx(packet: NativeIpView, checksum: bool) {
+    // Cold activation can perform filesystem I/O and VM release. Complete it
+    // before reserving the nested TCP wire records on the 64-KB RX stack.
+    // The ordinary decoder retains its original failure reporting and checks.
+    if packet.protocol == 6 {
+        let _ = operations::activate_tcp();
+    }
+    unsafe { rx_active(packet, checksum) };
+}
+#[inline(never)]
+unsafe fn rx_active(packet: NativeIpView, checksum: bool) {
     let Some(op) = (unsafe { decode(packet, false, checksum) }) else {
         return;
     };
@@ -166,6 +176,13 @@ pub(super) unsafe fn rx(packet: NativeIpView, checksum: bool) {
     }
 }
 pub(super) unsafe fn tx(packet: NativeIpView) {
+    if packet.protocol == 6 {
+        let _ = operations::activate_tcp();
+    }
+    unsafe { tx_active(packet) };
+}
+#[inline(never)]
+unsafe fn tx_active(packet: NativeIpView) {
     let Some(op) = (unsafe { decode(packet, true, false) }) else {
         return;
     };

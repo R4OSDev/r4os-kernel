@@ -368,14 +368,7 @@ unsafe fn main(shell: bool) -> ! {
         if (*instance).app_class == 1 && pending(instance) {
             AtomicU64::from_ptr(ptr::addr_of_mut!((*STATE.0.get()).attach_wait_events))
                 .fetch_add(1, Ordering::Relaxed);
-        }
-        while (*instance).app_class == 1 && pending(instance) {
-            if AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).close_requested))
-                .load(Ordering::Acquire)
-            {
-                break;
-            }
-            threads::yield_task();
+            super::gui_activity::await_attachment(instance);
         }
         let code = call(instance);
         boot_detail(report, b"SERVMAN: Programmende");

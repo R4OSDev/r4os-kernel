@@ -13,6 +13,7 @@ use crate::{
     },
     service::desktop_events,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::{cell::UnsafeCell, ffi::c_void, ptr};
 
 #[repr(C)]
@@ -228,6 +229,65 @@ struct Observation {
     channel: *mut Channel,
     sequence: u64,
 }
+
+struct Attachment {
+    instance: *mut super::registry_types::ProgramInstance,
+    channel: *mut Channel,
+}
+
+unsafe extern "C" fn attachment_pending(raw: *mut c_void) -> bool {
+    unsafe {
+        let observation = &*raw.cast::<Attachment>();
+        let instance = observation.instance;
+        !(*observation.channel).queue.core.closing
+            && AtomicBool::from_ptr(ptr::addr_of_mut!(
+                (*super::payload::gui(instance)).start_attach_pending
+            ))
+            .load(Ordering::Acquire)
+            && !AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).close_requested))
+                .load(Ordering::Acquire)
+            && !AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).done)).load(Ordering::Acquire)
+    }
+}
+
+/// # Safety
+/// The exact main-thread execution pin retains this GUI and its resident
+/// channel until entry/retirement. Association and close publish to this same
+/// channel; Runtime checks the predicate and enrolls the waiter atomically.
+pub(super) unsafe fn await_attachment(instance: *mut super::registry_types::ProgramInstance) {
+    let Some(_operation) = threads::Operation::enter() else {
+        return;
+    };
+    let mut observation = Attachment {
+        instance,
+        channel: unsafe { ptr::addr_of_mut!((*super::payload::gui(instance)).activity) },
+    };
+    loop {
+        let flags = runtime::save_runtime();
+        if !unsafe { attachment_pending(ptr::from_mut(&mut observation).cast()) } {
+            runtime::restore_runtime(flags);
+            return;
+        }
+        let mut request = WaitRequest::predicate(
+            u64::MAX,
+            Text::literal(b"gui-attach"),
+            attachment_pending,
+            ptr::from_mut(&mut observation).cast(),
+        );
+        request.flags = flags;
+        request.consume_runtime = true;
+        let result = unsafe {
+            sync_wait::r4os_rust_sync_wait(
+                ptr::addr_of_mut!((*observation.channel).queue),
+                &request,
+            )
+        };
+        if result != 1 {
+            return;
+        }
+    }
+}
+
 unsafe extern "C" fn unchanged(raw: *mut c_void) -> bool {
     unsafe {
         let observation = &*raw.cast::<Observation>();
