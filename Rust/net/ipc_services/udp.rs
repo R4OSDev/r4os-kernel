@@ -90,6 +90,8 @@ fn truncated_datagram_reply(
                 out.dest_port = info.dest_port;
                 out.flags |=
                     UDP_FLAG_OK | UDP_FLAG_DATA | UDP_FLAG_HANDLE_VALID | UDP_FLAG_REMOTE_VALID;
+                set_udp_service_status(&mut out, Status::Ok);
+                copy_bounded(&mut out.last_error, b"recv-ok".as_slice());
                 set_udp_lifecycle(&mut out, SOCKET_LIFECYCLE_ACTIVE_PUBLIC);
             }
         }
@@ -238,6 +240,8 @@ pub(super) fn udp_bind_result(out: &mut UdpServiceResult, payload: &[u8]) -> &'s
         out.result = 0;
         out.handle = int(svc_handle);
         out.flags |= UDP_FLAG_OK | UDP_FLAG_HANDLE_VALID;
+        set_udp_service_status(out, Status::Ok);
+        copy_bounded(&mut out.last_error, b"bind-ok".as_slice());
         set_udp_lifecycle(out, SOCKET_LIFECYCLE_ACTIVE_PUBLIC);
     }
     b"".as_slice()
@@ -257,6 +261,8 @@ pub(super) fn udp_send_to_result(out: &mut UdpServiceResult, payload: &[u8]) -> 
     if tx == net::TxResult::Ok {
         out.flags |= UDP_FLAG_OK;
         out.bytes = out.requested_bytes;
+        set_udp_service_status(out, Status::Ok);
+        copy_bounded(&mut out.last_error, b"send-ok".as_slice());
         set_udp_lifecycle(out, SOCKET_LIFECYCLE_ACTIVE_PUBLIC);
     } else if tx == net::TxResult::Busy {
         set_udp_service_status(out, Status::WouldBlock);
@@ -296,6 +302,8 @@ pub(super) fn udp_recv_result<'a>(
         out.flags |= UDP_FLAG_OK;
         if got > 0 {
             out.flags |= UDP_FLAG_DATA | UDP_FLAG_REMOTE_VALID;
+            set_udp_service_status(out, Status::Ok);
+            copy_bounded(&mut out.last_error, b"recv-ok".as_slice());
             set_udp_lifecycle(out, SOCKET_LIFECYCLE_ACTIVE_PUBLIC);
             return &data_out
                 [0..usize::try_from(got).expect("Original bounded positive IPC length")];
@@ -316,6 +324,8 @@ pub(super) fn udp_close_result(out: &mut UdpServiceResult, payload: &[u8]) -> &'
     out.result = result;
     if result == 0 {
         out.flags |= UDP_FLAG_OK;
+        set_udp_service_status(out, Status::Ok);
+        copy_bounded(&mut out.last_error, b"close-ok".as_slice());
         set_udp_lifecycle(out, SOCKET_LIFECYCLE_LOCAL_CLOSE_PUBLIC);
         record_service_close(Status::Ok);
     } else {
@@ -356,12 +366,9 @@ pub(super) fn set_udp_operation_status(out: &mut UdpServiceResult) {
     }
     let last_error = fixed_text(&out.last_error[0..]);
     if out.result == 0 {
-        if text_equals(last_error, operation_status_name(Status::WouldBlock)) {
-            set_udp_service_status(out, Status::WouldBlock);
-            set_udp_lifecycle(out, SOCKET_LIFECYCLE_WOULD_BLOCK_PUBLIC);
-        } else {
-            set_udp_service_status(out, Status::Ok);
-        }
+        // Empty receives and Busy already encode their own WouldBlock above.
+        // Historical global diagnostics cannot overturn confirmed success.
+        set_udp_service_status(out, Status::Ok);
         return;
     }
     if text_contains(last_error, b"timeout".as_slice()) {
@@ -493,4 +500,71 @@ pub(super) fn write_udp_close(w: &mut Writer<'_>, payload: &[u8]) {
     w.text(udp_last_error());
     w.text(b" status=".as_slice());
     w.text(operation_status_name(status));
+}
+
+/// Existing explicit NETWORK LIMIT case only. The caller owns both bound
+/// sockets and presents an empty receiver; all predecessor errors are real.
+pub(super) fn status_contract_probe(sender: u32, receiver: u32, port: u16) -> bool {
+    let mut info: super::super::udp_sockets::Info = unsafe { core::mem::zeroed() };
+    let mut data = [0u8; 2];
+    if net::udp_recv_from(receiver, &mut info, &mut data) != 0
+        || !text_equals(net::udp_error(), b"would-block".as_slice())
+    {
+        return false;
+    }
+    let mut request = [0u8; 12];
+    write_u32(&mut request, 0, sender);
+    request[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    request[8..10].copy_from_slice(&port.to_le_bytes());
+    request[10..].copy_from_slice(b"S5");
+    let mut unused = [];
+    let first = make_udp_result(OP_UDP_SENDTO_RESULT, &request, &mut unused).result;
+    if first.result != 0
+        || first.bytes != 2
+        || first.service_status != Status::Ok as u32
+        || first.lifecycle_cause != SOCKET_LIFECYCLE_ACTIVE_PUBLIC
+        || !text_equals(fixed_text(&first.last_error), b"send-ok".as_slice())
+        || !text_equals(net::udp_error(), b"would-block".as_slice())
+    {
+        return false;
+    }
+    if net::udp_recv_from(receiver, &mut info, &mut data) != 2 || data != *b"S5" {
+        return false;
+    }
+    if net::udp_recv_from(u32::MAX, &mut info, &mut data) >= 0
+        || !text_equals(net::udp_error(), b"recv-handle".as_slice())
+    {
+        return false;
+    }
+    let second = make_udp_result(OP_UDP_SENDTO_RESULT, &request, &mut unused).result;
+    if second.result != 0
+        || second.bytes != 2
+        || second.service_status != Status::Ok as u32
+        || second.lifecycle_cause != SOCKET_LIFECYCLE_ACTIVE_PUBLIC
+        || !text_equals(fixed_text(&second.last_error), b"send-ok".as_slice())
+        || !text_equals(net::udp_error(), b"recv-handle".as_slice())
+    {
+        return false;
+    }
+    if net::udp_recv_from(receiver, &mut info, &mut data) != 2 || data != *b"S5" {
+        return false;
+    }
+    if net::udp_recv_from(receiver, &mut info, &mut data) != 0 {
+        return false;
+    }
+    let zero = make_udp_result(OP_UDP_SENDTO_RESULT, &request[..10], &mut unused).result;
+    if zero.result != 0
+        || zero.bytes != 0
+        || zero.requested_bytes != 0
+        || zero.service_status != Status::Ok as u32
+        || !text_equals(fixed_text(&zero.last_error), b"send-ok".as_slice())
+        || !text_equals(net::udp_error(), b"would-block".as_slice())
+    {
+        return false;
+    }
+    info = unsafe { core::mem::zeroed() };
+    net::udp_recv_from(receiver, &mut info, &mut data) == 0
+        && info.length == 0
+        && info.source_port != 0
+        && info.dest_port == port
 }

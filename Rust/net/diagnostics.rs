@@ -999,7 +999,7 @@ fn limit_udp_local() -> bool {
         matches!(
             udp_sockets::receive_datagram(receiver.0, &mut output),
             Ok(None)
-        )
+        ) && super::ipc_services::udp_status_contract_probe(sender.0, receiver.0, 65093)
     })();
     drop(sender);
     drop(receiver);

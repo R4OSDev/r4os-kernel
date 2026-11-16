@@ -898,3 +898,8 @@ fn network_backend_info(
     write_u32(&mut body, 28, int(recv));
     write_response(response, channel, op, id, RESULT_OK, &body)
 }
+
+/// Bounded existing explicit NETWORK LIMIT coverage; no normal request work.
+pub(super) fn udp_status_contract_probe(sender: u32, receiver: u32, port: u16) -> bool {
+    udp::status_contract_probe(sender, receiver, port)
+}
