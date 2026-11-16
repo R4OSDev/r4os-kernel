@@ -225,20 +225,27 @@ unsafe fn summary() -> Summary {
         value
     }
 }
-unsafe fn dispatch(info: Info, payload: &[u8]) -> Option<Text> {
+pub(crate) enum Delivery {
+    Queued,
+    Unbound,
+    Dropped(Text),
+}
+unsafe fn dispatch(info: Info, payload: &[u8]) -> Delivery {
     unsafe {
-        let index = by_port(info.dest_port)?;
+        let Some(index) = by_port(info.dest_port) else {
+            return Delivery::Unbound;
+        };
         let s = state();
         let socket = &mut (*s).sockets[index];
         if payload.len() > PAYLOAD_MAX {
             socket.drops += 1;
             (*s).drops += 1;
-            return Some(text(b"socket-payload"));
+            return Delivery::Dropped(text(b"socket-payload"));
         }
         if socket.count >= QUEUE_CAPACITY {
             socket.drops += 1;
             (*s).drops += 1;
-            return Some(text(b"socket-full"));
+            return Delivery::Dropped(text(b"socket-full"));
         }
         let tail = socket.tail;
         socket.queue[tail] = Packet {
@@ -253,7 +260,37 @@ unsafe fn dispatch(info: Info, payload: &[u8]) -> Option<Text> {
         socket.count += 1;
         socket.rx_packets += 1;
         (*s).delivered += 1;
-        None
+        Delivery::Queued
+    }
+}
+/// # Safety
+/// Payload is a private resident immutable copy, never a pageable caller view.
+/// Source validation, enqueue and the confirmed sender count share one owner.
+pub(crate) unsafe fn send_local(
+    handle: u32,
+    source_ip: [u8; 4],
+    dest_ip: [u8; 4],
+    dest_port: u16,
+    payload: &[u8],
+) -> Result<Delivery, Text> {
+    let _guard = Guard::acquire().ok_or(text(b"cancelled"))?;
+    unsafe {
+        let source = by_handle(handle).ok_or(text(b"send-handle"))?;
+        let source_port = (*state()).sockets[source].port;
+        let result = dispatch(
+            Info {
+                source_ip,
+                dest_ip,
+                source_port,
+                dest_port,
+                length: 0,
+            },
+            payload,
+        );
+        if matches!(result, Delivery::Queued) {
+            (*state()).sockets[source].tx_packets += 1;
+        }
+        Ok(result)
     }
 }
 /// # Safety
@@ -361,7 +398,7 @@ pub unsafe extern "C" fn r4os_rust_udp_socket_dispatch(
     } else {
         unsafe { slice::from_raw_parts(data, len) }
     };
-    if let Some(reason) = unsafe { dispatch(*info, bytes) } {
+    if let Delivery::Dropped(reason) = unsafe { dispatch(*info, bytes) } {
         unsafe { error.write(reason) };
         true
     } else {

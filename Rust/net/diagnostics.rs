@@ -877,6 +877,136 @@ fn limit_udp_payload() -> bool {
         && after.resource_queue_full == before.resource_queue_full + 1
         && equal(udp_stats().last_error, b"socket-payload")
 }
+fn limit_udp_local() -> bool {
+    let before = capture(udp_sockets::r4os_rust_udp_socket_summary);
+    let receive = frames::r4os_rust_frames_udp_bind(65093);
+    if receive <= 0 {
+        return false;
+    }
+    let receiver = UdpSocket(receive as u32);
+    let send = frames::r4os_rust_frames_udp_bind(65094);
+    if send <= 0 {
+        return false;
+    }
+    let sender = UdpSocket(send as u32);
+    let passed = (|| {
+        let target = [127, 42, 99, 3];
+        let send_bytes = |handle, port, bytes: &[u8]| unsafe {
+            frames::r4os_rust_frames_udp_send(handle, &target, port, bytes.as_ptr(), bytes.len())
+        };
+        if udp_sockets::r4os_rust_udp_socket_bound(65095) {
+            return false;
+        }
+        if send_bytes(u32::MAX, 65093, b"invalid") != 6
+            || send_bytes(sender.0, 0, b"port") != 6
+            || send_bytes(sender.0, 65095, b"unbound") != 6
+            || send_bytes(sender.0, 65093, &[0x91; udp_sockets::PAYLOAD_MAX + 1]) != 4
+        {
+            return false;
+        }
+        let mut output = [0u8; udp_sockets::PAYLOAD_MAX];
+        if !matches!(
+            udp_sockets::receive_datagram(receiver.0, &mut output),
+            Ok(None)
+        ) {
+            return false;
+        }
+        if send_bytes(sender.0, 65093, b"") != 0 {
+            return false;
+        }
+        let Ok(Some(empty)) = udp_sockets::receive_datagram(receiver.0, &mut output) else {
+            return false;
+        };
+        if empty.length != 0
+            || empty.source_ip != [127, 0, 0, 1]
+            || empty.dest_ip != target
+            || empty.source_port != 65094
+            || empty.dest_port != 65093
+        {
+            return false;
+        }
+        let maximum = [0x91; udp_sockets::PAYLOAD_MAX];
+        if send_bytes(sender.0, 65093, &maximum) != 0 {
+            return false;
+        }
+        let Ok(Some(truncated)) = udp_sockets::receive_datagram(receiver.0, &mut output[..8])
+        else {
+            return false;
+        };
+        if usize::from(truncated.length) != maximum.len()
+            || output[..8] != maximum[..8]
+            || !matches!(
+                udp_sockets::receive_datagram(receiver.0, &mut output),
+                Ok(None)
+            )
+        {
+            return false;
+        }
+        if send_bytes(sender.0, 65093, &maximum) != 0 {
+            return false;
+        }
+        let Ok(Some(complete)) = udp_sockets::receive_datagram(receiver.0, &mut output) else {
+            return false;
+        };
+        if usize::from(complete.length) != maximum.len() || output != maximum {
+            return false;
+        }
+        if send_bytes(sender.0, 65093, b"keep") != 0 {
+            return false;
+        }
+        let mut info = MaybeUninit::uninit();
+        let small = unsafe {
+            frames::r4os_rust_frames_udp_recv(receiver.0, info.as_mut_ptr(), output.as_mut_ptr(), 2)
+        };
+        if small != -2 {
+            return false;
+        }
+        let whole = unsafe {
+            frames::r4os_rust_frames_udp_recv(
+                receiver.0,
+                info.as_mut_ptr(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        if whole != 4 || output[..4] != *b"keep" {
+            return false;
+        }
+        for index in 0..udp_sockets::QUEUE_CAPACITY {
+            if send_bytes(sender.0, 65093, &[index as u8]) != 0 {
+                return false;
+            }
+        }
+        let full = capture(udp_sockets::r4os_rust_udp_socket_summary);
+        if send_bytes(sender.0, 65093, b"full") != 3 {
+            return false;
+        }
+        let dropped = capture(udp_sockets::r4os_rust_udp_socket_summary);
+        if dropped.drops != full.drops + 1
+            || dropped.delivered != full.delivered
+            || dropped.queued != full.queued
+        {
+            return false;
+        }
+        for index in 0..udp_sockets::QUEUE_CAPACITY {
+            let Ok(Some(value)) = udp_sockets::receive_datagram(receiver.0, &mut output) else {
+                return false;
+            };
+            if value.length != 1 || output[0] != index as u8 {
+                return false;
+            }
+        }
+        matches!(
+            udp_sockets::receive_datagram(receiver.0, &mut output),
+            Ok(None)
+        )
+    })();
+    drop(sender);
+    drop(receiver);
+    let after = capture(udp_sockets::r4os_rust_udp_socket_summary);
+    passed && after.active == before.active && after.queued == before.queued
+}
+
 fn limit_probe() -> bool {
     let _restore = RestoreConfig(config::settings());
     if !limit_tx() {
@@ -889,6 +1019,9 @@ fn limit_probe() -> bool {
         return false;
     }
     if !limit_udp_payload() {
+        return false;
+    }
+    if !limit_udp_local() {
         return false;
     }
     unsafe {
@@ -911,7 +1044,7 @@ fn limit_probe() -> bool {
             return false;
         }
     }
-    cleanup::r4os_rust_net_note_limit_contract(10);
+    cleanup::r4os_rust_net_note_limit_contract(11);
     true
 }
 fn timing_probe() -> bool {

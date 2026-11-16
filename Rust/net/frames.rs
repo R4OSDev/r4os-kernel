@@ -443,6 +443,17 @@ fn udp_port(handle: u32) -> Option<u16> {
         None
     }
 }
+// Loopback aliases retain their requested destination and use the canonical
+// loopback source. Unconfigured 0.0.0.0 is never an own-address destination.
+fn local_udp_source(target: [u8; 4], local: [u8; 4]) -> Option<[u8; 4]> {
+    if target[0] == 127 {
+        Some([127, 0, 0, 1])
+    } else if local != [0; 4] && target == local {
+        Some(local)
+    } else {
+        None
+    }
+}
 unsafe fn udp_send(handle: u32, target: [u8; 4], port: u16, data: *const u8, len: usize) -> u8 {
     let Some(source_port) = udp_port(handle) else {
         udp_error(b"send-handle");
@@ -451,6 +462,34 @@ unsafe fn udp_send(handle: u32, target: [u8; 4], port: u16, data: *const u8, len
     if port == 0 {
         udp_error(b"send-port");
         return 6;
+    }
+    if let Some(source) = local_udp_source(target, config::settings().local_ip) {
+        if len > udp_sockets::PAYLOAD_MAX {
+            udp_error(b"send-payload");
+            return 4;
+        }
+        // Complete the foreign copy before the FIFO owner is borrowed.
+        let mut payload = [0; udp_sockets::PAYLOAD_MAX];
+        if len != 0 {
+            unsafe { ptr::copy_nonoverlapping(data, payload.as_mut_ptr(), len) };
+        }
+        return match unsafe {
+            udp_sockets::send_local(handle, source, target, port, &payload[..len])
+        } {
+            Ok(udp_sockets::Delivery::Queued) => 0,
+            Ok(udp_sockets::Delivery::Unbound) => {
+                udp_error(b"send-unbound");
+                6
+            }
+            Ok(udp_sockets::Delivery::Dropped(reason)) => {
+                unsafe { stats::r4os_rust_net_udp_owned_error(reason) };
+                3
+            }
+            Err(reason) => {
+                unsafe { stats::r4os_rust_net_udp_owned_error(reason) };
+                6
+            }
+        };
     }
     let mut packet = [0; 1536];
     let params = builders::WireUdpBuild {
