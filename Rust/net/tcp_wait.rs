@@ -65,26 +65,45 @@ static CONNECTIONS: [Channel; tcp::MAX_CONNECTIONS] =
 static LISTENERS: [Channel; tcp::MAX_LISTENERS] = [const { Channel::new() }; tcp::MAX_LISTENERS];
 static WOKEN: AtomicU64 = AtomicU64::new(0);
 
+fn changed_slots(mut mask: u32) -> impl Iterator<Item = usize> {
+    core::iter::from_fn(move || {
+        if mask == 0 {
+            return None;
+        }
+        let slot = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        Some(slot)
+    })
+}
+
 /// # Safety
-/// Exact TCP task owner remains held; no mutable table borrow survives here.
-/// This finite resident projection and wake never waits on a TCP operation.
+/// The TCP owner remains held through the final wake. Table reads precede
+/// runtime admission, which only covers publication and scheduler queues.
 pub(super) unsafe fn publish_owned() {
+    let changed = unsafe { tcp::take_changed_channels() };
+    if changed.connections == 0 && changed.listeners == 0 {
+        return;
+    }
     let mut connections = [(0, 0); tcp::MAX_CONNECTIONS];
     let mut listeners = [(0, 0); tcp::MAX_LISTENERS];
-    unsafe {
-        tcp::wait_observations(&mut connections, &mut listeners);
+    for slot in changed_slots(changed.connections) {
+        connections[slot] = unsafe { tcp::wait_connection(slot) };
+    }
+    for slot in changed_slots(changed.listeners) {
+        listeners[slot] = unsafe { tcp::wait_listener(slot) };
     }
     let _runtime = RuntimeGuard::acquire();
-    for (channel, &(identity, flags)) in CONNECTIONS.iter().zip(&connections) {
-        // Establishment waits also end on close; readable waits must recheck
-        // terminal state even when no further payload will arrive.
+    // Preserve connection-before-listener ordering and ascending slot order.
+    for slot in changed_slots(changed.connections) {
+        let (identity, flags) = connections[slot];
         unsafe {
-            channel.publish(identity, flags, &[5, 6, 4]);
+            CONNECTIONS[slot].publish(identity, flags, &[5, 6, 4]);
         }
     }
-    for (channel, &(identity, flags)) in LISTENERS.iter().zip(&listeners) {
+    for slot in changed_slots(changed.listeners) {
+        let (identity, flags) = listeners[slot];
         unsafe {
-            channel.publish(identity, flags, &[8, 16]);
+            LISTENERS[slot].publish(identity, flags, &[8, 16]);
         }
     }
 }

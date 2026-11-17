@@ -29,6 +29,7 @@ pub(crate) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
                     return Some(view);
                 }
                 discard_catalog(c);
+                mark_connection(c);
                 c.state = State::Closed;
                 c.terminal_cause = crate::contract::net_service_socket_lifecycle_reset;
                 c.used = c.retained_terminal;
@@ -66,6 +67,7 @@ pub(crate) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
                 apply_peer_handshake_options(c, view);
                 c.seq = c.seq.wrapping_add(1);
                 c.ack = view.seq.wrapping_add(1);
+                mark_connection(c);
                 c.state = State::Established;
                 update_tx_window(c, view);
                 count_negotiation(c);
@@ -76,6 +78,7 @@ pub(crate) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
                 && view.ack == c.seq.wrapping_add(1)
             {
                 c.seq = c.seq.wrapping_add(1);
+                mark_connection(c);
                 c.state = State::Established;
                 update_tx_window(c, view);
                 count_negotiation(c);
@@ -101,6 +104,7 @@ pub(crate) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
                     && view.seq.wrapping_add(view.payload.len as u32) == c.ack
                 {
                     c.ack = c.ack.wrapping_add(1);
+                    mark_connection(c);
                     c.state = State::Closed;
                     c.terminal_cause = crate::contract::net_service_socket_lifecycle_peer_gone;
                     (*stats()).last_error = text(b"fin-rx");
@@ -116,6 +120,7 @@ pub(crate) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
                 if peer_fin {
                     c.ack = c.ack.wrapping_add(1);
                 }
+                mark_connection(c);
                 c.state = State::Closed;
                 if view.flags & FLAG_FIN == 0 {
                     discard_catalog(c);
@@ -354,8 +359,11 @@ pub(super) unsafe fn update_tx_window(c: &mut Connection, view: SegmentView) {
     }
 }
 
-pub(super) fn write_rx(c: &mut Connection, bytes: &[u8]) -> usize {
+pub(super) unsafe fn write_rx(c: &mut Connection, bytes: &[u8]) -> usize {
     let len = bytes.len().min(rx_free(c));
+    if len != 0 && c.rx_len == 0 {
+        unsafe { mark_connection(c) };
+    }
     let mut copied = 0;
     while copied < len {
         let tail = (c.rx_head + c.rx_len) % c.rx.len();

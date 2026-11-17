@@ -170,6 +170,7 @@ pub(crate) unsafe fn commit_sent(id: u32, flags: u16, bytes: &[u8], tick: u64) -
         if flags & FLAG_FIN != 0 {
             c.seq = c.seq.wrapping_add(1);
             c.close_requested = false;
+            mark_connection(c);
             c.state = State::FinWait;
             (*stats()).fin_tx += 1;
             (*stats()).last_error = text(b"fin");
@@ -342,6 +343,9 @@ pub(crate) unsafe fn read(id: u32, out: &mut [u8]) -> i32 {
         };
         let c = &mut *c;
         let len = out.len().min(c.rx_len);
+        if len != 0 && len == c.rx_len {
+            mark_connection(c);
+        }
         if len != 0 {
             let mut copied = 0;
             while copied < len {
@@ -359,6 +363,7 @@ pub(crate) unsafe fn read(id: u32, out: &mut [u8]) -> i32 {
             if c.retained_terminal {
                 return 0;
             }
+            mark_connection(c);
             discard_catalog(c);
             c.used = false;
             return -1;
@@ -373,6 +378,7 @@ pub(crate) unsafe fn close(id: u32) -> i32 {
             return -1;
         };
         let c = &mut *c;
+        mark_connection(c);
         c.retained_terminal = false;
         if c.state == State::Closed {
             discard_catalog(c);

@@ -1141,34 +1141,38 @@ pub(crate) unsafe fn wait_observation_word(slot: usize) -> u64 {
 
 /// Non-owning projection only, under the exact TCP task owner. Native
 /// connection generation/ID and listener generation remain the authorities.
-pub(crate) unsafe fn wait_observations(
-    connections: &mut [(u64, u64); MAX_CONNECTIONS],
-    listeners: &mut [(u64, u64); MAX_LISTENERS],
-) {
-    unsafe {
-        for (slot, out) in listeners.iter_mut().enumerate() {
-            let l = &*listener(slot);
-            *out = (if l.used { l.generation } else { 0 }, 0);
-        }
-        for (slot, out) in connections.iter_mut().enumerate() {
-            let c = &*connection(slot);
-            if !c.used || c.id == 0 || c.generation == 0 {
-                *out = (0, 0);
-                continue;
-            }
-            let flags = wait_observation_word(slot) >> 48;
-            *out = (u64::from(c.id) | (u64::from(c.generation) << 32), flags);
-            if flags & 8 == 0 || c.listener_generation == 0 {
-                continue;
-            }
-            for (index, observed) in listeners.iter_mut().enumerate() {
-                if observed.0 == c.listener_generation && (*listener(index)).port == c.local_port {
-                    observed.1 |= flags & 24;
-                    break;
-                }
+pub(crate) unsafe fn wait_connection(slot: usize) -> (u64, u64) {
+    let c = unsafe { &*connection(slot) };
+    if !c.used || c.id == 0 || c.generation == 0 {
+        return (0, 0);
+    }
+    (
+        u64::from(c.id) | (u64::from(c.generation) << 32),
+        unsafe { wait_observation_word(slot) } >> 48,
+    )
+}
+
+pub(crate) unsafe fn wait_listener(slot: usize) -> (u64, u64) {
+    let l = unsafe { &*listener(slot) };
+    if !l.used {
+        return (0, 0);
+    }
+    let mut flags = 0;
+    for slot in 0..MAX_CONNECTIONS {
+        let c = unsafe { &*connection(slot) };
+        if c.used
+            && c.id != 0
+            && c.generation != 0
+            && c.local_port == l.port
+            && c.listener_generation == l.generation
+        {
+            flags |= (unsafe { wait_observation_word(slot) } >> 48) & 24;
+            if flags == 24 {
+                break;
             }
         }
     }
+    (l.generation, flags)
 }
 
 /// Exact retained slot query; no resident borrow escapes the TCP owner.

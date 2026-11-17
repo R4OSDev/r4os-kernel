@@ -130,6 +130,7 @@ pub(crate) unsafe fn listen_mode(port: u16, retained: bool) -> bool {
                 (*stats()).last_error = text(b"listen-generation");
                 return false;
             }
+            mark_listener(slot);
             *l = Listener {
                 used: true,
                 port,
@@ -152,6 +153,7 @@ pub(crate) unsafe fn close_listener(port: u16) {
             if l.used && l.port == port {
                 let generation = l.generation;
                 let retained = l.retained_terminal;
+                mark_listener(slot);
                 *l = Listener::EMPTY;
                 if retained {
                     // Claimed streams have their own exact lifetime. Only
@@ -201,6 +203,7 @@ pub(crate) unsafe fn accept_inbound(view: SegmentView, initial_seq: u32) -> Opti
         c.id = *NEXT_ID.0.get();
         c.generation = next_slot_generation(slot);
         c.state = State::SynReceived;
+        mark_listener(listener.slot);
         c.listener_generation = listener.generation;
         c.retained_terminal = (*super::listener(listener.slot)).retained_terminal;
         c.local_port = view.dest_port;
@@ -232,6 +235,7 @@ pub(crate) unsafe fn abort(conn_id: u32, reason: Text) {
     unsafe {
         if let Some(c) = by_id(conn_id) {
             discard_catalog(&mut *c);
+            mark_connection(&*c);
             (*c).state = State::Closed;
             (*c).retained_terminal = false;
             (*c).used = false;
@@ -276,6 +280,7 @@ pub(crate) unsafe fn request_close(id: u32) -> bool {
         let Some(c) = by_id(id) else {
             return false;
         };
+        mark_connection(&*c);
         (*c).retained_terminal = false;
         match (*c).state {
             State::Established => {
@@ -385,6 +390,7 @@ pub(crate) unsafe fn claim_accepted(id: u32) -> bool {
         if (*c).accepted_claimed {
             return false;
         }
+        mark_connection(&*c);
         (*c).accepted_claimed = true;
         true
     }
@@ -425,6 +431,7 @@ pub(crate) unsafe fn abort_all(reason: Text) -> CleanupResult {
         for slot in 0..MAX_LISTENERS {
             let l = &mut *listener(slot);
             if l.used {
+                mark_listener(slot);
                 *l = Listener::EMPTY;
                 result.listeners += 1;
             }

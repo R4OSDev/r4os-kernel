@@ -521,7 +521,10 @@ unsafe fn discard_catalog(c: &mut Connection) {
     c.sent.reset();
 }
 unsafe fn reset_connection_slot(c: &mut Connection) {
-    unsafe { discard_catalog(c) };
+    unsafe {
+        mark_connection(c);
+        discard_catalog(c)
+    };
     c.used = false;
     c.retained_terminal = false;
     c.terminal_cause = 0;
@@ -572,6 +575,9 @@ pub(super) unsafe fn reset() {
             reset_connection_slot(&mut *connection(slot));
         }
         GENERATIONS.0.get().write([0; MAX_CONNECTIONS]);
+        for slot in 0..MAX_LISTENERS {
+            mark_listener(slot);
+        }
         LISTENERS.0.get().write([Listener::EMPTY; MAX_LISTENERS]);
         NEXT_ID.0.get().write(1);
         NEXT_PORT.0.get().write(49152);
@@ -876,7 +882,42 @@ pub(super) use contract_checks::{
     performance_contract_probe, self_test_connect, wraparound_probe,
 };
 use foreign_api::loopback_write_foreign;
-pub(super) use foreign_api::wait_observations;
+pub(super) use foreign_api::{wait_connection, wait_listener};
+#[derive(Default)]
+pub(super) struct ChangedChannels {
+    pub connections: u32,
+    pub listeners: u32,
+}
+// Only the exact TCP table owner reads or writes these bits, including its
+// final publication before release. The projection contains no table pointers.
+static CHANGED: Storage<ChangedChannels> = Storage(UnsafeCell::new(ChangedChannels {
+    connections: 0,
+    listeners: 0,
+}));
+pub(super) unsafe fn take_changed_channels() -> ChangedChannels {
+    unsafe { core::mem::take(&mut *CHANGED.0.get()) }
+}
+unsafe fn mark_listener(slot: usize) {
+    unsafe {
+        (*CHANGED.0.get()).listeners |= 1 << slot;
+    }
+}
+/// The connection belongs to the resident TCP table. Capture its listener
+/// before reset/reuse can detach the old generation.
+unsafe fn mark_connection(c: &Connection) {
+    let slot = unsafe { core::ptr::from_ref(c).offset_from_unsigned(connection(0)) };
+    unsafe {
+        (*CHANGED.0.get()).connections |= 1 << slot;
+        if c.used
+            && c.listener_generation != 0
+            && let Some(l) = listener_identity(c.local_port)
+            && l.generation == c.listener_generation
+        {
+            mark_listener(l.slot);
+        }
+    }
+}
+const _: () = assert!(MAX_CONNECTIONS <= 32 && MAX_LISTENERS <= 32);
 pub(crate) use foreign_api::{
     begin_retained_connect, begin_retained_listener, retained_connected, retained_terminal_cause,
 };
