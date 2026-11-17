@@ -157,7 +157,7 @@ pub unsafe fn submit_image(
         };
         if !matches!(
             request.operation,
-            resource::PRESENT | resource::DIRECT_PRESENT
+            resource::PRESENT | resource::DIRECT_PRESENT | resource::PRESENT_REGION
         ) || u64::from(descriptor.width) != (*b).frame.width
             || u64::from(descriptor.height) != (*b).frame.height
             || descriptor.format != (*b).output_format

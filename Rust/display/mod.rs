@@ -35,6 +35,7 @@ pub mod output_validation;
 pub mod outputs;
 pub mod ownership;
 pub mod power_state;
+pub mod present_region;
 pub mod presentation_stats;
 pub mod presenter;
 pub mod queue;

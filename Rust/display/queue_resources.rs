@@ -38,6 +38,7 @@ pub const RENDER_GRID_LIST: u32 = 8;
 pub const RENDER_COLOR_LIST: u32 = 9;
 pub const NATIVE: u32 = 10;
 pub const RENDER_COLOR_GRID_LIST: u32 = 11;
+pub const PRESENT_REGION: u32 = a::gfx_queue_operation_present_region;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct UseSlot {
@@ -594,7 +595,7 @@ impl Table<'_> {
         now: u64,
     ) -> Result<queue::Fence, Error> {
         assert!(
-            request.operation <= RENDER_COLOR_GRID_LIST,
+            request.operation <= PRESENT_REGION,
             "resource operation enum"
         );
         let config = state.configuration(timeline, producer)?;
@@ -708,7 +709,7 @@ impl Table<'_> {
         {
             return Err(Error::Invalid);
         }
-        if request.operation == PRESENT || request.operation == DIRECT_PRESENT {
+        if matches!(request.operation, PRESENT | DIRECT_PRESENT | PRESENT_REGION) {
             return self
                 .present_submit(state, buffers, timeline, producer, submission, request, now);
         }
@@ -883,7 +884,7 @@ impl Table<'_> {
     ) -> Result<queue::Fence, Error> {
         let config = state.configuration(timeline, producer)?;
         if config.binding.adapter == 0
-            || request.source_offset != 0
+            || (request.operation != PRESENT_REGION && request.source_offset != 0)
             || request.target_offset != 0
             || request.target.id != 0
             || request.target.generation != 0
@@ -893,6 +894,21 @@ impl Table<'_> {
             return Err(Error::Invalid);
         }
         let descriptor = buffers.read_view().describe(request.source, producer)?;
+        if descriptor.plane_count != 1
+            || descriptor.planes[0].offset != 0
+            || request.source_pitch != descriptor.planes[0].pitch
+            || !super::present_region::valid(
+                descriptor.width,
+                descriptor.height,
+                request.source_pitch,
+                request.source_offset,
+                request.bytes,
+                request.row_count,
+                request.operation == PRESENT_REGION,
+            )
+        {
+            return Err(Error::Invalid);
+        }
         if request.operation == DIRECT_PRESENT
             && (descriptor.location != 1
                 || descriptor.modifier != 0
@@ -905,10 +921,15 @@ impl Table<'_> {
             || descriptor.plane_count != 1
             || descriptor.planes[0].offset != 0
             || descriptor.usage & 4 == 0
-            || request.bytes != u64::from(descriptor.width) * 4
-            || request.row_count != descriptor.height
-            || request.source_pitch != descriptor.planes[0].pitch
-            || row_span(request.bytes, request.row_count, request.source_pitch)? > descriptor.bytes
+            || request
+                .source_offset
+                .checked_add(row_span(
+                    request.bytes,
+                    request.row_count,
+                    request.source_pitch,
+                )?)
+                .ok_or(Error::Overflow)?
+                > descriptor.bytes
         {
             return Err(Error::Unsupported);
         }
@@ -942,6 +963,7 @@ impl Table<'_> {
                 .expect("admitted present geometry"),
             row_bytes: request.bytes,
             row_count: request.row_count,
+            source_offset: request.source_offset,
             source_pitch: request.source_pitch,
             deadline_ns: submission.deadline_ns,
             display_target: request.display_target,

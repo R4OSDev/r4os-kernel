@@ -309,8 +309,12 @@ pub unsafe fn submit_image(
         }
         let descriptor = unsafe { buffers::read() }.describe(request.source, caller)?;
         let presentation = entry.info()?;
-        if (request.operation != 5 && request.operation != 7)
-            || descriptor.width != entry.width
+        if !matches!(
+            request.operation,
+            a::gfx_queue_operation_present
+                | a::gfx_queue_operation_direct_present
+                | a::gfx_queue_operation_present_region
+        ) || descriptor.width != entry.width
             || descriptor.height != entry.height
             || descriptor.format != presentation.format
             || descriptor.plane_count != 1

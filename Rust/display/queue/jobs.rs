@@ -9,7 +9,7 @@ pub fn submit(
 ) -> Result<model::Status, Error> {
     if matches!(
         transport.operation,
-        resource::NATIVE | resource::PRESENT | resource::DIRECT_PRESENT
+        resource::NATIVE | resource::PRESENT | resource::DIRECT_PRESENT | resource::PRESENT_REGION
     ) {
         return Err(Error::Unsupported);
     }
@@ -113,7 +113,10 @@ pub fn submit_display_image(
     transport: &resource::Request,
     binding: model::Binding,
 ) -> Result<model::Status, Error> {
-    if transport.operation != resource::PRESENT && transport.operation != resource::DIRECT_PRESENT {
+    if !matches!(
+        transport.operation,
+        resource::PRESENT | resource::DIRECT_PRESENT | resource::PRESENT_REGION
+    ) {
         return Err(Error::Invalid);
     }
     submit_impl(owner, timeline, request, transport, Some(binding))
@@ -156,8 +159,10 @@ pub unsafe fn submit_output_locked(
     if !available() || irq_router::in_dispatch() {
         return Err(Error::Unavailable);
     }
-    if (transport.operation != resource::PRESENT && transport.operation != resource::DIRECT_PRESENT)
-        || transport.display_target.connector_id == 0
+    if (!matches!(
+        transport.operation,
+        resource::PRESENT | resource::DIRECT_PRESENT | resource::PRESENT_REGION
+    )) || transport.display_target.connector_id == 0
     {
         return Err(Error::Invalid);
     }

@@ -319,11 +319,14 @@ unsafe fn submit_common(
                 return Err(a::gfx_queue_error_invalid);
             }
             let operation = value.operation;
-            if operation > resource::RENDER_COLOR_GRID_LIST {
+            if operation > resource::PRESENT_REGION {
                 return Err(a::gfx_queue_error_unsupported);
             }
             if target.is_some()
-                && !matches!(operation, resource::PRESENT | resource::DIRECT_PRESENT)
+                && !matches!(
+                    operation,
+                    resource::PRESENT | resource::DIRECT_PRESENT | resource::PRESENT_REGION
+                )
             {
                 return Err(a::gfx_queue_error_invalid);
             }
@@ -376,7 +379,10 @@ unsafe fn submit_common(
                 display_target: target.unwrap_or_default(),
                 ..Default::default()
             };
-            let snapshot = if matches!(operation, resource::PRESENT | resource::DIRECT_PRESENT) {
+            let snapshot = if matches!(
+                operation,
+                resource::PRESENT | resource::DIRECT_PRESENT | resource::PRESENT_REGION
+            ) {
                 native_driver::submit_image(owner, queue.timeline, &submission, &request)
             } else {
                 runtime::submit(owner, queue.timeline, &submission, &request)

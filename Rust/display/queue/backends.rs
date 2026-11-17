@@ -98,7 +98,9 @@ pub fn register_native(identity: Owner, config: NativeConfig) -> Result<model::B
         || config.adapter == 0
         || config.milestone == 0
         || config.operations == 0
-        || config.operations & !4095 != 0
+        || config.operations & !8191 != 0
+        || (config.operations & (1 << a::gfx_queue_operation_present_region) != 0
+            && config.operations & (1 << a::gfx_queue_operation_present) == 0)
     {
         return Err(Error::Invalid);
     }
@@ -286,7 +288,12 @@ pub fn update_native_operations(
     binding: model::Binding,
     operations: u64,
 ) -> Result<(), Error> {
-    if irq_router::in_dispatch() || operations == 0 || operations & !4095 != 0 {
+    if irq_router::in_dispatch()
+        || operations == 0
+        || operations & !8191 != 0
+        || (operations & (1 << a::gfx_queue_operation_present_region) != 0
+            && operations & (1 << a::gfx_queue_operation_present) == 0)
+    {
         return Err(Error::Invalid);
     }
     let _bo = BoLock::acquire();

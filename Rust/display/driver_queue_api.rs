@@ -169,7 +169,10 @@ pub unsafe fn take(id: u32, input: *const a::GfxBackendBinding, out: *mut a::Gfx
                     }),
                 byte_length: if matches!(
                     job.operation,
-                    resource::COPY_ROWS | resource::PRESENT | resource::DIRECT_PRESENT
+                    resource::COPY_ROWS
+                        | resource::PRESENT
+                        | resource::DIRECT_PRESENT
+                        | resource::PRESENT_REGION
                 ) {
                     job.row_bytes
                 } else {
