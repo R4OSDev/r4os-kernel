@@ -298,6 +298,12 @@ impl State {
         }
     }
     fn insert_id(&mut self, id: u32, slot: usize) -> bool {
+        // At most half of the ID buckets can hold live ranges. Compact at
+        // three quarters occupied, amortizing a scan over at least IDS / 4
+        // removals while still leaving empty stops for unsuccessful lookups.
+        if self.id_entries + self.tombstones >= IDS * 3 / 4 {
+            self.rebuild();
+        }
         if self.insert_id_raw(id, slot) {
             return true;
         }
