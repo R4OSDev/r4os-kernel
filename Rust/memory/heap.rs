@@ -242,57 +242,54 @@ impl Control {
         }
         self.insert_free(offset, size);
     }
-    fn find(&mut self, need: usize) -> Option<usize> {
-        let start = bin(need);
-        let mut cursor = self.bins[start];
-        let mut scanned = 0;
-        while cursor != NONE && scanned < SCAN_LIMIT {
-            let offset = cursor as usize;
+    fn take_fit<T>(
+        &mut self,
+        cursor: &mut u64,
+        limit: usize,
+        fits: impl Fn(usize, usize) -> Option<T>,
+    ) -> Option<T> {
+        for _ in 0..limit {
+            if *cursor == NONE {
+                break;
+            }
+            let offset = *cursor as usize;
             let size = block_size(read(offset));
-            if size >= need {
+            if let Some(result) = fits(offset, size) {
                 self.unlink_free(offset, size);
-                return Some(offset);
+                return Some(result);
             }
-            cursor = read(offset + 16);
-            scanned += 1;
-        }
-        for index in start + 1..BINS {
-            let head = self.bins[index];
-            if head == NONE {
-                continue;
-            }
-            let offset = head as usize;
-            let size = block_size(read(offset));
-            if size >= need {
-                self.unlink_free(offset, size);
-                return Some(offset);
-            }
-            let mut cursor = read(offset + 16);
-            while cursor != NONE {
-                let offset = cursor as usize;
-                let size = block_size(read(offset));
-                if size >= need {
-                    self.unlink_free(offset, size);
-                    return Some(offset);
-                }
-                cursor = read(offset + 16);
-            }
+            *cursor = read(offset + 16);
         }
         None
     }
-    fn find_aligned(&mut self, need: usize, alignment: usize) -> Option<(usize, usize)> {
-        for index in bin(need)..BINS {
+    fn find(&mut self, need: usize) -> Option<usize> {
+        let start = bin(need);
+        let fits = |offset, size| (size >= need).then_some(offset);
+        let mut remainder = self.bins[start];
+        if let Some(offset) = self.take_fit(&mut remainder, SCAN_LIMIT, fits) {
+            return Some(offset);
+        }
+        for index in start + 1..BINS {
             let mut cursor = self.bins[index];
-            let mut scanned = 0;
-            while cursor != NONE && scanned < SCAN_LIMIT {
-                let offset = cursor as usize;
-                let size = block_size(read(offset));
-                if let Some(payload) = aligned_payload(offset, size, need, alignment) {
-                    self.unlink_free(offset, size);
-                    return Some((offset, payload));
+            if let Some(offset) = self.take_fit(&mut cursor, usize::MAX, fits) {
+                return Some(offset);
+            }
+        }
+        self.take_fit(&mut remainder, usize::MAX, fits)
+    }
+    fn find_aligned(&mut self, need: usize, alignment: usize) -> Option<(usize, usize)> {
+        let start = bin(need);
+        let fits = |offset, size| {
+            aligned_payload(offset, size, need, alignment).map(|payload| (offset, payload))
+        };
+        // A block's alignment can exclude it even in a larger size class.
+        // Resume each list under the same heap owner before requesting growth.
+        let mut cursors = self.bins;
+        for limit in [SCAN_LIMIT, usize::MAX] {
+            for cursor in &mut cursors[start..] {
+                if let Some(found) = self.take_fit(cursor, limit, fits) {
+                    return Some(found);
                 }
-                cursor = read(offset + 16);
-                scanned += 1;
             }
         }
         None
