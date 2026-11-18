@@ -385,10 +385,14 @@ pub unsafe extern "C" fn r4os_rust_program_process_close(input: *const Handle) -
             registry::unlock();
             return status;
         }
+        let service = (*slot).instance.app_class == 2;
         if mark_close(ptr::addr_of_mut!((*slot).instance), h) {
             registry::epoch();
         }
         registry::unlock();
+        if service {
+            crate::service::endpoint::wake_for_process_close(h);
+        }
         program_process_input(h);
         close_clients();
         crate::service::desktop_events::r4os_rust_desktop_signal();
@@ -499,14 +503,16 @@ pub unsafe extern "C" fn r4os_rust_program_process_reap(
         completions::r4os_rust_program_completion_access(2, *input, out)
     }
 }
-/// Read the executing pinned instance's cooperative close flag.
-pub(crate) fn should_close() -> bool {
-    unsafe {
-        let instance = super::context::current();
-        !instance.is_null()
-            && AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).close_requested))
-                .load(Ordering::Acquire)
+/// The executing task pins its instance across admissions and blocking waits.
+pub(crate) fn current_close_flag() -> *const AtomicBool {
+    let instance = unsafe { super::context::current() };
+    if instance.is_null() {
+        return ptr::null();
     }
+    unsafe { ptr::addr_of!((*instance).close_requested).cast() }
+}
+pub(crate) fn should_close() -> bool {
+    unsafe { current_close_flag().as_ref() }.is_some_and(|flag| flag.load(Ordering::Acquire))
 }
 /// # Safety
 /// Original legacy value/output contracts; current execution remains pinned.

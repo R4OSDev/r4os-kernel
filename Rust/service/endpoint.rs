@@ -13,7 +13,7 @@ use crate::{
 use core::{
     ffi::c_void,
     ptr,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 pub(crate) unsafe fn waitset_source<T>(
     input: crate::program::wait_sources::Identity,
@@ -788,13 +788,38 @@ unsafe fn take_response_inner(
         len as i32
     }
 }
+/// A direct process close leaves the endpoint open for ordinary teardown.
+pub(crate) fn wake_for_process_close(process: c::ProgramProcessHandle) {
+    let Some(_registry) = reg::lock_registry(1) else {
+        return;
+    };
+    unsafe {
+        let endpoints = ptr::addr_of!((*reg::raw()).endpoints);
+        let mut node = (*endpoints).after(0);
+        while !node.is_null() {
+            let ep = ptr::addr_of_mut!((*node).endpoint);
+            let owner = reg::entry((*ep).service_slot);
+            if crate::program::registry::equal((*owner).binding.process, process) {
+                queue_op(ptr::addr_of_mut!((*ep).requests_available), 1, 0);
+            }
+            node = (*endpoints).after((*ep).handle);
+        }
+    }
+}
 struct EndpointWait {
     identity: Identity,
+    close: *const AtomicBool,
 }
 unsafe extern "C" fn endpoint_needed(raw: *mut c_void) -> bool {
     unsafe {
-        let id = (*raw.cast::<EndpointWait>()).identity;
-        reg::identity_matches(id.endpoint, id) && (*id.endpoint).queued_count == 0
+        let wait = &*raw.cast::<EndpointWait>();
+        let id = wait.identity;
+        reg::identity_matches(id.endpoint, id)
+            && (*id.endpoint).queued_count == 0
+            && !wait
+                .close
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 }
 pub(super) unsafe fn poll(handle: u32) -> i32 {
@@ -807,6 +832,7 @@ pub(super) unsafe fn poll(handle: u32) -> i32 {
 }
 pub(super) unsafe fn wait_endpoint(handle: u32, timeout: u64) -> i32 {
     unsafe {
+        let close = crate::program::process::current_close_flag();
         let Some(identity) = reg::lookup_identity(handle) else {
             return c::service_api_result_bad_handle;
         };
@@ -817,7 +843,7 @@ pub(super) unsafe fn wait_endpoint(handle: u32, timeout: u64) -> i32 {
         if queued != 0 {
             return queued as i32;
         }
-        let mut context = EndpointWait { identity };
+        let mut context = EndpointWait { identity, close };
         let mut request = WaitRequest::predicate(
             timeout,
             Text::literal(b"svc-endpoint"),

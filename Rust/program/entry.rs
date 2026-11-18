@@ -151,6 +151,9 @@ unsafe fn prepare(instance: *mut ProgramInstance) -> View {
         };
         let mut flags =
             contract::r4xstart_flag_close_supported | contract::r4xstart_flag_yield_supported;
+        if (*instance).app_class == 2 {
+            flags |= contract::r4xstart_flag_endpoint_stop_wake;
+        }
         if view.import_count > 0 {
             flags |= contract::r4xstart_flag_imports_valid;
         }
