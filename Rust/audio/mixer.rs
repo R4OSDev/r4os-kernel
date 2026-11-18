@@ -1,7 +1,6 @@
 //! Original S16 ring and saturating fixed-point mixer, unchanged budgets.
 use core::{ptr, slice};
-/// Canonical productive stream capacity; wider private facade inputs retain
-/// the original generic path rather than introducing an artificial limit.
+/// Shared capacity of the playback owner, its source reservations and the mixer.
 pub(crate) const MAX_SOURCES: usize = 8;
 
 #[derive(Clone, Copy)]
@@ -68,17 +67,10 @@ impl Source {
     };
 }
 pub(crate) unsafe fn mix(sources: &[Source], output: &mut [u8], work: *mut Work) {
-    unsafe { mix_indexed(sources.len(), |i| sources[i], output, work) }
-}
-unsafe fn mix_indexed(
-    count: usize,
-    mut source_at: impl FnMut(usize) -> Source,
-    output: &mut [u8],
-    work: *mut Work,
-) {
+    assert!(sources.len() <= MAX_SOURCES);
     unsafe {
-        if count == 1 && source_at(0).volume == 65_536 {
-            let source = source_at(0);
+        if sources.len() == 1 && sources[0].volume == 65_536 {
+            let source = sources[0];
             let ring = slice::from_raw_parts(source.ring, source.len);
             let first = output.len().min(ring.len() - source.read_pos);
             output[..first].copy_from_slice(&ring[source.read_pos..source.read_pos + first]);
@@ -89,40 +81,18 @@ unsafe fn mix_indexed(
             }
             return;
         }
-        if count <= MAX_SOURCES {
-            // Read reservations keep each source stable for this complete
-            // call. Only local copied positions advance; actual consumption
-            // remains with the original backend acknowledgement owner.
-            let mut cursors = [Cursor::EMPTY; MAX_SOURCES];
-            for (i, cursor) in cursors[..count].iter_mut().enumerate() {
-                *cursor = Cursor::new(source_at(i));
-            }
-            let mut byte_offset = 0;
-            while byte_offset < output.len() {
-                let mut total = 0;
-                for cursor in &mut cursors[..count] {
-                    total = accumulate_sample(total, cursor.sample(), cursor.0.volume, work);
-                }
-                write_s16(output, byte_offset, clamp_sample(total), work);
-                byte_offset += 2;
-            }
-            return;
+        // Read reservations keep each source stable for this complete
+        // call. Only local copied positions advance; actual consumption
+        // remains with the original backend acknowledgement owner.
+        let mut cursors = [Cursor::EMPTY; MAX_SOURCES];
+        for (cursor, source) in cursors.iter_mut().zip(sources) {
+            *cursor = Cursor::new(*source);
         }
         let mut byte_offset = 0;
         while byte_offset < output.len() {
             let mut total = 0;
-            for i in 0..count {
-                let source = source_at(i);
-                total = accumulate_sample(
-                    total,
-                    ring_read_s16(
-                        slice::from_raw_parts(source.ring, source.len),
-                        source.read_pos,
-                        byte_offset,
-                    ),
-                    source.volume,
-                    work,
-                );
+            for cursor in &mut cursors[..sources.len()] {
+                total = accumulate_sample(total, cursor.sample(), cursor.0.volume, work);
             }
             write_s16(output, byte_offset, clamp_sample(total), work);
             byte_offset += 2;
@@ -225,25 +195,23 @@ pub unsafe extern "C" fn r4os_rust_audio_mixer(op: u32, args: *const Args) -> i6
         let a = &*args;
         match op {
             0 => {
+                if a.count > MAX_SOURCES {
+                    return -1;
+                }
                 let out = if a.ring_len == 0 {
                     &mut [][..]
                 } else {
                     slice::from_raw_parts_mut(a.ring, a.ring_len)
                 };
-                mix_indexed(
-                    a.count,
-                    |i| {
-                        if let Some(reader) = a.reader {
-                            let mut value = Source::EMPTY;
-                            reader(a.sources.cast(), i, &mut value);
-                            value
-                        } else {
-                            *a.sources.add(i)
-                        }
-                    },
-                    out,
-                    a.work,
-                );
+                let mut sources = [Source::EMPTY; MAX_SOURCES];
+                for (index, source) in sources[..a.count].iter_mut().enumerate() {
+                    if let Some(reader) = a.reader {
+                        reader(a.sources.cast(), index, source);
+                    } else {
+                        *source = *a.sources.add(index);
+                    }
+                }
+                mix(&sources[..a.count], out, a.work);
                 0
             }
             1 => {
@@ -310,3 +278,66 @@ const _: () = {
     assert!(size_of::<Args>() == 112);
     assert!(core::mem::offset_of!(Args, reader) == 104);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Independent offset-based implementation for comparison with the running cursors.
+    unsafe fn reference(sources: &[Source], out: &mut [u8]) {
+        for (i, pair) in out.chunks_exact_mut(2).enumerate() {
+            let mut total = 0_i64;
+            for s in sources {
+                let ring = unsafe { slice::from_raw_parts(s.ring, s.len) };
+                let pos = (s.read_pos + 2 * i) % ring.len();
+                let sample = i16::from_le_bytes([ring[pos], ring[(pos + 1) % ring.len()]]);
+                total += i64::from(sample) * i64::from(s.volume) / 65_536;
+            }
+            pair.copy_from_slice(
+                &(total.clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16).to_le_bytes(),
+            );
+        }
+    }
+
+    #[test]
+    fn productive_sources_match_reference_across_ring_ends() {
+        let rings: [[u8; 18]; MAX_SOURCES] =
+            core::array::from_fn(|i| core::array::from_fn(|j| (i * 47 + j * 19) as u8));
+        for count in 0..=MAX_SOURCES {
+            for volume in [16_384_u32, 65_536] {
+                let sources: [Source; MAX_SOURCES] = core::array::from_fn(|i| Source {
+                    ring: rings[i].as_ptr(),
+                    len: rings[i].len(),
+                    read_pos: (17 + i * 3) % 18,
+                    volume: if i == 0 {
+                        volume
+                    } else {
+                        32_768 + i as u32 * 1024
+                    },
+                });
+                let mut out = [0_u8; 16];
+                let mut expected = [0_u8; 16];
+                let mut work = Work::default();
+                unsafe {
+                    reference(&sources[..count], &mut expected);
+                    mix(&sources[..count], &mut out, &mut work);
+                }
+                assert_eq!(out, expected, "count={count} volume={volume}");
+                if count == 1 && volume == 65_536 {
+                    assert_eq!(work.direct_bytes, 16);
+                } else {
+                    assert_eq!(work.accumulations, count as u64 * 8);
+                    assert_eq!(work.sample_writes, 8);
+                }
+            }
+        }
+    }
+    #[test]
+    fn private_facade_rejects_an_unrepresentable_source_count() {
+        let args = Args {
+            count: MAX_SOURCES + 1,
+            ..unsafe { core::mem::zeroed() }
+        };
+        assert_eq!(unsafe { r4os_rust_audio_mixer(0, &args) }, -1);
+    }
+}
