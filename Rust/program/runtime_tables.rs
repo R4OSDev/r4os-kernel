@@ -901,6 +901,9 @@ fn configure_dev2() {
             as *const () as usize) as u64,
         device_inventory_record: (r4dev::devices::r4os_rust_r4dev_device_inventory_record
             as *const () as usize) as u64,
+        display_blit_check: (crate::display::blit_backend::check_copy
+            as c::R4DevFns::display_blit_check as *const () as usize)
+            as u64,
         device_inventory_capture: (r4dev::devices::r4os_rust_r4dev_device_inventory_capture
             as c::R4DevFns::device_inventory_capture as *const ()
             as usize) as u64,

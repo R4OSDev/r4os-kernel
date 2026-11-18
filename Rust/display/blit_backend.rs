@@ -3,7 +3,8 @@
 use super::ownership;
 use core::{cell::UnsafeCell, mem::size_of};
 pub const NAME_BYTES: usize = 24;
-pub const REQUIRED_FLAGS: u32 = 7;
+pub const REQUIRED_FLAGS: u32 = crate::contract::display_blit_backend_flag_xrgb32
+    | crate::contract::display_blit_backend_flag_synchronous;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Region {
@@ -172,6 +173,16 @@ impl Drop for Call {
 /// Caller retains the job, its pixels/regions and exact driver callback through
 /// the synchronous invocation. No callback may retain or alter those inputs.
 pub unsafe fn invoke(job: *const Job) -> InvokeResult {
+    with_backend(unsafe { (*job).region_count }, false, |descriptor| unsafe {
+        (descriptor.present)(descriptor.context, job)
+    })
+}
+
+fn with_backend(
+    region_count: u32,
+    qualify: bool,
+    callback: impl FnOnce(Descriptor) -> i32,
+) -> InvokeResult {
     let call = ownership::retain_call();
     if !call.admitted() {
         return InvokeResult::default();
@@ -185,7 +196,7 @@ pub unsafe fn invoke(job: *const Job) -> InvokeResult {
         };
         if !row.active
             || !row.admissions_open
-            || unsafe { (*job).region_count } > descriptor.max_regions
+            || region_count > descriptor.max_regions
             || row.busy == u32::MAX
         {
             return InvokeResult::default();
@@ -193,11 +204,19 @@ pub unsafe fn invoke(job: *const Job) -> InvokeResult {
         row.busy += 1;
         (descriptor, row.generation, row.owner, row.name)
     };
-    let result = unsafe { (descriptor.present)(descriptor.context, job) };
+    let result = callback(descriptor);
     {
         let _state = ownership::enter_state();
         let row = unsafe { &mut (*STATE.0.get()).registration };
         if row.active && row.owner == owner && row.generation == generation && row.busy != 0 {
+            if qualify && let Some(active) = row.descriptor.as_mut() {
+                let tested = crate::contract::display_blit_backend_flag_self_tested;
+                if result == 0 {
+                    active.flags |= tested;
+                } else {
+                    active.flags &= !tested;
+                }
+            }
             row.busy -= 1
         }
     }
@@ -207,6 +226,71 @@ pub unsafe fn invoke(job: *const Job) -> InvokeResult {
         name,
     }
 }
+/// Runs only on an explicit graphics diagnosis. The synchronous driver call
+/// borrows private RAM. Its registration remains pinned throughout comparison.
+pub extern "C" fn check_copy() -> i32 {
+    let mut source = [0_u32; 96];
+    for (i, pixel) in source.iter_mut().enumerate() {
+        *pixel = 0x1100_0000 | i as u32;
+    }
+    const CLEAR: u32 = 0xa5a5_a5a5;
+    let mut target = [CLEAR; 96];
+    let regions = [
+        Region {
+            dst_x: 2,
+            dst_y: 1,
+            src_x: 5,
+            src_y: 0,
+            w: 10,
+            h: 2,
+        },
+        Region {
+            dst_x: 20,
+            dst_y: 2,
+            src_x: 1,
+            src_y: 2,
+            w: 5,
+            h: 1,
+        },
+    ];
+    let job = Job {
+        version: 1,
+        size: size_of::<Job>() as u32,
+        format: 1,
+        flags: 0,
+        target_address: target.as_mut_ptr().addr() as u64,
+        target_width: 32,
+        target_height: 3,
+        target_pitch_pixels: 32,
+        source_address: source.as_ptr().addr() as u64,
+        source_stride_pixels: 32,
+        source_pixel_count: source.len() as u32,
+        region_count: regions.len() as u32,
+        regions_address: regions.as_ptr().addr() as u64,
+    };
+    with_backend(job.region_count, true, |descriptor| {
+        let rc = unsafe { (descriptor.present)(descriptor.context, &job) };
+        if rc != 0 {
+            return rc;
+        }
+        for (i, actual) in target.iter().enumerate() {
+            let (x, y) = (i % 32, i / 32);
+            let expected = if y >= 1 && (2..12).contains(&x) {
+                source[(y - 1) * 32 + 5 + (x - 2)]
+            } else if y == 2 && (20..25).contains(&x) {
+                source[2 * 32 + 1 + (x - 20)]
+            } else {
+                CLEAR
+            };
+            if *actual != expected {
+                return -2;
+            }
+        }
+        0
+    })
+    .result
+}
+
 pub fn prepare_owner_cleanup(owner: u32) -> bool {
     let _state = ownership::enter_state();
     let row = unsafe { &mut (*STATE.0.get()).registration };
