@@ -1377,13 +1377,16 @@ fn set_cursor_after_page(position: usize, next_page: u64) {
         s.cursor_page = 0;
     });
 }
-fn scan_span(range_slot: usize, position: usize, slot: u16, page_floor: u64) -> Option<u64> {
+fn scan_span(range_slot: usize, slot: u16, page_floor: u64, page_limit: u64) -> Option<u64> {
     ps::with(|s| s.hot.reclaim_cursor_span_steps = s.hot.reclaim_cursor_span_steps.wrapping_add(1));
     let span = ps::with(|s| s.spans[usize::from(slot)]);
     if span.flags & page_state_flag_committed == 0 {
         return None;
     }
-    let end = span.first_page.checked_add(span.page_count)?;
+    let end = span
+        .first_page
+        .checked_add(span.page_count)?
+        .min(page_limit);
     if end <= page_floor {
         return None;
     }
@@ -1392,7 +1395,6 @@ fn scan_span(range_slot: usize, position: usize, slot: u16, page_floor: u64) -> 
         ps::with(|s| {
             s.hot.reclaim_cursor_page_steps = s.hot.reclaim_cursor_page_steps.wrapping_add(1)
         });
-        set_cursor_after_page(position, page + 1);
         let address = range.base + page * PAGE;
         if range.guard_len != 0
             && virt_policy::r4os_rust_vm_overlap(address, PAGE, range.guard_base, range.guard_len)
@@ -1485,28 +1487,35 @@ fn scan_span(range_slot: usize, position: usize, slot: u16, page_floor: u64) -> 
 }
 fn evict_one(backing: backing::Result, path: *const u8, owner: Option<u64>) -> EvictionStep {
     let mut held = Held::acquire();
-    if count() == 0 {
+    let range_count = count();
+    if range_count == 0 {
         return EvictionStep::EMPTY;
     }
     let mut start_position = 0;
     let mut start_page = 0;
     if let Some(slot) = ps::with(|s| s.cursor_slot)
         && let Some(position) = vm_index::position(usize::from(slot))
-        && position < count()
+        && position < range_count
     {
         start_position = position;
-        start_page = ps::with(|s| s.cursor_page);
+        start_page = ps::with(|s| s.cursor_page).min(vm_ranges::read(usize::from(slot)).len / PAGE);
     }
-    let mut visited = 0;
+    // The final visit covers only the prefix omitted on the first visit.
     let mut position = start_position;
-    while visited < count() {
+    for visited in 0..range_count + usize::from(start_page != 0) {
         let range_slot = ordered(position);
         let range = vm_ranges::read(range_slot);
         ps::with(|s| {
             s.hot.reclaim_cursor_range_steps = s.hot.reclaim_cursor_range_steps.wrapping_add(1)
         });
         let page_floor = if visited == 0 { start_page } else { 0 };
-        if range.active()
+        let page_limit = if visited == range_count {
+            start_page
+        } else {
+            range.len / PAGE
+        };
+        if page_floor < page_limit
+            && range.active()
             && range.pager_io_count == 0
             && range.partial_uncommit_len == 0
             && range.window == 6
@@ -1517,7 +1526,8 @@ fn evict_one(backing: backing::Result, path: *const u8, owner: Option<u64>) -> E
         {
             let mut cursor = range.page_state_span_head.get();
             while let Some(slot) = cursor {
-                if let Some(page) = scan_span(range_slot, position, slot, page_floor) {
+                if let Some(page) = scan_span(range_slot, slot, page_floor, page_limit) {
+                    set_cursor_after_page(position, page + 1);
                     held.release();
                     return evict_resident(range.id, page, backing, path);
                 }
@@ -1526,17 +1536,19 @@ fn evict_one(backing: backing::Result, path: *const u8, owner: Option<u64>) -> E
                 cursor = ps::with(|s| s.spans[usize::from(slot)].next);
             }
         }
+        if visited == range_count {
+            break;
+        }
         position += 1;
-        if position == count() {
+        if position == range_count {
             position = 0;
             ps::with(|s| s.hot.reclaim_cursor_wraps = s.hot.reclaim_cursor_wraps.wrapping_add(1));
         }
-        ps::with(|s| {
-            s.cursor_slot = Some(ordered(position) as u16);
-            s.cursor_page = 0;
-        });
-        visited += 1;
     }
+    ps::with(|s| {
+        s.cursor_slot = Some(ordered(start_position) as u16);
+        s.cursor_page = start_page;
+    });
     EvictionStep::EMPTY
 }
 // Reclaim updates below occur outside I/O and take only bounded VM admission.
