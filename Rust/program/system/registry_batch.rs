@@ -17,9 +17,46 @@ fn fail(out: &mut c::RegistryBatchResult, index: usize, result: i32) -> Option<i
     out.status = c::registry_batch_status_validation_failed;
     Some(result)
 }
-fn validate(
+/// Sorted lookup covers only keys touched by this batch. The contract caps its
+/// size. Operations and the reported failure index remain in caller order.
+pub(super) struct Targets<'a> {
+    entries: [(&'a [u8], &'a [u8]); c::registry_batch_operation_max as usize],
+    len: usize,
+}
+impl<'a> Targets<'a> {
+    fn new() -> Self {
+        Self {
+            entries: [(&[], &[]); c::registry_batch_operation_max as usize],
+            len: 0,
+        }
+    }
+    fn position(&self, key: &[u8], name: &[u8]) -> Result<usize, usize> {
+        self.entries[..self.len].binary_search_by(|&(path, value)| {
+            path::compare_path(path, key).then_with(|| {
+                value
+                    .iter()
+                    .map(u8::to_ascii_uppercase)
+                    .cmp(name.iter().map(u8::to_ascii_uppercase))
+            })
+        })
+    }
+    fn insert(&mut self, key: &'a [u8], name: &'a [u8]) -> bool {
+        let Err(pos) = self.position(key, name) else {
+            return false;
+        };
+        self.entries.copy_within(pos..self.len, pos + 1);
+        self.entries[pos] = (key, name);
+        self.len += 1;
+        true
+    }
+    pub(super) fn contains(&self, key: &[u8], name: &[u8]) -> bool {
+        self.position(key, name).is_ok()
+    }
+}
+fn validate<'a>(
     operations: &[c::RegistryBatchOperation],
-    blob: &[u8],
+    blob: &'a [u8],
+    targets: &mut Targets<'a>,
     out: &mut c::RegistryBatchResult,
 ) -> Option<i32> {
     for (index, operation) in operations.iter().enumerate() {
@@ -64,17 +101,8 @@ fn validate(
                 return fail(out, index, c::registry_api_result_invalid);
             }
         }
-        for prior in &operations[..index] {
-            if path::equal_path(
-                slice(blob, prior.key_path_offset, prior.key_path_len)
-                    .expect("Validated prior batch path"),
-                key,
-            ) && slice(blob, prior.value_name_offset, prior.value_name_len)
-                .expect("Validated prior batch name")
-                .eq_ignore_ascii_case(name)
-            {
-                return fail(out, index, c::registry_api_result_invalid);
-            }
+        if !targets.insert(key, name) {
+            return fail(out, index, c::registry_api_result_invalid);
         }
     }
     None
@@ -113,7 +141,8 @@ pub unsafe extern "C" fn r4os_rust_sys_registry_batch(
         }
         let operations = core::slice::from_raw_parts(operations, count as usize);
         let blob = core::slice::from_raw_parts(blob, len as usize);
-        if let Some(error) = validate(operations, blob, &mut *out) {
+        let mut targets = Targets::new();
+        if let Some(error) = validate(operations, blob, &mut targets, &mut *out) {
             return error;
         }
         let _transaction = s::Transaction::acquire();
@@ -132,7 +161,7 @@ pub unsafe extern "C" fn r4os_rust_sys_registry_batch(
             (*out).status = c::registry_batch_status_commit_failed;
             return loaded;
         }
-        let candidate = build::batch(operations, blob, &mut *out);
+        let candidate = build::batch(operations, blob, &targets, &mut *out);
         if candidate.result != c::registry_api_result_ok {
             (*out).status = c::registry_batch_status_validation_failed;
             (*out).generation_after = (*out).generation_before;

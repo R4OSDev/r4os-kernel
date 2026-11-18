@@ -77,21 +77,18 @@ pub fn write_z(out: &mut [u8], value: &[u8]) -> bool {
     out[value.len()] = 0;
     true
 }
+pub(super) fn compare_path(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    fn normalized(byte: &u8) -> u8 {
+        if *byte == b'/' {
+            b'\\'
+        } else {
+            byte.to_ascii_uppercase()
+        }
+    }
+    a.iter().map(normalized).cmp(b.iter().map(normalized))
+}
 pub fn equal_path(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(&a, &b)| {
-            let a = if a == b'/' {
-                b'\\'
-            } else {
-                a.to_ascii_uppercase()
-            };
-            let b = if b == b'/' {
-                b'\\'
-            } else {
-                b.to_ascii_uppercase()
-            };
-            a == b
-        })
+    a.len() == b.len() && compare_path(a, b).is_eq()
 }
 pub(super) fn separator(ch: u8) -> bool {
     matches!(ch, b'\\' | b'/')

@@ -3,7 +3,7 @@
 use super::super::{
     registry_format as f, registry_format_builder as builder, registry_format_types as t,
 };
-use super::{path, registry_batch as batch, registry_state as s};
+use super::{registry_batch as batch, registry_state as s};
 use crate::contract as c;
 use core::ptr;
 #[derive(Clone, Copy)]
@@ -123,8 +123,7 @@ unsafe fn collect(
     list: &mut List,
     skip: Option<u32>,
     name: &[u8],
-    operations: &[c::RegistryBatchOperation],
-    blob: &[u8],
+    targets: Option<&batch::Targets<'_>>,
 ) -> i32 {
     unsafe {
         for index in 0..hive.header.key_count {
@@ -141,16 +140,7 @@ unsafe fn collect(
                 if skip == Some(index) && value_name.eq_ignore_ascii_case(name) {
                     continue;
                 }
-                if operations.iter().any(|operation| {
-                    path::equal_path(
-                        path,
-                        batch::slice(blob, operation.key_path_offset, operation.key_path_len)
-                            .expect("Validated registry batch path"),
-                    ) && value_name.eq_ignore_ascii_case(
-                        batch::slice(blob, operation.value_name_offset, operation.value_name_len)
-                            .expect("Validated registry batch name"),
-                    )
-                }) {
+                if targets.is_some_and(|targets| targets.contains(path, value_name)) {
                     continue;
                 }
                 if !list.append(
@@ -250,7 +240,7 @@ pub(super) unsafe fn mutation(
                     return Candidate::fail(c::registry_api_result_value_not_found);
                 }
             }
-            let result = collect(hive, &mut list, target, name, &[], &[]);
+            let result = collect(hive, &mut list, target, name, None);
             if result != c::registry_api_result_ok {
                 return Candidate::fail(result);
             }
@@ -270,6 +260,7 @@ pub(super) unsafe fn mutation(
 pub(super) unsafe fn batch(
     operations: &[c::RegistryBatchOperation],
     blob: &[u8],
+    targets: &batch::Targets<'_>,
     result: &mut c::RegistryBatchResult,
 ) -> Candidate {
     unsafe {
@@ -313,7 +304,7 @@ pub(super) unsafe fn batch(
         (*s::slot(index)).invalidate(true);
         let mut list = List::new();
         if let Some(hive) = current {
-            let code = collect(hive, &mut list, None, &[], operations, blob);
+            let code = collect(hive, &mut list, None, &[], Some(targets));
             if code != c::registry_api_result_ok {
                 return Candidate::fail(code);
             }
