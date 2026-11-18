@@ -1387,56 +1387,71 @@ fn scan_span(range_slot: usize, slot: u16, page_floor: u64, page_limit: u64) -> 
         .first_page
         .checked_add(span.page_count)?
         .min(page_limit);
-    if end <= page_floor {
+    let first = span.first_page.max(page_floor);
+    if end <= first {
         return None;
     }
     let range = vm_ranges::read(range_slot);
-    for page in span.first_page.max(page_floor)..end {
+    let guard = guard_page_interval(range, first, end);
+    let guarded = guard.end - guard.start;
+    let disqualifiers = page_state_flag_pinned | page_state_flag_busy | page_state_flag_error;
+    let resident = span.flags & page_state_flag_resident != 0;
+    if !resident || span.flags & disqualifiers != 0 {
+        let pages = end - first;
+        ps::with(|s| {
+            let summary = &mut s.summary;
+            let counter = if !resident {
+                &mut summary.eviction_skipped_nonresident
+            } else if span.flags & page_state_flag_pinned != 0 {
+                &mut summary.eviction_skipped_pinned
+            } else if span.flags & page_state_flag_busy != 0 {
+                &mut summary.eviction_skipped_busy
+            } else {
+                &mut summary.eviction_skipped_error
+            };
+            *counter = counter.wrapping_add(pages - guarded);
+            let disabled = if resident { pages } else { guarded };
+            summary.pager_disabled_eviction_gates =
+                summary.pager_disabled_eviction_gates.wrapping_add(disabled);
+            s.hot.reclaim_cursor_page_steps = s.hot.reclaim_cursor_page_steps.wrapping_add(pages);
+        });
+        return None;
+    }
+    let candidate = scan_candidates(range_slot, range, first..guard.start);
+    if candidate.is_some() || guarded == 0 {
+        return candidate;
+    }
+    ps::with(|s| {
+        s.summary.pager_disabled_eviction_gates = s
+            .summary
+            .pager_disabled_eviction_gates
+            .wrapping_add(guarded);
+        s.hot.reclaim_cursor_page_steps = s.hot.reclaim_cursor_page_steps.wrapping_add(guarded);
+    });
+    scan_candidates(range_slot, range, guard.end..end)
+}
+
+// The VM guard can begin or end inside a page. Count every touched page once.
+fn guard_page_interval(range: Range, first: u64, end: u64) -> core::ops::Range<u64> {
+    if range.guard_len == 0 {
+        return end..end;
+    }
+    let Some(guard_end) = range.guard_base.checked_add(range.guard_len) else {
+        return first..end;
+    };
+    let start_page = range.guard_base.saturating_sub(range.base) / PAGE;
+    let end_page = guard_end.saturating_sub(range.base).div_ceil(PAGE);
+    let start = start_page.max(first);
+    let stop = end_page.min(end);
+    if start >= stop { end..end } else { start..stop }
+}
+
+fn scan_candidates(range_slot: usize, range: Range, pages: core::ops::Range<u64>) -> Option<u64> {
+    for page in pages {
         ps::with(|s| {
             s.hot.reclaim_cursor_page_steps = s.hot.reclaim_cursor_page_steps.wrapping_add(1)
         });
         let address = range.base + page * PAGE;
-        if range.guard_len != 0
-            && virt_policy::r4os_rust_vm_overlap(address, PAGE, range.guard_base, range.guard_len)
-        {
-            ps::with(|s| {
-                s.summary.pager_disabled_eviction_gates =
-                    s.summary.pager_disabled_eviction_gates.wrapping_add(1)
-            });
-            continue;
-        }
-        if span.flags & page_state_flag_resident == 0 {
-            ps::with(|s| {
-                s.summary.eviction_skipped_nonresident =
-                    s.summary.eviction_skipped_nonresident.wrapping_add(1)
-            });
-            continue;
-        }
-        if span.flags & page_state_flag_pinned != 0 {
-            ps::with(|s| {
-                s.summary.eviction_skipped_pinned =
-                    s.summary.eviction_skipped_pinned.wrapping_add(1);
-                s.summary.pager_disabled_eviction_gates =
-                    s.summary.pager_disabled_eviction_gates.wrapping_add(1);
-            });
-            continue;
-        }
-        if span.flags & page_state_flag_busy != 0 {
-            ps::with(|s| {
-                s.summary.eviction_skipped_busy = s.summary.eviction_skipped_busy.wrapping_add(1);
-                s.summary.pager_disabled_eviction_gates =
-                    s.summary.pager_disabled_eviction_gates.wrapping_add(1);
-            });
-            continue;
-        }
-        if span.flags & page_state_flag_error != 0 {
-            ps::with(|s| {
-                s.summary.eviction_skipped_error = s.summary.eviction_skipped_error.wrapping_add(1);
-                s.summary.pager_disabled_eviction_gates =
-                    s.summary.pager_disabled_eviction_gates.wrapping_add(1);
-            });
-            continue;
-        }
         if !mapped(address) {
             ps::with(|s| {
                 s.summary.eviction_skipped_unmapped =
