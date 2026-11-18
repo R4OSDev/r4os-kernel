@@ -5,6 +5,7 @@ use super::{
     context::{self as ctx, PathBuffers},
     fs, path, registry_state, stream,
 };
+use crate::fs::vfs::copy::Target;
 use crate::{
     contract as c,
     fs::{
@@ -18,7 +19,7 @@ use core::{
     ffi::c_void,
     mem::size_of,
     ptr,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 macro_rules! some {
     ($value:expr,$error:expr) => {
@@ -28,12 +29,11 @@ macro_rules! some {
         }
     };
 }
-static SEQUENCE: AtomicU32 = AtomicU32::new(0);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 pub(crate) fn install_program_cancellation() {
     CANCEL.store(true, Ordering::Release)
 }
-struct CopyIo {
+struct CopyIo<'a> {
     lease: *mut request::Guard,
     source: fs::Volume,
     target: fs::Volume,
@@ -41,14 +41,10 @@ struct CopyIo {
     target_letter: u8,
     entry: fs::Entry,
     parent: u64,
-    target_name: Bytes,
-    stage: [u8; 13],
-    stage_len: usize,
+    publication: Target<'a>,
+    original: Option<&'a fs::Entry>,
     stage_owned: bool,
     readers_allowed: bool,
-}
-unsafe fn stage<'a>(io: *const CopyIo) -> &'a [u8] {
-    unsafe { core::slice::from_raw_parts(ptr::addr_of!((*io).stage).cast(), (*io).stage_len) }
 }
 unsafe extern "C" fn cancelled(_: *mut c_void) -> bool {
     CANCEL.load(Ordering::Acquire)
@@ -57,30 +53,14 @@ unsafe extern "C" fn cancelled(_: *mut c_void) -> bool {
 unsafe extern "C" fn prepare(context: *mut c_void) -> bool {
     unsafe {
         let io = context.cast::<CopyIo>();
-        for _ in 0..128 {
-            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) & 0xffffff;
-            let mut name = *b"~C000000.TMP\0";
-            for index in 0..6 {
-                name[2 + index] =
-                    b"0123456789ABCDEF"[((sequence >> (4 * (5 - index))) & 15) as usize];
-            }
-            (*io).stage = name;
-            let name = &name[..12];
-            if name.eq_ignore_ascii_case((*io).target_name.slice()) {
-                continue;
-            }
-            let mut entry = fs::Entry::EMPTY;
-            match fs::lookup((*io).target, (*io).parent, name, false, &mut entry) {
-                0 => continue,
-                2 => return false,
-                1 => {}
-                _ => unreachable!(),
-            }
-            (*io).stage_len = name.len();
-            (*io).stage_owned = true;
-            return fs::write((*io).target, (*io).parent, stage(io), &[], false);
-        }
-        false
+        (*io).stage_owned = true;
+        fs::write(
+            (*io).target,
+            (*io).parent,
+            &(*io).publication.stage,
+            &[],
+            false,
+        )
     }
 }
 unsafe extern "C" fn allow_readers(context: *mut c_void) {
@@ -132,7 +112,7 @@ unsafe extern "C" fn append(
             fs::Args {
                 volume: (*io).target,
                 parent: (*io).parent,
-                name: fs::bytes(stage(io)),
+                name: fs::bytes(&(*io).publication.stage),
                 offset,
                 data: fs::Bytes { data, len },
                 ..Default::default()
@@ -168,41 +148,7 @@ unsafe extern "C" fn publish(context: *mut c_void) -> bool {
         let Some(mut request) = fs::Request::volume(17, (*io).target_letter, (*io).target) else {
             return false;
         };
-        let mut old = fs::Entry::EMPTY;
-        match fs::lookup(
-            (*io).target,
-            (*io).parent,
-            (*io).target_name.slice(),
-            false,
-            &mut old,
-        ) {
-            0 => {
-                if old.is_dir()
-                    || old.read_only()
-                    || !fs::delete((*io).target, (*io).parent, (*io).target_name.slice())
-                {
-                    return false;
-                }
-            }
-            1 => {}
-            2 => return false,
-            _ => unreachable!(),
-        }
-        request.ok = fs::run(
-            fs::op::PUBLISH_COPY,
-            fs::Args {
-                volume: (*io).target,
-                parent: (*io).parent,
-                name: fs::bytes(stage(io)),
-                second: fs::bytes((*io).target_name.slice()),
-                ..Default::default()
-            },
-            ptr::null_mut(),
-        )
-        .present;
-        if request.ok {
-            (*io).stage_owned = false;
-        }
+        request.ok = (*io).publication.publish((*io).original);
         request.ok
     }
 }
@@ -215,7 +161,7 @@ unsafe extern "C" fn abort(context: *mut c_void) {
         let Some(mut request) = fs::Request::volume(13, (*io).target_letter, (*io).target) else {
             return;
         };
-        request.ok = fs::delete((*io).target, (*io).parent, stage(io));
+        request.ok = fs::delete((*io).target, (*io).parent, &(*io).publication.stage);
         if request.ok {
             (*io).stage_owned = false;
         }
@@ -396,6 +342,7 @@ unsafe fn perform(
             {
                 return -9;
             }
+            let publication = some!(Target::select(tv, target_parent, path::base(tp)), -9);
             let mut io = CopyIo {
                 lease: &mut request.guard,
                 source: sv,
@@ -404,9 +351,8 @@ unsafe fn perform(
                 target_letter: tl,
                 entry,
                 parent: target_parent,
-                target_name: Bytes::from_slice(path::base(tp)),
-                stage: [0; 13],
-                stage_len: 0,
+                publication,
+                original: existing.as_ref(),
                 stage_owned: false,
                 readers_allowed: false,
             };

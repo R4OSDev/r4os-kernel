@@ -250,7 +250,12 @@ pub(crate) unsafe fn ntfs(op: u8, args: *const Args, out: *mut Entry) -> Output 
             native.other = view(a.data);
             20
         }
-        12 | 21 => 30,
+        12 => {
+            native.name = view(a.second);
+            native.other = view(a.name);
+            34
+        }
+        21 => 30,
         15 => 28,
         16 => 24,
         17 => 25,

@@ -220,57 +220,6 @@ unsafe fn append_internal(
     }
 }
 #[inline(never)]
-pub(super) unsafe fn publish_copy(
-    original: Volume,
-    parent: u32,
-    staged: Bytes,
-    target: Bytes,
-) -> bool {
-    unsafe {
-        if !n::valid_short(staged.view())
-            || !n::valid(target.view())
-            || n::equal_ascii(staged.view(), target.view())
-        {
-            return false;
-        }
-        let Some(v) = s::mutation(original) else {
-            return false;
-        };
-        s::invalidate_append();
-        let mut e = MaybeUninit::uninit();
-        if d::find(v, parent, target, e.as_mut_ptr()) != Lookup::NotFound {
-            return false;
-        }
-        let mut loc = MaybeUninit::<Location>::uninit();
-        if d::find_location(v, parent, staged, loc.as_mut_ptr()) != Lookup::Found {
-            return false;
-        }
-        let loc = loc.assume_init();
-        if loc.entry.is_dir() || loc.entry.read_only() || loc.lfn_count != 0 {
-            return false;
-        }
-        let mut raw = [0; SLOT_MAX * 32];
-        let Some(len) = d::build_entries(
-            v,
-            parent,
-            target,
-            0x20,
-            loc.entry.first_cluster,
-            loc.entry.size,
-            &mut raw,
-        ) else {
-            return false;
-        };
-        if !d::detach(v, loc) || !s::flush_mutation(v) {
-            return false;
-        }
-        if !d::write_entries(v, parent, Bytes::of(&raw[..len])) {
-            return false;
-        }
-        s::flush_mutation(v)
-    }
-}
-#[inline(never)]
 pub(super) unsafe fn copy(
     src: Volume,
     dst: Volume,
@@ -637,7 +586,7 @@ pub(super) unsafe fn replace(
         }
         if let Some(t) = target {
             if n::same_ownership(t.entry, staged.entry) {
-                if !d::detach(v, staged) {
+                if !ownership_flush(v) || !d::detach(v, staged) {
                     return Replace::Io;
                 }
                 return if s::flush_volume(v) {
@@ -717,8 +666,6 @@ pub(super) unsafe fn replace_create(
         {
             return Replace::Invalid;
         }
-        s::invalidate_append();
-        s::invalidate_extents();
         if !n::valid_short(target_name.view()) {
             return Replace::NotAtomic;
         }
@@ -728,18 +675,38 @@ pub(super) unsafe fn replace_create(
         {
             return Replace::Alias;
         }
+        match d::optional_location(v, parent, backup_name) {
+            Ok(None) => publish_copy(v, parent, staged_name, target_name),
+            Ok(Some(_)) => Replace::Conflict,
+            Err(_) => Replace::Io,
+        }
+    }
+}
+
+// Ordinary copies also support creating long names. Keep the flushed stage
+// until the target's short entry names its chain, even for a multi-slot LFN.
+#[inline(never)]
+pub(super) unsafe fn publish_copy(
+    v: Volume,
+    parent: u32,
+    staged_name: Bytes,
+    target_name: Bytes,
+) -> Replace {
+    unsafe {
+        if !n::valid(target_name.view()) || !n::valid_short(staged_name.view()) {
+            return Replace::Invalid;
+        }
+        if n::equal_ascii(target_name.view(), staged_name.view()) {
+            return Replace::Alias;
+        }
+        s::invalidate_append();
+        s::invalidate_extents();
         let Ok(target) = d::optional_location(v, parent, target_name) else {
             return Replace::Io;
         };
         let Ok(staged) = d::optional_location(v, parent, staged_name) else {
             return Replace::Io;
         };
-        let Ok(backup) = d::optional_location(v, parent, backup_name) else {
-            return Replace::Io;
-        };
-        if backup.is_some() {
-            return Replace::Conflict;
-        }
         let Some(staged) = staged else {
             return if target.is_none() {
                 Replace::NotFound
@@ -763,15 +730,15 @@ pub(super) unsafe fn replace_create(
                     return Replace::Conflict;
                 }
             }
-            if !ownership_flush(v) {
-                return Replace::Io;
-            }
-            let Ok(Some(t)) = d::optional_location(v, parent, target_name) else {
-                return Replace::Io;
-            };
-            if !n::same_ownership(t.entry, staged.entry) {
-                return Replace::Conflict;
-            }
+        }
+        if !ownership_flush(v) {
+            return Replace::Io;
+        }
+        let Ok(Some(t)) = d::optional_location(v, parent, target_name) else {
+            return Replace::Io;
+        };
+        if !n::same_ownership(t.entry, staged.entry) {
+            return Replace::Conflict;
         }
         let Ok(stage_after) = d::optional_location(v, parent, staged_name) else {
             return Replace::Io;

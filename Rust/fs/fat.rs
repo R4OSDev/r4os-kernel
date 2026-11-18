@@ -94,7 +94,7 @@ pub unsafe extern "C" fn r4os_rust_fat_run(
                 true,
                 a.data,
             ) as i32),
-            12 => Output::boolean(m::publish_copy(v, a.parent, a.name, a.second)),
+            12 => Output::boolean(m::publish_copy(v, a.parent, a.name, a.second) == Replace::Ok),
             13 => Output::boolean(m::copy(
                 v,
                 a.other,

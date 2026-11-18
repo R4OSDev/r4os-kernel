@@ -1,5 +1,7 @@
 //! Original VFS mount/identity/dispatch/copy owner. Exact mounted generations
 //! stay under the storage owner; backend waits never retain its table borrow.
+#[path = "vfs_copy.rs"]
+pub(crate) mod copy;
 use super::vfs_types::{self as t, Args, Entry, Result as Output, Volume, op};
 use crate::{
     memory::{heap, owner::Guard},
@@ -497,18 +499,8 @@ unsafe fn call(operation: u8, args: Args, output: *mut Entry) -> Output {
 unsafe fn run(operation: u8, args: Args, output: *mut Entry) -> Output {
     let result = match operation {
         op::COPY => {
-            if args.volume.kind == 0 && args.other.kind == 0 {
-                unsafe {
-                    backend(
-                        if args.flag {
-                            op::COPY
-                        } else {
-                            op::COPY_NO_REPLACE
-                        },
-                        args,
-                        output,
-                    )
-                }
+            if !args.flag && args.volume.kind == 0 && args.other.kind == 0 {
+                unsafe { backend(op::COPY_NO_REPLACE, args, output) }
             } else {
                 let chunk = heap::r4os_rust_heap_alloc(32768, 1);
                 if chunk.is_null() {
@@ -568,7 +560,12 @@ unsafe fn copy_buffered(args: Args) -> bool {
             chunks: 0,
             max_chunk: 0,
         });
-        if source.is_dir() || args.buffer_len == 0 || source.size > u64::from(u32::MAX) {
+        if source.is_dir()
+            || args.name.len == 0
+            || args.name.data.is_null()
+            || args.buffer_len == 0
+            || source.size > u64::from(u32::MAX)
+        {
             return false;
         }
         let destination = Args {
@@ -576,7 +573,7 @@ unsafe fn copy_buffered(args: Args) -> bool {
             ..args
         };
         let mut existing = Entry::EMPTY;
-        match run(op::LOOKUP, destination, &mut existing).status {
+        let original = match run(op::LOOKUP, destination, &mut existing).status {
             0 => {
                 if !args.flag || existing.is_dir() || existing.read_only() {
                     return false;
@@ -600,19 +597,29 @@ unsafe fn copy_buffered(args: Args) -> bool {
                         return false;
                     }
                 }
-                if !run(op::DELETE, destination, ptr::null_mut()).present {
-                    return false;
-                }
+                Some(&existing)
             }
-            1 => {}
+            1 => None,
             2 => return false,
             _ => unreachable!(),
+        };
+        let name = core::slice::from_raw_parts(destination.name.data, destination.name.len);
+        let Some(target) = copy::Target::select(destination.volume, destination.parent, name)
+        else {
+            return false;
+        };
+        let stage = Args {
+            name: t::Bytes {
+                data: target.stage.as_ptr(),
+                len: target.stage.len(),
+            },
+            ..destination
+        };
+        if !copy_payload(args, source, stage) {
+            let _ = run(op::DELETE, stage, ptr::null_mut());
+            return false;
         }
-        let completed = copy_payload(args, source, destination);
-        if !completed {
-            let _ = run(op::DELETE, destination, ptr::null_mut());
-        }
-        completed
+        target.publish(original)
     }
 }
 unsafe fn copy_payload(args: Args, source: Entry, destination: Args) -> bool {
