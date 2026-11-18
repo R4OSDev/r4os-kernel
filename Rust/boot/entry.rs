@@ -98,7 +98,6 @@ pub fn start() -> ! {
         require_test(action(33), b"Boot scheduler priority selftest failed");
     }
     action(34); // unchanged BOOTSELFTEST ON/OFF diagnostic
-    status(b"Task-Registry pruefen");
     action(35);
     if config::ENABLE_STACK_GUARD_TEST {
         action(36);
@@ -255,7 +254,10 @@ unsafe fn boot_action(action: u32) -> bool {
             b"BOOTSELFTEST OFF heap=0 page_tables=0 sync=0 priority=0\r\n"
         }),
         35 => {
-            sched::task_probe::r4os_rust_task_registry_selftest();
+            if let Some(choice) = sched::task_probe::selected() {
+                status(b"Task-Registry pruefen");
+                return sched::task_probe::run_selected(choice);
+            }
         }
         36 => {
             if config::ENABLE_STACK_GUARD_TEST {

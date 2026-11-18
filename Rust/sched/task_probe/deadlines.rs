@@ -230,7 +230,19 @@ pub unsafe fn retained_idle() -> bool {
         runtime::restore_runtime(flags);
         let start = now();
         sleep(EARLY_TICKS, b"taskreg-retained-idle");
-        let elapsed = now().saturating_sub(start);
+        let woke = now();
+        let elapsed = woke.saturating_sub(start);
+        let due = start.saturating_add(EARLY_TICKS);
+        // A device IRQ or IPI may let the scheduler wake a due sleeper before
+        // the next periodic timer IRQ. Check sleep duration at wake, then give
+        // the restored periodic source a bounded interval to show delivery.
+        for _ in 0..1_000_000 {
+            if timer::observed_last_irq_tick() >= due || now().saturating_sub(woke) >= LATENESS_BAR
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
         let after = timer::deadline_stats();
         let passed = ok
             && finite
@@ -241,7 +253,7 @@ pub unsafe fn retained_idle() -> bool {
             && after.periodic_resumes >= before.periodic_resumes + 2
             && after.runtime_fallbacks == before.runtime_fallbacks
             && elapsed >= EARLY_TICKS
-            && after.last_irq_tick >= start.saturating_add(EARLY_TICKS);
+            && after.last_irq_tick >= due;
         if !passed {
             puts(b"TIMER08864 retained-idle FAIL finite=");
             dec(u64::from(finite));
@@ -252,7 +264,7 @@ pub unsafe fn retained_idle() -> bool {
             puts(b" last_irq=");
             dec(after.last_irq_tick);
             puts(b" due=");
-            dec(start.saturating_add(EARLY_TICKS));
+            dec(due);
             puts(b"\r\n");
             return false;
         }

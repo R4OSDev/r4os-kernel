@@ -16,112 +16,104 @@ mod roles;
 mod run;
 mod state;
 mod workers;
-#[repr(C)]
-struct Span {
-    pointer: *const u8,
-    len: usize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Case {
+    TscDeadline,
+    IdleDeadline,
+    Xsaveopt,
+    XstateContract,
+    FpuEnvironment,
+    FpuGuards,
+    FpuWork,
+    All,
 }
 
-fn option_is(value: &[u8], wanted: &[u8]) -> bool {
-    value.len() == wanted.len()
-        && value
-            .iter()
-            .zip(wanted)
-            .all(|(&a, &b)| a.to_ascii_lowercase() == b)
+fn select(value: &[u8]) -> Option<Case> {
+    const CASES: &[(&[u8], Case)] = &[
+        (b"tsc-deadline", Case::TscDeadline),
+        (b"idle-deadline", Case::IdleDeadline),
+        (b"xsaveopt", Case::Xsaveopt),
+        (b"xstate-contract", Case::XstateContract),
+        (b"fpu-environment", Case::FpuEnvironment),
+        (b"fpu-guards", Case::FpuGuards),
+        (b"fpu-work", Case::FpuWork),
+        (b"yes", Case::All),
+    ];
+    CASES
+        .iter()
+        .find(|(name, _)| value.eq_ignore_ascii_case(name))
+        .map(|(_, case)| *case)
 }
+
+pub(crate) fn selected() -> Option<Case> {
+    let value = unsafe {
+        crate::boot::config::option_value(crate::boot::config::get(), b"TASKREGISTRY", b"selftest")
+    }?;
+    select(value)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_task_registry_selftest() -> bool {
+    selected().is_none_or(run_selected)
+}
+pub(crate) fn run_selected(choice: Case) -> bool {
     let Some(mut gate) = crate::sched::kernel_check::gate() else {
         return false;
     };
-    let result = boot_cases();
+    let result = boot_cases(choice);
     if !result || resources::retained_work() {
         gate.retain();
     }
     result
 }
-fn boot_cases() -> bool {
+fn boot_cases(choice: Case) -> bool {
     unsafe {
-        let mut option = Span {
-            pointer: core::ptr::null(),
-            len: 0,
-        };
-        task_probe_option(&mut option);
-        if option.pointer.is_null() {
-            return true;
-        }
-        let value = core::slice::from_raw_parts(option.pointer, option.len);
-        if option_is(value, b"tsc-deadline") {
-            if !run::prepare() {
-                return false;
+        match choice {
+            Case::TscDeadline => {
+                if !run::prepare() {
+                    return false;
+                }
+                // Reuse the original strict checkpoint/earlier-IRQ and bounded
+                // idle-timeout oracles before the isolated hardware/source cases.
+                let idle = deadlines::probe() && deadlines::storm();
+                let line = if idle {
+                    b"[TSCDEADLINE-IDLE] result=PASS checkpoint=finite earlier=real-irq due=65 bounded=64+1 future=held\r\n".as_slice()
+                } else {
+                    b"[TSCDEADLINE-CHECK] result=FAILED stage=legacy-idle\r\n".as_slice()
+                };
+                crate::boot::log::text(line);
+                crate::boot::log_route::serial_write_raw(line);
+                if !idle {
+                    crate::arch::lapic::log_timer(0);
+                    return false;
+                }
+                // Keep the original real source demotion/AP wake receipt. The
+                // same BSP oracle then proves retention on the calibrated count
+                // fallback, with a new clock generation and fresh physical arm.
+                crate::arch::lapic::deadline_boot_check() && deadlines::retained_idle()
             }
-            // Reuse the original strict checkpoint/earlier-IRQ and bounded
-            // idle-timeout oracles before the isolated hardware/source cases.
-            let idle = deadlines::probe() && deadlines::storm();
-            let line = if idle {
-                b"[TSCDEADLINE-IDLE] result=PASS checkpoint=finite earlier=real-irq due=65 bounded=64+1 future=held\r\n".as_slice()
-            } else {
-                b"[TSCDEADLINE-CHECK] result=FAILED stage=legacy-idle\r\n".as_slice()
-            };
-            crate::boot::log::text(line);
-            crate::boot::log_route::serial_write_raw(line);
-            if !idle {
-                crate::arch::lapic::log_timer(0);
-                return false;
+            Case::IdleDeadline => {
+                if !deadlines::retained_idle() || !deadlines::storm() {
+                    return helpers::fail(b"idle-deadline");
+                }
+                helpers::puts(b"TASKREG08244 idle-timeout PASS due=65 bounded=64+1 future=held timer-irq=unchanged\r\n");
+                true
             }
-            // Keep the original real source demotion/AP wake receipt. The
-            // same BSP oracle then proves retention on the calibrated count
-            // fallback, with a new clock generation and fresh physical arm.
-            return crate::arch::lapic::deadline_boot_check() && deadlines::retained_idle();
-        }
-        if option_is(value, b"idle-deadline") {
-            if !deadlines::retained_idle() || !deadlines::storm() {
-                return helpers::fail(b"idle-deadline");
+            Case::Xsaveopt => fpu_opt::run(),
+            Case::XstateContract => fpu_contract::run(),
+            Case::FpuEnvironment => fpu_environment::run(),
+            Case::FpuGuards => resources::work_fpu(),
+            Case::FpuWork => {
+                if !resources::work_fpu() {
+                    return false;
+                }
+                if !resources::reserve_probe() {
+                    return helpers::fail(b"fpu-reserve");
+                }
+                helpers::puts(b"TASKREG08201 fpu-reserve PASS admission=oom reuse=2 initial=clean guard-roundtrip=preserved\r\n");
+                true
             }
-            helpers::puts(b"TASKREG08244 idle-timeout PASS due=65 bounded=64+1 future=held timer-irq=unchanged\r\n");
-            return true;
+            Case::All => run::run(),
         }
-        if option_is(value, b"xsaveopt") {
-            return fpu_opt::run();
-        }
-        if option_is(value, b"xstate-contract") {
-            return fpu_contract::run();
-        }
-        if option_is(value, b"fpu-environment") {
-            return fpu_environment::run();
-        }
-        // Bounded guard-only selection, without reserve admission injection.
-        if option_is(value, b"fpu-guards") {
-            return resources::work_fpu();
-        }
-        if option_is(value, b"fpu-work") {
-            if !resources::work_fpu() {
-                return false;
-            }
-            if !resources::reserve_probe() {
-                return helpers::fail(b"fpu-reserve");
-            }
-            helpers::puts(b"TASKREG08201 fpu-reserve PASS admission=oom reuse=2 initial=clean guard-roundtrip=preserved\r\n");
-            return true;
-        }
-        if !option_is(value, b"yes") {
-            return true;
-        }
-        run::run()
-    }
-}
-
-unsafe fn task_probe_option(out: *mut Span) {
-    unsafe {
-        let v = crate::boot::config::option_value(
-            crate::boot::config::get(),
-            b"TASKREGISTRY",
-            b"selftest",
-        )
-        .unwrap_or(b"");
-        out.write(Span {
-            pointer: v.as_ptr(),
-            len: v.len(),
-        });
     }
 }
