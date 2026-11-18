@@ -98,21 +98,17 @@ pub extern "C" fn r4os_rust_boot_intro() -> bool {
     puts(b"\r\n\r\n");
     true
 }
-extern "C" fn boot_hook(byte: u8) -> bool {
-    unsafe { super::log::r4os_rust_bootlog_write(&byte, 1) };
-    true
-}
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_boot_redirect() {
     REDIRECT.store(true, Ordering::Relaxed);
-    super::log_route::set_output_hook(Some(boot_hook), false);
+    super::log_route::route_bootlog();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_boot_release() {
     REDIRECT.store(false, Ordering::Relaxed);
     crate::display::boot_display::invalidate_external();
     crate::display::diag_screen::r4os_rust_diag_reset();
-    super::log_route::set_output_hook(Some(boot_hook), false);
+    super::log_route::route_bootlog();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_boot_unroute() {

@@ -35,6 +35,17 @@ impl State {
         }
         self.total = self.total.wrapping_add(1);
     }
+    fn append_bytes(&mut self, input: &[u8]) {
+        let skipped = input.len().saturating_sub(CAPACITY);
+        let retained = &input[skipped..];
+        let start = (self.cursor + skipped % CAPACITY) % CAPACITY;
+        let first = retained.len().min(CAPACITY - start);
+        self.bytes[start..start + first].copy_from_slice(&retained[..first]);
+        self.bytes[..retained.len() - first].copy_from_slice(&retained[first..]);
+        self.wrapped |= input.len() >= CAPACITY - self.cursor;
+        self.cursor = (start + retained.len()) % CAPACITY;
+        self.total = self.total.wrapping_add(input.len() as u64);
+    }
     fn length(&self) -> usize {
         if self.wrapped { CAPACITY } else { self.cursor }
     }
@@ -63,8 +74,8 @@ pub unsafe extern "C" fn r4os_rust_bootlog_info(output: *mut Info) {
 pub unsafe extern "C" fn r4os_rust_bootlog_write(data: *const u8, len: usize) {
     let _guard = Guard::acquire(0);
     let state = unsafe { &mut *LOG.0.get() };
-    for index in 0..len {
-        state.append(unsafe { data.add(index).read() });
+    if len != 0 {
+        state.append_bytes(unsafe { core::slice::from_raw_parts(data, len) });
     }
 }
 #[unsafe(no_mangle)]

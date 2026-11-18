@@ -10,13 +10,31 @@ pub type SerialBulkSink = unsafe extern "C" fn(*const u8, usize);
 pub type SerialControlHook = extern "C" fn();
 pub type OutputHook = extern "C" fn(u8) -> bool;
 #[derive(Clone, Copy)]
+enum Hook {
+    None,
+    BootLog,
+    Custom(OutputHook),
+}
+impl Hook {
+    fn consumes(self, byte: u8) -> bool {
+        match self {
+            Self::None => false,
+            Self::BootLog => {
+                super::log::text(core::slice::from_ref(&byte));
+                true
+            }
+            Self::Custom(hook) => hook(byte),
+        }
+    }
+}
+#[derive(Clone, Copy)]
 struct State {
     serial: Option<SerialSink>,
     bulk: Option<SerialBulkSink>,
     flush: Option<SerialControlHook>,
     sync: Option<SerialControlHook>,
     console: *mut Console,
-    hook: Option<OutputHook>,
+    hook: Hook,
     intercept_serial: bool,
 }
 struct Storage(UnsafeCell<State>);
@@ -29,7 +47,7 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
     flush: None,
     sync: None,
     console: ptr::null_mut(),
-    hook: None,
+    hook: Hook::None,
     intercept_serial: false,
 }));
 fn snapshot() -> State {
@@ -62,10 +80,19 @@ pub unsafe fn set_console(console: *mut Console) {
     unsafe { (*STATE.0.get()).console = console };
 }
 pub fn set_output_hook(hook: Option<OutputHook>, intercept_serial: bool) {
+    set_hook(
+        hook.map_or(Hook::None, Hook::Custom),
+        intercept_serial && hook.is_some(),
+    );
+}
+pub(super) fn route_bootlog() {
+    set_hook(Hook::BootLog, false);
+}
+fn set_hook(hook: Hook, intercept_serial: bool) {
     let _owner = Guard::acquire(0);
     unsafe {
         (*STATE.0.get()).hook = hook;
-        (*STATE.0.get()).intercept_serial = intercept_serial && hook.is_some();
+        (*STATE.0.get()).intercept_serial = intercept_serial;
     }
 }
 pub fn serial_flush() {
@@ -124,19 +151,13 @@ pub fn console_scalar_raw(scalar: u32) {
 }
 pub fn putc(byte: u8) {
     let state = snapshot();
-    if state.intercept_serial
-        && let Some(hook) = state.hook
-        && hook(byte)
-    {
+    if state.intercept_serial && state.hook.consumes(byte) {
         return;
     }
     if let Some(putc) = state.serial {
         unsafe { putc(byte) };
     }
-    if !state.intercept_serial
-        && let Some(hook) = state.hook
-        && hook(byte)
-    {
+    if !state.intercept_serial && state.hook.consumes(byte) {
         return;
     }
     console_byte(state.console, byte);
@@ -150,15 +171,17 @@ pub fn puts(text: &[u8]) {
         return;
     }
     serial_write(state, text);
-    if let Some(hook) = state.hook {
-        for &byte in text {
-            if !hook(byte) {
-                console_byte(state.console, byte);
+    match state.hook {
+        Hook::BootLog => super::log::text(text),
+        Hook::Custom(hook) => {
+            for &byte in text {
+                if !hook(byte) {
+                    console_byte(state.console, byte);
+                }
             }
         }
-        return;
+        Hook::None => console_write(state.console, text),
     }
-    console_write(state.console, text);
 }
 pub fn hex(value: u64, digits: u8) {
     for index in (0..digits).rev() {
