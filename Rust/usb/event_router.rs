@@ -292,15 +292,20 @@ impl Mailbox {
         self.purge_where(|event| event.slot_id == slot)
     }
     fn purge_where(&mut self, predicate: impl Fn(Event) -> bool) -> usize {
-        let (mut removed, mut index) = (0, 0);
-        while index < self.count {
-            if !predicate(self.events[index]) {
-                index += 1;
+        let mut keep = 0;
+        for read in 0..self.count {
+            let event = self.events[read];
+            if predicate(event) {
                 continue;
             }
-            self.remove_at(index);
-            removed += 1;
+            if keep != read {
+                self.events[keep] = event;
+            }
+            keep += 1;
         }
+        let removed = self.count - keep;
+        self.events[keep..self.count].fill(Event::EMPTY);
+        self.count = keep;
         self.purged += removed as u64;
         removed
     }
