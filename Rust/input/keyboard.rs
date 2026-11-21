@@ -25,6 +25,7 @@ struct State {
     physical: physical::Queue,
     alt_down: bool,
     altgr_down: bool,
+    shortcut_delete: bool,
     modifier_stale_resets: u64,
     extended: bool,
     layout: u32,
@@ -44,6 +45,7 @@ static CURRENT: Storage = Storage(UnsafeCell::new(State {
     physical: physical::Queue::EMPTY,
     alt_down: false,
     altgr_down: false,
+    shortcut_delete: false,
     modifier_stale_resets: 0,
     extended: false,
     layout: 0,
@@ -111,6 +113,7 @@ impl State {
     fn reset_modifiers(&mut self) {
         self.alt_down = false;
         self.altgr_down = false;
+        self.shortcut_delete = false;
         self.extended = false;
     }
     fn push(&mut self, codepoint: u32, wake: &mut Wake) {
@@ -129,6 +132,11 @@ impl State {
         if scan == 0xe0 {
             self.extended = true;
             return w;
+        }
+        // PS/2 and USB share this Set-1 producer. The physical chord is
+        // delivered to the desktop, with no second text Delete for its client.
+        if self.extended && scan == 0x53 && !self.physical.held[0x4c] {
+            self.shortcut_delete = self.ctrl_down() && (self.alt_down || self.altgr_down);
         }
         let resets = self.physical.overflow_resets;
         if let Some(usage) = physical::set1_usage(scan & 0x7f, self.extended)
@@ -170,7 +178,7 @@ impl State {
                 0x4f => Some(0x8b),
                 0x49 => Some(0x8d),
                 0x51 => Some(0x8e),
-                0x53 => Some(0x7f),
+                0x53 if !self.shortcut_delete => Some(0x7f),
                 0x5b | 0x5c => Some(0x8c),
                 _ => None,
             };
