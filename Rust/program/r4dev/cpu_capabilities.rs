@@ -280,3 +280,18 @@ pub(crate) unsafe extern "C" fn check(
         Err(reason) => reason,
     }
 }
+
+/// # Safety
+/// Exclusive resident output with an initialized version and size. No reference is retained.
+pub(crate) unsafe extern "C" fn time(index: u32, out: *mut c::CpuTimeInfo) -> i32 {
+    if !unsafe { valid(out) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    match crate::arch::cpu_time::info(index) {
+        Ok(value) => {
+            unsafe { out.write(value) };
+            0
+        }
+        Err(reason) => reason,
+    }
+}

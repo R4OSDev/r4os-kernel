@@ -296,7 +296,9 @@ pub(crate) fn enter(ticket: Ticket) {
             core::arch::asm!("monitor",in("rax") core::ptr::addr_of!(MONITORS[cpu].word),in("ecx")0u32,in("edx")0u32,options(nostack));
         },
         |hint| unsafe {
+            super::cpu_time::enter(cpu as u32);
             core::arch::asm!("mwait",in("eax")hint,in("ecx")1u32,options(nostack));
+            super::cpu_time::leave(cpu as u32);
         },
     );
     // Unlike STI;HLT, masked-break MWAIT returns with IF0 and its wake IRQ
@@ -335,10 +337,13 @@ fn enter_with(ticket: Ticket, monitor: impl FnOnce(), wait: impl FnOnce(u32)) {
     t.active.fetch_sub(1, SeqCst);
 }
 pub(crate) fn hlt() {
-    if let Some(c) = COUNTERS.get(percpu::current_index() as usize) {
+    let cpu = percpu::current_index();
+    if let Some(c) = COUNTERS.get(cpu as usize) {
         c.fallback.fetch_add(1, SeqCst);
     }
-    runtime::r4os_rust_runtime_control(13, 0);
+    super::cpu_time::enter(cpu);
+    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
+    super::cpu_time::leave(percpu::current_index());
 }
 pub(crate) fn info(cpu: u32) -> Result<c::CpuIdleInfo, i32> {
     let _runtime = RuntimeGuard::acquire();

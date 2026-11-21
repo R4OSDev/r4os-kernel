@@ -19,6 +19,7 @@ pub unsafe fn dispatch(frame: *const InterruptFrame) {
     if super::machine_check::terminal_active() {
         crate::boot::fatal::halt();
     }
+    super::cpu_time::leave(percpu::current_index());
     let saved = runtime::save_runtime();
     let vector = unsafe { core::ptr::addr_of!((*frame).vector).read() };
     if !(0x20..0x40).contains(&vector) {
@@ -93,6 +94,7 @@ pub unsafe fn dispatch_ipi(frame: *const InterruptFrame) {
     if super::machine_check::terminal_active() {
         crate::boot::fatal::halt();
     }
+    super::cpu_time::leave(percpu::current_index());
     match unsafe { core::ptr::addr_of!((*frame).vector).read() } {
         0xf0 => {
             eoi();

@@ -163,6 +163,9 @@ fn transition_held(index: u32, from: u8, to: u8) -> bool {
         return false;
     }
     let bit = 1u64 << index;
+    if to == 4 || from == 4 {
+        super::cpu_time::availability(index, to == 4);
+    }
     if to == 4 {
         TLB_PARTICIPANTS.fetch_or(bit, Ordering::AcqRel);
         SCHEDULABLE.fetch_or(bit, Ordering::AcqRel);

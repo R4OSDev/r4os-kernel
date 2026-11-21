@@ -292,6 +292,8 @@ pub(crate) fn seal(qualified: u64) {
     }
     let (trusted, domains) = domains::derive(trusted);
     unsafe { DOMAINS.0.get().write(domains) };
+    // BSP scheduling predates the globally qualified monotonic clock.
+    crate::arch::cpu_time::availability(0, true);
     QUALIFIED.store(qualified, Ordering::Relaxed);
     TRUSTED.store(trusted, Ordering::Relaxed);
     SEALED.store(true, Ordering::Release);

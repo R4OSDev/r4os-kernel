@@ -3,6 +3,7 @@ pub(crate) mod apic_target;
 pub mod callback_abort;
 pub(crate) mod cpu_idle;
 pub(crate) mod cpu_lifecycle;
+pub(crate) mod cpu_time;
 pub mod fpu;
 pub(crate) mod fpu_fault;
 pub(crate) mod fpu_probe;
