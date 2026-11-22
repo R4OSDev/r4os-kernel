@@ -18,6 +18,8 @@ pub(crate) mod cpu_registers;
 pub(crate) mod cpu_topology;
 pub(crate) mod cpu_topology_decode;
 pub mod device_inventory;
+pub(crate) mod dram;
+mod dram_accounting;
 pub mod firmware_tables;
 pub mod firmware_view;
 pub mod irq;

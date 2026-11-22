@@ -9,6 +9,53 @@ use crate::{
 };
 use core::{mem, mem::MaybeUninit};
 
+/// Three distinct resident outputs are published only after a valid observation.
+pub(crate) unsafe extern "C" fn dram_traffic(
+    operation: u32,
+    bytes: *mut u64,
+    stamp: *mut u64,
+    epoch: *mut u64,
+) -> i32 {
+    if [bytes, stamp, epoch]
+        .iter()
+        .any(|p| p.is_null() || !p.is_aligned())
+        || bytes == stamp
+        || stamp == epoch
+        || bytes == epoch
+        || operation > 1
+    {
+        return -1;
+    }
+    let Some(_admission) = crate::sched::task_context::Admission::acquire(true) else {
+        return -3;
+    };
+    let Some(id) = (unsafe { context::handle() }) else {
+        return -1;
+    };
+    let owner = (id.instance_id, id.generation);
+    if operation == 1 {
+        return if crate::platform::dram::release(owner) {
+            0
+        } else {
+            -3
+        };
+    }
+    if !crate::platform::cpu_power::accepts_dram_samples() {
+        return -2;
+    }
+    match crate::platform::dram::sample(owner) {
+        Ok((n, t, e)) => {
+            unsafe {
+                bytes.write(n);
+                stamp.write(t);
+                epoch.write(e);
+            }
+            0
+        }
+        Err(code) => code,
+    }
+}
+
 /// The caller owns two distinct, writable byte counts until return.
 pub(crate) unsafe extern "C" fn physical_usage(total: *mut u64, free: *mut u64) -> i32 {
     if total.is_null()

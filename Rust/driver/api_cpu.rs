@@ -58,6 +58,7 @@ pub(crate) unsafe extern "C" fn query(out: *mut c::DriverCpuPowerApi) -> i32 {
         firmware_cpu_info: cpu_power::firmware::cpu_info as *const () as usize as u64,
         idle_publish: idle_publish as *const () as usize as u64,
         idle_policy: idle_policy as *const () as usize as u64,
+        dram_register: cpu_power::register_dram as *const () as usize as u64,
         ..Default::default()
     };
     unsafe {

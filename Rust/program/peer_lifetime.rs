@@ -50,6 +50,9 @@ pub(super) unsafe fn cleanup(instance: *mut ProgramInstance) -> bool {
         {
             return false;
         }
+        if !crate::platform::dram::retire_instance((*instance).id) {
+            return false;
+        }
         if !process_data::r4os_rust_program_data_local_cleanup(instance)
             || !notifications_cleanup(instance)
         {

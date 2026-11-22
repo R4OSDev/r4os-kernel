@@ -200,6 +200,9 @@ pub(crate) fn unregister(cookie: u64) -> i32 {
         state.closing = false;
         return c::cpu_capabilities_error_busy;
     }
+    if !super::dram::withdraw(cookie) {
+        return c::cpu_capabilities_error_busy;
+    }
     state.binding = None;
     hints::clear(&_runtime);
     c::cpu_capabilities_ok
@@ -244,9 +247,39 @@ pub(crate) fn finish_close(owner: u32) -> bool {
     if !state.closing || state.active != 0 || state.controls.iter().any(Option::is_some) {
         return false;
     }
+    if let Some(binding) = state.binding
+        && !super::dram::withdraw(binding.cookie)
+    {
+        return false;
+    }
     state.binding = None;
     hints::clear(&_runtime);
     true
+}
+pub(crate) extern "C" fn register_dram(
+    cookie: u64,
+    signature: u32,
+    first: u32,
+    second: u32,
+) -> i32 {
+    let Some(id) = lifecycle_identity() else {
+        return c::cpu_capabilities_error_context;
+    };
+    let _runtime = RuntimeGuard::acquire();
+    let state = unsafe { &*STATE.0.get() };
+    if state.closing
+        || !state
+            .binding
+            .is_some_and(|b| (b.owner, b.epoch, b.cookie) == (id.0, id.1, cookie))
+    {
+        return c::cpu_capabilities_error_epoch;
+    }
+    super::dram::register(cookie, signature, first, second)
+}
+pub(crate) fn accepts_dram_samples() -> bool {
+    let _runtime = RuntimeGuard::acquire();
+    let state = unsafe { &*STATE.0.get() };
+    state.binding.is_some() && !state.closing && !SYSTEM_TRANSITION.load(Ordering::Acquire)
 }
 pub(crate) fn register_performance(cookie: u64, backend: c::CpuPerformanceBackend) -> i32 {
     if backend.version != 1
