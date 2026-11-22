@@ -676,3 +676,63 @@ pub(crate) fn slot_count() -> usize {
 pub(crate) const fn max_devices() -> usize {
     MAX
 }
+
+/// Passive whole-device counters. The inventory and its immutable metadata
+/// are already resident. Never enter the partition scanner or invoke a backend.
+pub(crate) unsafe extern "C" fn activity(
+    flags: u32,
+    out: *mut crate::contract::StorageActivitySample,
+    capacity: u32,
+) -> i32 {
+    use crate::{contract::StorageActivitySample, platform::clocksource};
+    if flags & !1 != 0 || (capacity != 0 && (out.is_null() || !out.is_aligned())) {
+        return -1;
+    }
+    let mut rows = [StorageActivitySample::default(); MAX];
+    let mut count = 0;
+    {
+        let _owner = Guard::acquire(1);
+        let registry = unsafe { &*REGISTRY.0.get() };
+        let epoch = clocksource::generation();
+        let stamp = clocksource::now_nanoseconds();
+        let clock_ok = stamp.is_some() && epoch == clocksource::generation();
+        for slot in &registry.slots[..registry.slot_count] {
+            if !visible(*slot, registry.excluded) {
+                continue;
+            }
+            let row = &mut rows[count];
+            count += 1;
+            if count > capacity as usize {
+                continue;
+            }
+            // The metadata owner protects this exact slot and its counters.
+            // Other device fields, including worker queues, have independent owners.
+            let disk = slot.device.cast::<super::block_device::Device>();
+            let sector = slot.info.sector_bytes;
+            let sectors = unsafe { ((*disk).stats.read_sectors, (*disk).stats.write_sectors) };
+            let extra = unsafe { (*disk).additional_transfer_bytes };
+            if let (Some(read), Some(written)) = (
+                super::split::transferred_bytes(sectors.0, sector, extra[0]),
+                super::split::transferred_bytes(sectors.1, sector, extra[1]),
+            ) {
+                row.flags = 1;
+                row.read_bytes = read;
+                row.write_bytes = written;
+            }
+            row.slot = slot.reference.slot;
+            row.generation = slot.reference.generation;
+            row.stamp_ns = stamp.unwrap_or(0);
+            row.clock_generation = if clock_ok { u64::from(epoch) } else { 0 };
+            if flags & 1 != 0 {
+                unsafe {
+                    copy_text(&mut row.name, slot.info.name);
+                    copy_text(&mut row.model, slot.info.model);
+                }
+            }
+        }
+    }
+    if count != 0 && count <= capacity as usize {
+        unsafe { ptr::copy_nonoverlapping(rows.as_ptr(), out, count) };
+    }
+    count as i32
+}

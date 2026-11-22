@@ -112,6 +112,7 @@ pub struct Device {
     pub lane: u8,
     pub stats: accounting::Stats,
     pub active: u32,
+    pub additional_transfer_bytes: [u64; 2],
     pub slots: [block_requests::Slot; 16],
     pub slot_available: WaitQueue,
     pub completion_available: WaitQueue,
@@ -150,6 +151,7 @@ unsafe extern "C" fn initialize(
         ptr::addr_of_mut!((*out).state).write(0);
         ptr::addr_of_mut!((*out).resetting).write(false);
         ptr::addr_of_mut!((*out).active).write(0);
+        ptr::addr_of_mut!((*out).additional_transfer_bytes).write([0; 2]);
         ptr::addr_of_mut!((*out).index).write(u8::try_from(reference.slot).expect("block slot"));
         ptr::addr_of_mut!((*out).lane).write(lane);
         ptr::write_bytes(ptr::addr_of_mut!((*out).stats), 0, 1);

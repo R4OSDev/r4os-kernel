@@ -74,3 +74,25 @@ const _: () = {
     assert!(core::mem::offset_of!(Iterator, sector_size) == 8);
     assert!(core::mem::size_of::<Chunk>() == 24);
 };
+
+/// Successful whole sectors plus a successful short device completion.
+pub(crate) fn transferred_bytes(sectors: u64, sector_bytes: u32, additional: u64) -> Option<u64> {
+    if sector_bytes == 0 {
+        return None;
+    }
+    sectors.checked_mul(u64::from(sector_bytes))?.checked_add(additional)
+}
+
+#[cfg(test)]
+mod transferred_tests {
+    use super::transferred_bytes;
+    #[test]
+    fn device_sector_size_short_transfers_and_limits() {
+        assert_eq!(transferred_bytes(2, 512, 37), Some(1061));
+        assert_eq!(transferred_bytes(2, 4096, 37), Some(8229));
+        assert_eq!(transferred_bytes(0, 4096, 0), Some(0));
+        assert_eq!(transferred_bytes(1, 0, 0), None);
+        assert_eq!(transferred_bytes(u64::MAX, 4096, 0), None);
+        assert_eq!(transferred_bytes(1, 512, u64::MAX), None);
+    }
+}

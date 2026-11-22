@@ -456,6 +456,7 @@ unsafe fn finish(
     request: block_state::Execution,
     ok: bool,
     error: u8,
+    short_bytes: u32,
 ) {
     let owner = unsafe { lock(device, v) };
     if request.slot_index >= 16 {
@@ -477,6 +478,24 @@ unsafe fn finish(
         return;
     }
     let transition = unsafe { transition.assume_init() };
+    // Successful ordinary completions already contribute whole sectors below.
+    // Preserve the device-confirmed portion of a short reply and full transfers
+    // whose caller was cancelled after dispatch. Duplicate receipts returned above.
+    if matches!(request.kind, 1 | 2) {
+        let extra = if ok && transition.completion_override != 0 {
+            request.buffer_len as u64
+        } else {
+            u64::from(short_bytes)
+        };
+        if extra != 0 {
+            let _guard = Guard::acquire(1);
+            let disk = device.cast::<crate::storage::block_device::Device>();
+            unsafe {
+                let counter = &mut (*disk).additional_transfer_bytes[usize::from(request.kind - 1)];
+                *counter = counter.saturating_add(extra);
+            }
+        }
+    }
     state(v, 8, 0, 0, 0);
     accounting::r4os_rust_block_runtime_active(false);
     let latency = tick.saturating_sub(request.start_tick);
@@ -583,7 +602,7 @@ unsafe fn submit(device: *mut c_void, v: View, request: block_state::Execution) 
     accounting::r4os_rust_block_runtime_change(1, 22, 1);
     let Some(_unwind) = BackendUnwind::enter() else {
         unsafe {
-            finish(device, v, request, false, 1);
+            finish(device, v, request, false, 1, 0);
         }
         return;
     };
@@ -617,6 +636,7 @@ unsafe fn submit(device: *mut c_void, v: View, request: block_state::Execution) 
                 } else {
                     block_requests::r4os_rust_block_backend_error(request.kind)
                 },
+                0,
             );
         }
     }
@@ -652,7 +672,13 @@ pub unsafe fn pump(device: *mut c_void, mode: u8) -> bool {
             }
             let result = unsafe { result.assume_init() };
             unsafe {
-                finish(device, v, request, result.ok, result.err);
+                let short_bytes =
+                    if completion.result == 0 && (completion.bytes as usize) < request.buffer_len {
+                        completion.bytes
+                    } else {
+                        0
+                    };
+                finish(device, v, request, result.ok, result.err, short_bytes);
             }
             steps += 1;
             // Exact completion, wakes and detached-buffer release are done;
@@ -684,7 +710,7 @@ pub unsafe fn pump(device: *mut c_void, mode: u8) -> bool {
         } else {
             let result = unsafe { execute(device, v, request) };
             unsafe {
-                finish(device, v, request, result.ok, result.err);
+                finish(device, v, request, result.ok, result.err, 0);
             }
         }
         steps += 1;
@@ -1157,7 +1183,7 @@ unsafe fn reset(device: *mut c_void, reason: u32) -> bool {
         let current = unsafe { current.assume_init() };
         drop(owner);
         unsafe {
-            finish(device, v, current, false, 12);
+            finish(device, v, current, false, 12, 0);
         }
     }
     let _lock = unsafe { lock(device, v) };
