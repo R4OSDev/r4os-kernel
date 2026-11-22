@@ -856,6 +856,8 @@ fn configure_dev2() {
     const CPU_FIRMWARE: c::generation2::R4DevFns2::cpu_firmware_performance =
         crate::platform::cpu_power::firmware::call;
     const CPU_TIME: c::generation2::R4DevFns2::cpu_time_info = r4dev::cpu_capabilities::time;
+    const PHYSICAL_USAGE: c::generation2::R4DevFns2::physical_memory_usage =
+        r4dev::memory::physical_usage;
     const CPU_IDLE: c::generation2::R4DevFns2::cpu_idle_info = r4dev::cpu_capabilities::idle;
     const CPU_MACHINE_INFO: c::generation2::R4DevFns2::cpu_machine_info =
         r4dev::cpu_capabilities::machine_info;
@@ -1015,6 +1017,7 @@ fn configure_dev2() {
         cpu_performance_hint: (CPU_HINT as *const () as usize) as u64,
         cpu_firmware_performance: (CPU_FIRMWARE as *const () as usize) as u64,
         cpu_time_info: (CPU_TIME as *const () as usize) as u64,
+        physical_memory_usage: (PHYSICAL_USAGE as *const () as usize) as u64,
         cpu_idle_info: (CPU_IDLE as *const () as usize) as u64,
         cpu_machine_info: (CPU_MACHINE_INFO as *const () as usize) as u64,
         cpu_machine_bank: (CPU_MACHINE_BANK as *const () as usize) as u64,

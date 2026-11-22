@@ -8,6 +8,27 @@ use crate::{
     program::context,
 };
 use core::{mem, mem::MaybeUninit};
+
+/// The caller owns two distinct, writable byte counts until return.
+pub(crate) unsafe extern "C" fn physical_usage(total: *mut u64, free: *mut u64) -> i32 {
+    if total.is_null()
+        || free.is_null()
+        || !total.is_aligned()
+        || !free.is_aligned()
+        || total == free
+    {
+        return -1;
+    }
+    let Some((managed_bytes, free_bytes)) = phys::usage_bytes() else {
+        return -2;
+    };
+    unsafe {
+        total.write(managed_bytes);
+        free.write(free_bytes);
+    }
+    0
+}
+
 /// # Safety
 /// Caller retains a resident exclusive v1 header and its advertised output
 /// capacity. The exact task unwind token survives every wait and publication.

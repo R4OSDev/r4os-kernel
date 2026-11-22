@@ -35,6 +35,7 @@ pub struct Stats {
 struct State {
     bitmap: *mut u8,
     stats: Stats,
+    managed_frames: u64,
     next_hint: u64,
     local_hints: [u64; MAX_NODES],
     local_exhausted: u64,
@@ -44,6 +45,7 @@ struct State {
 impl State {
     const EMPTY: Self = Self {
         bitmap: null_mut(),
+        managed_frames: 0,
         stats: Stats {
             total_frames: 0,
             free_frames: 0,
@@ -123,6 +125,22 @@ impl State {
         } else {
             None
         }
+    }
+    /// Hand newly available boot pages to the bitmap. Its address span also
+    /// covers holes, whereas only pages actually admitted here contribute RAM.
+    fn admit_range(&mut self, base: u64, len: u64) {
+        let Some(end) = base.checked_add(len) else {
+            return;
+        };
+        let start = base.max(FRAME);
+        let before = self.stats.free_frames;
+        self.mark_range(start, end.saturating_sub(start), false);
+        self.managed_frames += self.stats.free_frames - before;
+    }
+
+    fn usage_bytes(&self) -> Option<(u64, u64)> {
+        (self.initialized && self.stats.free_frames <= self.managed_frames)
+            .then(|| (self.managed_frames * FRAME, self.stats.free_frames * FRAME))
     }
     fn alloc_one(&mut self) -> Option<u64> {
         if !self.initialized || self.stats.free_frames == 0 {
@@ -415,10 +433,9 @@ pub extern "C" fn r4os_rust_phys_init() -> bool {
         unsafe { core::ptr::write_bytes(bitmap, 0xff, bytes as usize) };
         for entry in entries {
             if entry.kind == 0 {
-                state.mark_range(entry.usable_base, entry.usable_len, false);
+                state.admit_range(entry.usable_base, entry.usable_len);
             }
         }
-        state.mark_range(0, FRAME, true);
         state.mark_range(base, bytes, true);
     }
     let Some(claim_end) = align_up(end, FRAME) else {
@@ -627,6 +644,10 @@ pub(crate) fn free_frames() -> u64 {
     let _guard = Guard::acquire(7);
     unsafe { (&*PMM.0.get()).stats.free_frames }
 }
+pub(crate) fn usage_bytes() -> Option<(u64, u64)> {
+    let _guard = Guard::acquire(7);
+    unsafe { (&*PMM.0.get()).usage_bytes() }
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_phys_to_virt(address: u64) -> u64 {
     address
@@ -653,4 +674,30 @@ unsafe fn pmm_fault(kind: u8, address: u64) {
     log::puts(b" frame=0x");
     log::hex(address, 16);
     log::puts(b"\r\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_ram_tracks_admissions_and_allocations_across_holes() {
+        let mut bits = [u64::MAX; 2];
+        let mut state = State::EMPTY;
+        state.bitmap = bits.as_mut_ptr().cast();
+        state.stats.total_frames = 128;
+        state.stats.bitmap_bytes = 16;
+        state.admit_range(0, 5 * FRAME);
+        state.admit_range(100 * FRAME, 3 * FRAME);
+        state.mark_range(FRAME, FRAME, true); // PMM bitmap
+        state.initialized = true;
+        assert_eq!(state.usage_bytes(), Some((7 * FRAME, 6 * FRAME)));
+        let page = state.alloc_any().unwrap();
+        assert_eq!(page, 2 * FRAME);
+        assert_eq!(state.usage_bytes(), Some((7 * FRAME, 5 * FRAME)));
+        assert_eq!(state.free_one(page), 0);
+        assert_eq!(state.usage_bytes(), Some((7 * FRAME, 6 * FRAME)));
+        state.admit_range(90 * FRAME, 2 * FRAME);
+        assert_eq!(state.usage_bytes(), Some((9 * FRAME, 8 * FRAME)));
+    }
 }
