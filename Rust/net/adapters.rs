@@ -76,6 +76,11 @@ pub struct NativeAdapter {
     // Generic NIC lifecycle identity, owned by this same registry. A genuine
     // carrier transition invalidates copied protocol work from its old link.
     pub link_generation: u64,
+    pub media_generation: u64,
+    pub media_link: u8,
+    pub duplex: u8,
+    pub rx_bps: u64,
+    pub tx_bps: u64,
 }
 impl NativeAdapter {
     pub(crate) const EMPTY: Self = Self {
@@ -112,6 +117,11 @@ impl NativeAdapter {
             interrupt_moderation_us: 0,
             reserved: 0,
         },
+        media_generation: 0,
+        media_link: 0,
+        duplex: 0,
+        rx_bps: 0,
+        tx_bps: 0,
         ops: NativeAdapterOps::EMPTY,
         link_generation: 0,
     };
@@ -452,7 +462,7 @@ const _: () = {
     assert!(core::mem::offset_of!(NativeAdapterStats, last_error) == 56);
 };
 const _: () = {
-    assert!(core::mem::size_of::<NativeAdapter>() == 264);
+    assert!(core::mem::size_of::<NativeAdapter>() == 296);
     assert!(core::mem::align_of::<NativeAdapter>() == 8);
     assert!(core::mem::offset_of!(NativeAdapter, registration_id) == 0);
     assert!(core::mem::offset_of!(NativeAdapter, name) == 8);
@@ -503,3 +513,98 @@ const _: () = {
     assert!(core::mem::offset_of!(BackendStatus, rx_software_fallbacks) == 144);
     assert!(core::mem::offset_of!(BackendStatus, rx_metadata_errors) == 152);
 };
+
+/// The driver reports only initialization and hardware media changes. Its
+/// registration ID survives slot compaction and is never reused this boot.
+pub(crate) extern "C" fn publish_media(id: i32, flags: u32, rx_bps: u64, tx_bps: u64) -> i32 {
+    let link = (flags & 3) as u8;
+    let duplex = ((flags >> 8) & 3) as u8;
+    if id <= 0 || flags & !0x303 != 0 || link > 2 || duplex > 2 {
+        return -1;
+    }
+    let _owner = Guard::acquire(2);
+    let registry = unsafe { &mut *state() };
+    let Some(adapter) = registry.entries[..registry.count]
+        .iter_mut()
+        .find(|a| a.registration_id == id as u32)
+    else {
+        return -1;
+    };
+    if adapter.media_generation == 0
+        || (
+            adapter.media_link,
+            adapter.duplex,
+            adapter.rx_bps,
+            adapter.tx_bps,
+        ) != (link, duplex, rx_bps, tx_bps)
+    {
+        adapter.media_generation = registry.next_link_generation;
+        registry.next_link_generation = registry
+            .next_link_generation
+            .checked_add(1)
+            .expect("NIC generation");
+        adapter.media_link = link;
+        adapter.duplex = duplex;
+        adapter.rx_bps = rx_bps;
+        adapter.tx_bps = tx_bps;
+    }
+    0
+}
+
+/// Name pointers are borrowed from the registered driver only under the
+/// registry owner. Caller storage is written after that short loan ends.
+pub(crate) unsafe extern "C" fn traffic(
+    flags: u32,
+    out: *mut crate::contract::NetworkTrafficSample,
+    capacity: u32,
+) -> i32 {
+    use crate::{contract::NetworkTrafficSample, platform::clocksource};
+    if flags & !1 != 0 || (capacity != 0 && (out.is_null() || !out.is_aligned())) {
+        return -1;
+    }
+    let mut rows = [NetworkTrafficSample::default(); CAPACITY];
+    let count = {
+        let _owner = Guard::acquire(2);
+        let registry = unsafe { &*state() };
+        if registry.count > capacity as usize {
+            return registry.count as i32;
+        }
+        let epoch = clocksource::generation();
+        let stamp = clocksource::now_nanoseconds();
+        let valid_clock = stamp.is_some() && epoch == clocksource::generation();
+        for (row, adapter) in rows.iter_mut().zip(&registry.entries[..registry.count]) {
+            row.interface_id = adapter.registration_id;
+            row.generation = adapter.link_generation.max(adapter.media_generation);
+            row.resets = adapter.stats.resets;
+            row.link = if adapter.media_generation != 0 {
+                adapter.media_link
+            } else {
+                adapter.link
+            };
+            row.duplex = adapter.duplex;
+            row.rx_bps = adapter.rx_bps;
+            row.tx_bps = adapter.tx_bps;
+            row.rx_bytes = adapter.stats.rx_bytes;
+            row.tx_bytes = adapter.stats.tx_bytes;
+            row.stamp_ns = stamp.unwrap_or(0);
+            row.clock_generation = if valid_clock { u64::from(epoch) } else { 0 };
+            if flags & 1 != 0 {
+                let n = adapter.name.len.min(row.name.len() - 1);
+                if n != 0 {
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            adapter.name.pointer,
+                            row.name.as_mut_ptr(),
+                            n,
+                        )
+                    };
+                }
+            }
+        }
+        registry.count
+    };
+    if count != 0 {
+        unsafe { core::ptr::copy_nonoverlapping(rows.as_ptr(), out, count) };
+    }
+    count as i32
+}

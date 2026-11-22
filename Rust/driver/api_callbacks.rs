@@ -344,6 +344,7 @@ pub(super) const fn template2() -> DriverApi2 {
         register_audio_output_epoch: Some(crate::driver::api_audio::register_output_epoch),
         register_audio_capture_backend: Some(crate::driver::api_audio::register_capture2),
         audio_output_progress: Some(crate::driver::api_audio::output_progress),
+        net_publish_media: Some(crate::net::adapters::publish_media),
         irq_rearm: Some(super::api_callbacks::driver_irq_rearm),
     }
 }
