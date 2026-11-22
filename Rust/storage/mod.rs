@@ -3,6 +3,7 @@ pub mod access_runtime;
 pub mod access_state;
 pub mod ahci;
 pub mod block_accounting;
+pub(crate) mod block_activity;
 pub mod block_device_state;
 pub mod block_diagnostics;
 pub mod block_execution;

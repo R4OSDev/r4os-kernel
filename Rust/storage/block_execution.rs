@@ -563,6 +563,29 @@ impl Drop for BackendUnwind {
         }
     }
 }
+fn activity_clock() -> Option<super::block_activity::Instant> {
+    use crate::platform::clocksource;
+    let epoch = clocksource::generation();
+    let ns = clocksource::now_nanoseconds()?;
+    (epoch == clocksource::generation()).then_some(super::block_activity::Instant { epoch, ns })
+}
+
+unsafe fn dispatched(device: *mut c_void, request: &block_state::Execution) {
+    let _owner = Guard::acquire(1);
+    unsafe {
+        (*device.cast::<super::block_device::Device>())
+            .activity
+            .begin(request.slot_index, request.id, activity_clock);
+    }
+}
+unsafe fn completed(device: *mut c_void, request: &block_state::Execution) {
+    let _owner = Guard::acquire(1);
+    unsafe {
+        (*device.cast::<super::block_device::Device>())
+            .activity
+            .end(request.slot_index, request.id, activity_clock);
+    }
+}
 unsafe fn execute(
     device: *mut c_void,
     v: View,
@@ -581,9 +604,15 @@ unsafe fn execute(
         3 if !v.io.has_flush => 0,
         0 => 2,
         1..=3 => {
-            if unsafe { crate::storage::block_device::backend(device, &request, request.kind, 0) }
-                != 0
-            {
+            unsafe {
+                dispatched(device, &request);
+            }
+            let result =
+                unsafe { crate::storage::block_device::backend(device, &request, request.kind, 0) };
+            unsafe {
+                completed(device, &request);
+            }
+            if result != 0 {
                 0
             } else {
                 block_requests::r4os_rust_block_backend_error(request.kind)
@@ -606,9 +635,15 @@ unsafe fn submit(device: *mut c_void, v: View, request: block_state::Execution) 
         }
         return;
     };
+    unsafe {
+        dispatched(device, &request);
+    }
     let result = unsafe { crate::storage::block_device::backend(device, &request, 4, 0) };
     if result == 0 {
         return;
+    }
+    unsafe {
+        completed(device, &request);
     }
     let rejected = {
         let _owner = Guard::acquire(1);
@@ -1075,6 +1110,12 @@ pub(crate) unsafe fn complete_receipt(handle: u64, result: i32, bytes: u32) -> C
             accounting::r4os_rust_block_runtime_change(1, 26, 1);
             return CompletionReceipt::Duplicate;
         }
+        // Already inside the exact device owner, after the first accepted latch.
+        unsafe {
+            (*registered.device.cast::<super::block_device::Device>())
+                .activity
+                .end(request_index, (*p).id, activity_clock);
+        }
         block_workers::r4os_rust_block_worker_lane(v.lane)
     };
     if lane != 255 {
@@ -1111,6 +1152,14 @@ unsafe fn reset(device: *mut c_void, reason: u32) -> bool {
     let owner = unsafe { lock(device, v) };
     if !state(v, 4, 0, 0, 0) {
         return false;
+    }
+    {
+        let _owner = Guard::acquire(1);
+        unsafe {
+            (*device.cast::<super::block_device::Device>())
+                .activity
+                .reset();
+        }
     }
     for index in 0..16 {
         let p = unsafe { slot(v, index) };
@@ -1183,6 +1232,7 @@ unsafe fn reset(device: *mut c_void, reason: u32) -> bool {
         let current = unsafe { current.assume_init() };
         drop(owner);
         unsafe {
+            completed(device, &current);
             finish(device, v, current, false, 12, 0);
         }
     }

@@ -719,6 +719,16 @@ pub(crate) unsafe extern "C" fn activity(
                 row.read_bytes = read;
                 row.write_bytes = written;
             }
+            let instant = if clock_ok {
+                stamp.map(|ns| super::block_activity::Instant { epoch, ns })
+            } else {
+                None
+            };
+            if let Some((active_ns, generation)) = unsafe { (*disk).activity.sample(instant) } {
+                row.flags |= 2;
+                row.active_ns = active_ns;
+                row.activity_epoch = generation;
+            }
             row.slot = slot.reference.slot;
             row.generation = slot.reference.generation;
             row.stamp_ns = stamp.unwrap_or(0);
